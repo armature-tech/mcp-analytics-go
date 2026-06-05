@@ -3,8 +3,8 @@
 //
 // Usage:
 //
-//	rec, err := armatureanalytics.New(armatureanalytics.Config{
-//	    APIKey: os.Getenv("ARMATURE_INGEST_API_KEY"),
+//	rec, err := armatureanalytics.NewRecorder(armatureanalytics.Config{
+//	    APIKey: os.Getenv("ANALYTICS_INGEST_API_KEY"),
 //	})
 //	if err != nil { /* handle */ }
 //	defer rec.Close(context.Background())
@@ -85,9 +85,10 @@ type callContext struct {
 	actorSeed string
 }
 
-// New constructs a Recorder. Returns ErrMissingAPIKey when Config.APIKey is
-// empty (unless Config.Disabled is true, in which case the Recorder no-ops).
-func New(cfg Config) (*Recorder, error) {
+// NewRecorder constructs a Recorder. Returns ErrMissingAPIKey when
+// Config.APIKey is empty (unless Config.Disabled is true, in which case the
+// Recorder no-ops). Mirrors the TS SDK's createAnalyticsRecorder.
+func NewRecorder(cfg Config) (*Recorder, error) {
 	r := &Recorder{cfg: cfg}
 	if cfg.Disabled {
 		return r, nil

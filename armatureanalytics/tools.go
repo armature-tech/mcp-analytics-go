@@ -38,17 +38,19 @@ func TelemetryFromContext(ctx context.Context) Telemetry {
 	return Telemetry{}
 }
 
-// AddTool registers a tool on s and instruments it for Armature analytics
-// telemetry capture. It decorates the tool's input schema with an optional
-// `telemetry` object (intent / context / frustration_level) and wraps the
-// handler so that the telemetry arguments are stripped before the handler
-// runs but kept on the request context for the recorder's hooks to read.
+// InstrumentTool registers a tool on s and instruments it for Armature
+// analytics telemetry capture. It decorates the tool's input schema with an
+// optional `telemetry` object (intent / context / frustration_level) and
+// wraps the handler so that the telemetry arguments are stripped before the
+// handler runs but kept on the request context for the recorder's hooks to
+// read.
 //
-// AddTool is purely additive on top of Recorder.Hooks(): the hook chain
-// must still be installed via server.WithHooks(rec.Hooks()) for events to
-// reach Armature. Tools registered with the plain server.AddTool still emit
-// events, just without intent metadata.
-func AddTool(s *server.MCPServer, tool mcp.Tool, handler server.ToolHandlerFunc) {
+// Mirrors the TS SDK's instrumentMcpServerTools, applied one tool at a
+// time. InstrumentTool is purely additive on top of Recorder.Hooks(): the
+// hook chain must still be installed via server.WithHooks(rec.Hooks()) for
+// events to reach Armature. Tools registered with the plain server.AddTool
+// still emit events, just without intent metadata.
+func InstrumentTool(s *server.MCPServer, tool mcp.Tool, handler server.ToolHandlerFunc) {
 	decorated, _ := decorateToolSchema(tool)
 	s.AddTool(decorated, WrapHandler(handler))
 }
@@ -56,10 +58,11 @@ func AddTool(s *server.MCPServer, tool mcp.Tool, handler server.ToolHandlerFunc)
 // WrapHandler returns a ToolHandlerFunc that extracts a top-level telemetry
 // argument (if present), attaches it to the request context, and forwards
 // the cleaned request to handler. Use this when registering tools through a
-// path other than AddTool (e.g. SetTools or a custom dispatcher).
+// path other than InstrumentTool (e.g. SetTools or a custom dispatcher).
 //
 // WrapHandler does NOT decorate the tool's input schema — call
-// DecorateToolSchema first (or use AddTool, which does both).
+// DecorateInputSchemaWithTelemetry first (or use InstrumentTool, which
+// does both).
 func WrapHandler(handler server.ToolHandlerFunc) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		tel, cleaned := extractTelemetryFromArgs(req.GetArguments())
@@ -71,16 +74,16 @@ func WrapHandler(handler server.ToolHandlerFunc) server.ToolHandlerFunc {
 	}
 }
 
-// DecorateToolSchema mutates a copy of tool's input schema to include the
-// optional telemetry object. The original tool value is not modified — use
-// the returned Tool when registering.
+// DecorateInputSchemaWithTelemetry mutates a copy of tool's input schema to
+// include the optional telemetry object. The original tool value is not
+// modified — use the returned Tool when registering.
 //
-// Schema-decoration rules match the TS SDK's
-// decorateInputSchemaWithTelemetry: telemetry is added under `properties`,
-// is itself an object with intent / context / frustration_level, and is
-// NEVER added to the schema's `required` array. The Required list inside
-// the telemetry object is also empty by design — intent is a soft nudge.
-func DecorateToolSchema(tool mcp.Tool) mcp.Tool {
+// Mirrors the TS SDK's decorateInputSchemaWithTelemetry: telemetry is added
+// under `properties`, is itself an object with intent / context /
+// frustration_level, and is NEVER added to the schema's `required` array.
+// The Required list inside the telemetry object is also empty by design —
+// intent is a soft nudge.
+func DecorateInputSchemaWithTelemetry(tool mcp.Tool) mcp.Tool {
 	out, _ := decorateToolSchema(tool)
 	return out
 }

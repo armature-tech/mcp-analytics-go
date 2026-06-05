@@ -59,14 +59,14 @@ func (s *ingestSink) Events() []map[string]any {
 func TestRecorder_EndToEnd_ToolCallAndSessionInit(t *testing.T) {
 	sink := newIngestSink(t)
 
-	rec, err := armatureanalytics.New(armatureanalytics.Config{
+	rec, err := armatureanalytics.NewRecorder(armatureanalytics.Config{
 		APIKey:      "test-key",
 		EndpointURL: sink.server.URL,
 		Timeout:     2 * time.Second,
 		ActorSeed:   func(_ context.Context) string { return "user-42" },
 	})
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("NewRecorder: %v", err)
 	}
 	t.Cleanup(func() { _ = rec.Close(context.Background()) })
 
@@ -175,13 +175,13 @@ func TestRecorder_EndToEnd_ToolCallAndSessionInit(t *testing.T) {
 
 func TestRecorder_DisabledIsNoop(t *testing.T) {
 	sink := newIngestSink(t)
-	rec, err := armatureanalytics.New(armatureanalytics.Config{
+	rec, err := armatureanalytics.NewRecorder(armatureanalytics.Config{
 		APIKey:      "test-key",
 		EndpointURL: sink.server.URL,
 		Disabled:    true,
 	})
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("NewRecorder: %v", err)
 	}
 	mcpServer := server.NewMCPServer("s", "1.0", server.WithToolCapabilities(true), server.WithHooks(rec.Hooks()))
 	mcpServer.AddTool(
@@ -207,13 +207,13 @@ func TestRecorder_DisabledIsNoop(t *testing.T) {
 
 func TestAddTool_PropagatesIntentToEvent(t *testing.T) {
 	sink := newIngestSink(t)
-	rec, err := armatureanalytics.New(armatureanalytics.Config{
+	rec, err := armatureanalytics.NewRecorder(armatureanalytics.Config{
 		APIKey:      "test-key",
 		EndpointURL: sink.server.URL,
 		Timeout:     2 * time.Second,
 	})
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("NewRecorder: %v", err)
 	}
 	t.Cleanup(func() { _ = rec.Close(context.Background()) })
 
@@ -222,7 +222,7 @@ func TestAddTool_PropagatesIntentToEvent(t *testing.T) {
 		server.WithHooks(rec.Hooks()),
 	)
 	var sawHandlerArgs map[string]any
-	armatureanalytics.AddTool(mcpServer,
+	armatureanalytics.InstrumentTool(mcpServer,
 		mcp.NewTool("echo",
 			mcp.WithDescription("Echoes"),
 			mcp.WithString("text", mcp.Description("Text to echo")),
@@ -303,7 +303,7 @@ func containsString(s, sub string) bool {
 
 func TestRecorder_ClosePreventsFurtherEmission(t *testing.T) {
 	sink := newIngestSink(t)
-	rec, _ := armatureanalytics.New(armatureanalytics.Config{
+	rec, _ := armatureanalytics.NewRecorder(armatureanalytics.Config{
 		APIKey:      "test-key",
 		EndpointURL: sink.server.URL,
 	})

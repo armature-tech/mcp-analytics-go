@@ -8,8 +8,8 @@ import (
 )
 
 func TestNewMCPServer_NoAPIKey_NoOp(t *testing.T) {
-	t.Setenv("ARMATURE_INGEST_API_KEY", "")
-	t.Setenv("ARMATURE_INGEST_URL", "")
+	t.Setenv("ANALYTICS_INGEST_API_KEY", "")
+	t.Setenv("ANALYTICS_INGEST_URL", "")
 
 	s, shutdown := NewMCPServer("test", "0")
 	if s == nil {
@@ -35,7 +35,7 @@ func TestNewMCPServerWithConfig_BuildsRecorderWhenAPIKeySet(t *testing.T) {
 		t.Fatal("shutdown nil")
 	}
 	// Register a tool to confirm the returned server is usable.
-	AddTool(s, mcp.NewTool("noop", mcp.WithDescription("noop")), func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	InstrumentTool(s, mcp.NewTool("noop", mcp.WithDescription("noop")), func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		return mcp.NewToolResultText("ok"), nil
 	})
 	if err := shutdown(context.Background()); err != nil {

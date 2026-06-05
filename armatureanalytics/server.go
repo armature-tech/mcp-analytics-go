@@ -14,7 +14,7 @@ import (
 type Shutdown func(context.Context) error
 
 // EnvConfig returns a Config populated from the standard environment
-// variables: ARMATURE_INGEST_API_KEY and ARMATURE_INGEST_URL. When no API
+// variables: ANALYTICS_INGEST_API_KEY and ANALYTICS_INGEST_URL. When no API
 // key is set, the returned Config produces a disabled (no-op) recorder.
 //
 // Callers that need additional fields (Timeout, OnError, …) should start
@@ -24,15 +24,15 @@ type Shutdown func(context.Context) error
 //	cfg.OnError = func(err error, _ armatureanalytics.Batch) { … }
 func EnvConfig() Config {
 	return Config{
-		APIKey:      os.Getenv("ARMATURE_INGEST_API_KEY"),
-		EndpointURL: os.Getenv("ARMATURE_INGEST_URL"),
+		APIKey:      os.Getenv("ANALYTICS_INGEST_API_KEY"),
+		EndpointURL: os.Getenv("ANALYTICS_INGEST_URL"),
 	}
 }
 
 // NewMCPServer constructs a *server.MCPServer with Armature analytics
 // pre-wired from the environment. It is the one-line equivalent of:
 //
-//	rec, _   := armatureanalytics.New(armatureanalytics.EnvConfig())
+//	rec, _   := armatureanalytics.NewRecorder(armatureanalytics.EnvConfig())
 //	defer rec.Close(ctx)
 //	s := server.NewMCPServer(name, version,
 //	    append(opts, server.WithHooks(rec.Hooks()))...,
@@ -50,13 +50,13 @@ func EnvConfig() Config {
 //	    _ = shutdown(ctx)
 //	}()
 //
-// When ARMATURE_INGEST_API_KEY is unset, no recorder is built, no hooks
+// When ANALYTICS_INGEST_API_KEY is unset, no recorder is built, no hooks
 // are added, and Shutdown is a no-op — so this call is safe to drop into
 // a server that runs both with and without analytics enabled.
 //
 // For tools to surface intent/context in the dashboard, register them via
-// armatureanalytics.AddTool (instead of s.AddTool) so their input schema
-// gets the optional telemetry block.
+// armatureanalytics.InstrumentTool (instead of s.AddTool) so their input
+// schema gets the optional telemetry block.
 func NewMCPServer(name, version string, opts ...server.ServerOption) (*server.MCPServer, Shutdown) {
 	return NewMCPServerWithConfig(name, version, EnvConfig(), opts...)
 }
@@ -72,7 +72,7 @@ func NewMCPServer(name, version string, opts ...server.ServerOption) (*server.MC
 func NewMCPServerWithConfig(name, version string, cfg Config, opts ...server.ServerOption) (*server.MCPServer, Shutdown) {
 	var rec *Recorder
 	if cfg.APIKey != "" {
-		r, err := New(cfg)
+		r, err := NewRecorder(cfg)
 		if err != nil {
 			if cfg.OnError != nil {
 				cfg.OnError(err, Batch{})
