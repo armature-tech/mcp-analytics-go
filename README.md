@@ -118,25 +118,29 @@ until in-flight POSTs complete (or `ctx` cancels).
 Once `Close` returns, the recorder is unusable — subsequent hook firings are
 counted via `Dropped()` and dropped silently.
 
-## Integrating with SigNoz MCP Server
+## Integrating into an existing hook bundle
 
-SigNoz already has its own analytics provider interface (`pkg/analytics.Analytics`),
-so the most idiomatic integration there is via a small adapter in their tree.
-But the standalone hook pattern works on SigNoz too — three lines in
-`internal/mcp-server/server.go` where the `*server.Hooks` is built:
+If your server already constructs a `*server.Hooks` (for OTEL, structured
+logging, etc.), use `Install` to add the recorder's hooks alongside yours
+instead of replacing them with `rec.Hooks()`:
 
 ```go
+hooks := &server.Hooks{}
+hooks.AddBeforeAny(myTracing)
+hooks.AddOnError(myErrorLogger)
+
 rec, _ := armatureanalytics.New(armatureanalytics.Config{
-    APIKey:    cfg.ArmatureIngestAPIKey,
-    Disabled:  cfg.ArmatureIngestAPIKey == "",
+    APIKey:    os.Getenv("ARMATURE_INGEST_API_KEY"),
+    Disabled:  os.Getenv("ARMATURE_INGEST_API_KEY") == "",
     ActorSeed: func(ctx context.Context) string {
-        // derive from SigNoz's identity resolver
-        if u, ok := util.GetSigNozUserID(ctx); ok { return u }
+        // return the auth principal / user id from your own context
         return ""
     },
 })
-rec.Install(hooks) // existing *server.Hooks
-defer rec.Close(ctx)
+rec.Install(hooks)
+defer rec.Close(context.Background())
+
+s := server.NewMCPServer("my-mcp", "1.0", server.WithHooks(hooks))
 ```
 
 ## Compatibility

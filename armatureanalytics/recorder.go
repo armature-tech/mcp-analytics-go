@@ -110,8 +110,8 @@ func (r *Recorder) Hooks() *server.Hooks {
 }
 
 // Install adds the recorder's hooks to an existing *server.Hooks. Use this
-// when the caller maintains their own hooks bundle (e.g. SigNoz). Safe to
-// call once per Hooks instance.
+// when the caller maintains their own hooks bundle (e.g. for tracing or
+// structured logging). Safe to call once per Hooks instance.
 func (r *Recorder) Install(h *server.Hooks) {
 	if r == nil || h == nil {
 		return

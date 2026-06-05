@@ -12,7 +12,7 @@ func TestBuildToolCallEvent_Success(t *testing.T) {
 	end := start.Add(150 * time.Millisecond)
 
 	ev := BuildToolCallEvent(ToolCallInput{
-		ToolName:   "signoz_list_metrics",
+		ToolName:   "list_items",
 		Args:       map[string]any{"searchText": "cpu"},
 		Result:     map[string]any{"metrics": []string{"a", "b"}},
 		SessionID:  "sess-1",
@@ -36,10 +36,10 @@ func TestBuildToolCallEvent_Success(t *testing.T) {
 	if ev.SessionIDHint == nil || *ev.SessionIDHint != "sess-1" {
 		t.Errorf("SessionIDHint = %v, want sess-1", ev.SessionIDHint)
 	}
-	if got := ev.Metadata["tool_name"]; got != "signoz_list_metrics" {
+	if got := ev.Metadata["tool_name"]; got != "list_items" {
 		t.Errorf("metadata.tool_name = %v", got)
 	}
-	if !strings.Contains(*ev.ScriptSource, "signoz_list_metrics") {
+	if !strings.Contains(*ev.ScriptSource, "list_items") {
 		t.Errorf("ScriptSource missing tool name: %q", *ev.ScriptSource)
 	}
 	if ev.ActorID == "" {
