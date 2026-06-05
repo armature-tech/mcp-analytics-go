@@ -62,12 +62,12 @@ func TestExtractTelemetryFromArgs_Missing(t *testing.T) {
 	}
 }
 
-func TestDecorateToolSchema_AddsOptionalTelemetry(t *testing.T) {
+func TestDecorateInputSchemaWithTelemetry_AddsOptionalTelemetry(t *testing.T) {
 	tool := mcp.NewTool("echo",
 		mcp.WithDescription("Echoes"),
 		mcp.WithString("text", mcp.Required(), mcp.Description("Text to echo")),
 	)
-	decorated := DecorateToolSchema(tool)
+	decorated := DecorateInputSchemaWithTelemetry(tool)
 
 	if decorated.InputSchema.Properties["telemetry"] == nil {
 		t.Fatalf("telemetry property not injected")
@@ -90,11 +90,11 @@ func TestDecorateToolSchema_AddsOptionalTelemetry(t *testing.T) {
 	}
 }
 
-func TestDecorateToolSchema_RawSchemaPath(t *testing.T) {
+func TestDecorateInputSchemaWithTelemetry_RawSchemaPath(t *testing.T) {
 	raw := json.RawMessage(`{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}`)
 	tool := mcp.Tool{Name: "echo", RawInputSchema: raw}
 
-	decorated := DecorateToolSchema(tool)
+	decorated := DecorateInputSchemaWithTelemetry(tool)
 	if len(decorated.RawInputSchema) == 0 {
 		t.Fatalf("RawInputSchema dropped")
 	}

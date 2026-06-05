@@ -8,16 +8,31 @@ All notable changes to this project will be documented in this file.
 
 - Initial `armatureanalytics` package: drop-in observability for any MCP
   server built on `github.com/mark3labs/mcp-go`.
-- `armatureanalytics.AddTool(server, tool, handler)` + `WrapHandler` +
-  `DecorateToolSchema` for capturing LLM-supplied `intent` / `context` /
-  `frustration_level` per call. Schema-decoration is purely additive: the
-  `telemetry` object is optional, never added to the schema's `required`
-  list. Wire format matches the TS SDK's
+- `armatureanalytics.InstrumentTool(server, tool, handler)` + `WrapHandler`
+  + `DecorateInputSchemaWithTelemetry` for capturing LLM-supplied `intent`
+  / `context` / `frustration_level` per call. Schema-decoration is purely
+  additive: the `telemetry` object is optional, never added to the
+  schema's `required` list. Wire format matches the TS SDK's
   `metadata.intent` / `metadata.context` / `metadata.frustration_level`.
+- Public function names map to the TS SDK's exports for parity across
+  SDKs: `NewMCPServer` ↔ `createMcpAnalyticsServer`, `NewRecorder` ↔
+  `createAnalyticsRecorder`, `InstrumentTool` ↔ `instrumentMcpServerTools`
+  (per-tool), `DecorateInputSchemaWithTelemetry` ↔
+  `decorateInputSchemaWithTelemetry`.
 - `WithTelemetry` / `TelemetryFromContext` for custom registration paths
   that want to plug into the same hook machinery without using `AddTool`.
 - `Recorder.Hooks()` / `Recorder.Install(*server.Hooks)` for one-line
   integration via `server.WithHooks`.
+- `NewMCPServer(name, version, opts...)` / `NewMCPServerWithConfig` —
+  construct a `*server.MCPServer` with analytics pre-wired from the
+  environment. Returns a `Shutdown(ctx)` that flushes pending batches.
+- Environment variables `ANALYTICS_INGEST_API_KEY` /
+  `ANALYTICS_INGEST_URL` (read by `EnvConfig` and `NewMCPServer`),
+  matching the TS SDK's published convention so the same env names
+  work across both SDKs.
+- Telemetry field descriptions on the decorated input schema match the
+  TS SDK's canonical strings verbatim, so the LLM sees the same intent /
+  context / frustration_level guidance regardless of which SDK is in use.
 - `tool_call` events on every `tools/call` (captured via `BeforeAny` +
   `OnSuccess` / `OnError` filtered to that method).
 - `session_init` events on successful `initialize`, captured via

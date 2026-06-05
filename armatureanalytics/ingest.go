@@ -11,7 +11,7 @@ import (
 )
 
 // DefaultEndpointURL is the production Armature ingest endpoint. Override via
-// Config.EndpointURL or the ARMATURE_INGEST_URL env var.
+// Config.EndpointURL or the ANALYTICS_INGEST_URL env var.
 const DefaultEndpointURL = "https://app.armature.tech/api/mcp-analytics/ingest"
 
 // DefaultTimeout caps each ingest POST. The TS SDK ships with 500ms; this Go

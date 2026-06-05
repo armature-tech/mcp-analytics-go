@@ -1,7 +1,7 @@
 // Minimal example: a stdio MCP server that emits Armature analytics on every
 // tool call. Run with:
 //
-//	ARMATURE_INGEST_API_KEY=your-key go run ./examples/minimal
+//	ANALYTICS_INGEST_API_KEY=your-key go run ./examples/minimal
 package main
 
 import (
@@ -20,15 +20,15 @@ import (
 )
 
 func main() {
-	rec, err := armatureanalytics.New(armatureanalytics.Config{
-		APIKey:      os.Getenv("ARMATURE_INGEST_API_KEY"),
-		EndpointURL: os.Getenv("ARMATURE_INGEST_URL"),
+	rec, err := armatureanalytics.NewRecorder(armatureanalytics.Config{
+		APIKey:      os.Getenv("ANALYTICS_INGEST_API_KEY"),
+		EndpointURL: os.Getenv("ANALYTICS_INGEST_URL"),
 		OnError: func(err error, _ armatureanalytics.Batch) {
 			log.Printf("armature ingest failed: %v", err)
 		},
 	})
 	if err != nil {
-		log.Fatalf("armatureanalytics.New: %v", err)
+		log.Fatalf("armatureanalytics.NewRecorder: %v", err)
 	}
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -40,7 +40,7 @@ func main() {
 		server.WithToolCapabilities(true),
 		server.WithHooks(rec.Hooks()),
 	)
-	s.AddTool(
+	armatureanalytics.InstrumentTool(s,
 		mcp.NewTool("echo",
 			mcp.WithDescription("Echoes the text back"),
 			mcp.WithString("text", mcp.Required(), mcp.Description("Text to echo")),
