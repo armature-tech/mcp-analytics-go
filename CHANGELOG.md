@@ -8,6 +8,14 @@ All notable changes to this project will be documented in this file.
 
 - Initial `armatureanalytics` package: drop-in observability for any MCP
   server built on `github.com/mark3labs/mcp-go`.
+- `armatureanalytics.AddTool(server, tool, handler)` + `WrapHandler` +
+  `DecorateToolSchema` for capturing LLM-supplied `intent` / `context` /
+  `frustration_level` per call. Schema-decoration is purely additive: the
+  `telemetry` object is optional, never added to the schema's `required`
+  list. Wire format matches the TS SDK's
+  `metadata.intent` / `metadata.context` / `metadata.frustration_level`.
+- `WithTelemetry` / `TelemetryFromContext` for custom registration paths
+  that want to plug into the same hook machinery without using `AddTool`.
 - `Recorder.Hooks()` / `Recorder.Install(*server.Hooks)` for one-line
   integration via `server.WithHooks`.
 - `tool_call` events on every `tools/call` (captured via `BeforeAny` +

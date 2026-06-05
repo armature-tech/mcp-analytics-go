@@ -65,6 +65,7 @@ type ToolCallInput struct {
 	StartedAt   time.Time
 	FinishedAt  time.Time
 	ClientInfo  *ClientInfo
+	Telemetry   Telemetry // optional LLM-supplied intent / context / frustration_level
 }
 
 // SessionInitInput is the typed input to BuildSessionInitEvent.
@@ -115,9 +116,9 @@ func BuildToolCallEvent(in ToolCallInput) Event {
 
 	meta := map[string]any{
 		"tool_name":         in.ToolName,
-		"intent":            nil,
-		"context":           nil,
-		"frustration_level": nil,
+		"intent":            stringOrNil(in.Telemetry.Intent),
+		"context":           stringOrNil(in.Telemetry.Context),
+		"frustration_level": stringOrNil(in.Telemetry.FrustrationLevel),
 		"input_preview":     inputPreview,
 	}
 	mergeClientInfo(meta, in.ClientInfo)
@@ -269,4 +270,13 @@ func stringPtrOrNil(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+// stringOrNil returns the string when non-empty, otherwise nil. Used for
+// metadata fields that the wire schema expects as `string | null`.
+func stringOrNil(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }

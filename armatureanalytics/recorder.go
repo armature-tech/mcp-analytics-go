@@ -79,6 +79,7 @@ type Recorder struct {
 type callContext struct {
 	toolName  string
 	args      any
+	telemetry Telemetry
 	startedAt time.Time
 	sessionID string
 	actorSeed string
@@ -166,9 +167,15 @@ func (r *Recorder) onBeforeAny(ctx context.Context, id any, method mcp.MCPMethod
 		return
 	}
 	sessionID := sessionIDFromContext(ctx)
+	// Extract telemetry up-front so it survives into OnSuccess / OnError
+	// regardless of whether the tool was registered via AddTool. Args used
+	// for the input preview have telemetry stripped so the dashboards don't
+	// double-show the same intent string.
+	telemetry, cleanedArgs := extractTelemetryFromArgs(req.GetArguments())
 	r.pendingCalls.Store(callKey(sessionID, id), callContext{
 		toolName:  req.Params.Name,
-		args:      req.Params.Arguments,
+		args:      cleanedArgs,
+		telemetry: telemetry,
 		startedAt: time.Now(),
 		sessionID: sessionID,
 		actorSeed: r.actorSeed(ctx),
@@ -195,6 +202,7 @@ func (r *Recorder) onSuccess(ctx context.Context, id any, method mcp.MCPMethod, 
 		StartedAt:   cc.startedAt,
 		FinishedAt:  time.Now(),
 		ClientInfo:  r.clientInfoFor(cc.sessionID),
+		Telemetry:   firstTelemetry(cc.telemetry, TelemetryFromContext(ctx)),
 	}))
 }
 
@@ -218,7 +226,18 @@ func (r *Recorder) onError(ctx context.Context, id any, method mcp.MCPMethod, _ 
 		StartedAt:  cc.startedAt,
 		FinishedAt: time.Now(),
 		ClientInfo: r.clientInfoFor(cc.sessionID),
+		Telemetry:  firstTelemetry(cc.telemetry, TelemetryFromContext(ctx)),
 	}))
+}
+
+// firstTelemetry returns a if any field is set, else b. Used to prefer the
+// telemetry captured in BeforeAny (off the raw args) over the one stashed by
+// AddTool's handler wrap, since both come from the same args block.
+func firstTelemetry(a, b Telemetry) Telemetry {
+	if a != (Telemetry{}) {
+		return a
+	}
+	return b
 }
 
 func (r *Recorder) onAfterInitialize(ctx context.Context, _ any, message *mcp.InitializeRequest, _ *mcp.InitializeResult) {

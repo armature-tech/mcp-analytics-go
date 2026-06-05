@@ -205,6 +205,102 @@ func TestRecorder_DisabledIsNoop(t *testing.T) {
 	}
 }
 
+func TestAddTool_PropagatesIntentToEvent(t *testing.T) {
+	sink := newIngestSink(t)
+	rec, err := armatureanalytics.New(armatureanalytics.Config{
+		APIKey:      "test-key",
+		EndpointURL: sink.server.URL,
+		Timeout:     2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = rec.Close(context.Background()) })
+
+	mcpServer := server.NewMCPServer("test", "1.0",
+		server.WithToolCapabilities(true),
+		server.WithHooks(rec.Hooks()),
+	)
+	var sawHandlerArgs map[string]any
+	armatureanalytics.AddTool(mcpServer,
+		mcp.NewTool("echo",
+			mcp.WithDescription("Echoes"),
+			mcp.WithString("text", mcp.Description("Text to echo")),
+		),
+		func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			sawHandlerArgs = req.GetArguments()
+			return &mcp.CallToolResult{Content: []mcp.Content{
+				mcp.TextContent{Type: "text", Text: "echo: " + req.GetArguments()["text"].(string)},
+			}}, nil
+		},
+	)
+
+	client, _ := mcpclient.NewInProcessClient(mcpServer)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = client.Start(ctx)
+	_, _ = client.Initialize(ctx, mcp.InitializeRequest{})
+
+	callReq := mcp.CallToolRequest{}
+	callReq.Params.Name = "echo"
+	callReq.Params.Arguments = map[string]any{
+		"text": "hi",
+		"telemetry": map[string]any{
+			"intent":  "verify intent reaches Armature",
+			"context": "integration test",
+		},
+	}
+	if _, err := client.CallTool(ctx, callReq); err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if err := rec.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	if _, leaked := sawHandlerArgs["telemetry"]; leaked {
+		t.Errorf("handler saw telemetry in args: %v", sawHandlerArgs)
+	}
+	if sawHandlerArgs["text"] != "hi" {
+		t.Errorf("handler lost real args: %v", sawHandlerArgs)
+	}
+
+	var found bool
+	for _, ev := range sink.Events() {
+		if ev["kind"] != "tool_call" {
+			continue
+		}
+		meta, _ := ev["metadata"].(map[string]any)
+		if meta["tool_name"] != "echo" {
+			continue
+		}
+		if meta["intent"] != "verify intent reaches Armature" {
+			t.Errorf("metadata.intent = %v, want %q", meta["intent"], "verify intent reaches Armature")
+		}
+		if meta["context"] != "integration test" {
+			t.Errorf("metadata.context = %v, want %q", meta["context"], "integration test")
+		}
+		// The input_preview should NOT contain the telemetry block.
+		if preview, ok := meta["input_preview"].(string); ok {
+			if preview != "" && containsString(preview, "telemetry") {
+				t.Errorf("input_preview leaked telemetry: %q", preview)
+			}
+		}
+		found = true
+	}
+	if !found {
+		t.Fatalf("did not see tool_call event for echo; sink=%v", sink.Events())
+	}
+}
+
+func containsString(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
 func TestRecorder_ClosePreventsFurtherEmission(t *testing.T) {
 	sink := newIngestSink(t)
 	rec, _ := armatureanalytics.New(armatureanalytics.Config{

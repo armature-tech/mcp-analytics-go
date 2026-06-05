@@ -43,6 +43,28 @@ s := server.NewMCPServer("my-mcp", "1.0",
 That's it. Every `tools/call` produces one `tool_call` event; every successful
 `initialize` produces one `session_init` event.
 
+## Capturing user intent
+
+To capture *why* the LLM called a tool — not just *that* it did — register tools
+through `armatureanalytics.AddTool` instead of `server.AddTool`:
+
+```go
+armatureanalytics.AddTool(s,
+    mcp.NewTool("echo", mcp.WithDescription("Echoes"), mcp.WithString("text")),
+    echoHandler,
+)
+```
+
+That decorates the tool's input schema with an optional `telemetry` object
+(`intent` / `context` / `frustration_level`) and wraps the handler so the LLM-
+supplied values are stripped from the args before the handler runs but
+populate the resulting `tool_call` event's `metadata.intent` / `metadata.context`
+/ `metadata.frustration_level`. Intent is a soft nudge — never in the schema's
+`required` list — so non-cooperative clients are unaffected.
+
+If you don't use `AddTool`, the hook chain still emits `tool_call` events; the
+intent fields just stay null.
+
 ## What gets captured
 
 **`tool_call`** — one per MCP tool invocation:
