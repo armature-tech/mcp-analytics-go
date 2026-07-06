@@ -37,6 +37,7 @@ func TestExtractTelemetryFromArgs_AllFields(t *testing.T) {
 
 func TestExtractTelemetryFromArgs_StringEncoded(t *testing.T) {
 	args := map[string]any{
+		"text":      "hi",
 		"telemetry": `{"intent":"x"}`,
 	}
 	tel, cleaned := extractTelemetryFromArgs(args)
@@ -45,6 +46,9 @@ func TestExtractTelemetryFromArgs_StringEncoded(t *testing.T) {
 	}
 	if _, ok := cleaned["telemetry"]; ok {
 		t.Errorf("cleaned args still contain telemetry")
+	}
+	if cleaned["text"] != "hi" {
+		t.Errorf("sibling arg dropped when telemetry was string-encoded: %v", cleaned)
 	}
 }
 
@@ -67,10 +71,16 @@ func TestDecorateInputSchemaWithTelemetry_AddsOptionalTelemetry(t *testing.T) {
 		mcp.WithDescription("Echoes"),
 		mcp.WithString("text", mcp.Required(), mcp.Description("Text to echo")),
 	)
-	decorated := DecorateInputSchemaWithTelemetry(tool)
+	decorated, ok := DecorateInputSchemaWithTelemetry(tool)
+	if !ok {
+		t.Fatalf("expected ok=true for a plain schema")
+	}
 
 	if decorated.InputSchema.Properties["telemetry"] == nil {
 		t.Fatalf("telemetry property not injected")
+	}
+	if _, leaked := tool.InputSchema.Properties["telemetry"]; leaked {
+		t.Fatalf("original tool's Properties map was mutated")
 	}
 	for _, r := range decorated.InputSchema.Required {
 		if r == "telemetry" {
@@ -94,7 +104,10 @@ func TestDecorateInputSchemaWithTelemetry_RawSchemaPath(t *testing.T) {
 	raw := json.RawMessage(`{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}`)
 	tool := mcp.Tool{Name: "echo", RawInputSchema: raw}
 
-	decorated := DecorateInputSchemaWithTelemetry(tool)
+	decorated, ok := DecorateInputSchemaWithTelemetry(tool)
+	if !ok {
+		t.Fatalf("expected ok=true for a plain raw schema")
+	}
 	if len(decorated.RawInputSchema) == 0 {
 		t.Fatalf("RawInputSchema dropped")
 	}
@@ -111,6 +124,33 @@ func TestDecorateInputSchemaWithTelemetry_RawSchemaPath(t *testing.T) {
 		if r == "telemetry" {
 			t.Errorf("telemetry must NOT be in raw schema required")
 		}
+	}
+}
+
+func TestDecorateInputSchemaWithTelemetry_PreexistingPropertyUntouched(t *testing.T) {
+	tool := mcp.NewTool("legacy",
+		mcp.WithDescription("Has its own telemetry input"),
+		mcp.WithString("telemetry", mcp.Required(), mcp.Description("A real input, not ours")),
+	)
+	decorated, ok := DecorateInputSchemaWithTelemetry(tool)
+	if ok {
+		t.Fatalf("expected ok=false for a pre-existing telemetry property")
+	}
+	got, _ := decorated.InputSchema.Properties["telemetry"].(map[string]any)
+	if got == nil || got["type"] != "string" {
+		t.Fatalf("pre-existing telemetry property was overwritten: %+v", got)
+	}
+}
+
+func TestDecorateInputSchemaWithTelemetry_RawSchemaPreexistingPropertyUntouched(t *testing.T) {
+	raw := json.RawMessage(`{"type":"object","properties":{"telemetry":{"type":"string"}},"required":["telemetry"]}`)
+	tool := mcp.Tool{Name: "legacy", RawInputSchema: raw}
+	decorated, ok := DecorateInputSchemaWithTelemetry(tool)
+	if ok {
+		t.Fatalf("expected ok=false for a pre-existing raw telemetry property")
+	}
+	if string(decorated.RawInputSchema) != string(raw) {
+		t.Fatalf("raw schema with pre-existing telemetry was modified: %s", decorated.RawInputSchema)
 	}
 }
 

@@ -71,18 +71,23 @@ type Recorder struct {
 	emittedSession sync.Map // sessionID → struct{}; dedup session_init
 
 	inflight sync.WaitGroup
+	// closeMu serializes the closed transition against emit's inflight.Add
+	// so Close cannot finish draining between a completion's active() check
+	// and its Add, which would let an event POST after Close returned.
+	closeMu sync.Mutex
 
 	dropped uint64
 	closed  atomic.Bool
 }
 
 type callContext struct {
-	toolName  string
-	args      any
-	telemetry Telemetry
-	startedAt time.Time
-	sessionID string
-	actorSeed string
+	toolName   string
+	args       any
+	telemetry  Telemetry
+	startedAt  time.Time
+	sessionID  string
+	sessionKey any
+	actorSeed  string
 }
 
 // NewRecorder constructs a Recorder. Returns ErrMissingAPIKey when
@@ -141,9 +146,12 @@ func (r *Recorder) Flush(ctx context.Context) error {
 }
 
 // Close marks the recorder closed (so further events drop) and waits for
-// in-flight POSTs via Flush. After Close returns, the recorder is unusable.
+// in-flight POSTs via Flush. After Close returns, the recorder is unusable
+// and no further ingest POSTs start.
 func (r *Recorder) Close(ctx context.Context) error {
+	r.closeMu.Lock()
 	r.closed.Store(true)
+	r.closeMu.Unlock()
 	return r.Flush(ctx)
 }
 
@@ -167,28 +175,31 @@ func (r *Recorder) onBeforeAny(ctx context.Context, id any, method mcp.MCPMethod
 	if !ok || req == nil {
 		return
 	}
-	sessionID := sessionIDFromContext(ctx)
 	// Extract telemetry up-front so it survives into OnSuccess / OnError
 	// regardless of whether the tool was registered via AddTool. Args used
 	// for the input preview have telemetry stripped so the dashboards don't
 	// double-show the same intent string.
 	telemetry, cleanedArgs := extractTelemetryFromArgs(req.GetArguments())
-	r.pendingCalls.Store(callKey(sessionID, id), callContext{
-		toolName:  req.Params.Name,
-		args:      cleanedArgs,
-		telemetry: telemetry,
-		startedAt: time.Now(),
-		sessionID: sessionID,
-		actorSeed: r.actorSeed(ctx),
+	sessionKey := sessionKeyFromContext(ctx)
+	r.pendingCalls.Store(callKey(sessionKey, id), callContext{
+		toolName:   req.Params.Name,
+		args:       cleanedArgs,
+		telemetry:  telemetry,
+		startedAt:  time.Now(),
+		sessionID:  sessionIDFromContext(ctx),
+		sessionKey: sessionKey,
+		actorSeed:  r.actorSeed(ctx),
 	})
 }
 
 func (r *Recorder) onSuccess(ctx context.Context, id any, method mcp.MCPMethod, _ any, result any) {
-	if !r.active() || method != mcp.MethodToolsCall {
+	if method != mcp.MethodToolsCall {
 		return
 	}
-	cc, ok := r.takeCall(sessionIDFromContext(ctx), id)
-	if !ok {
+	// Take the pending call before the active() check so a Close between
+	// BeforeAny and here still cleans up the entry instead of leaking it.
+	cc, ok := r.takeCall(sessionKeyFromContext(ctx), id)
+	if !ok || !r.active() {
 		return
 	}
 
@@ -202,17 +213,18 @@ func (r *Recorder) onSuccess(ctx context.Context, id any, method mcp.MCPMethod, 
 		ActorSeed:   cc.actorSeed,
 		StartedAt:   cc.startedAt,
 		FinishedAt:  time.Now(),
-		ClientInfo:  r.clientInfoFor(cc.sessionID),
+		ClientInfo:  r.clientInfoFor(cc.sessionKey),
 		Telemetry:   firstTelemetry(cc.telemetry, TelemetryFromContext(ctx)),
 	}))
 }
 
 func (r *Recorder) onError(ctx context.Context, id any, method mcp.MCPMethod, _ any, callErr error) {
-	if !r.active() || method != mcp.MethodToolsCall {
+	if method != mcp.MethodToolsCall {
 		return
 	}
-	cc, ok := r.takeCall(sessionIDFromContext(ctx), id)
-	if !ok {
+	// See onSuccess: clean up the pending call even when closed.
+	cc, ok := r.takeCall(sessionKeyFromContext(ctx), id)
+	if !ok || !r.active() {
 		return
 	}
 	if callErr == nil {
@@ -226,7 +238,7 @@ func (r *Recorder) onError(ctx context.Context, id any, method mcp.MCPMethod, _ 
 		ActorSeed:  cc.actorSeed,
 		StartedAt:  cc.startedAt,
 		FinishedAt: time.Now(),
-		ClientInfo: r.clientInfoFor(cc.sessionID),
+		ClientInfo: r.clientInfoFor(cc.sessionKey),
 		Telemetry:  firstTelemetry(cc.telemetry, TelemetryFromContext(ctx)),
 	}))
 }
@@ -245,22 +257,22 @@ func (r *Recorder) onAfterInitialize(ctx context.Context, _ any, message *mcp.In
 	if !r.active() || message == nil {
 		return
 	}
-	sessionID := sessionIDFromContext(ctx)
+	sessionKey := sessionKeyFromContext(ctx)
 	info := &ClientInfo{
 		Name:            message.Params.ClientInfo.Name,
 		Version:         message.Params.ClientInfo.Version,
 		ProtocolVersion: message.Params.ProtocolVersion,
 	}
-	if sessionID != "" {
-		r.sessionInfo.Store(sessionID, info)
+	if !isEmptySessionKey(sessionKey) {
+		r.sessionInfo.Store(sessionKey, info)
 	}
 
-	if _, already := r.emittedSession.LoadOrStore(sessionID, struct{}{}); already && sessionID != "" {
+	if _, already := r.emittedSession.LoadOrStore(sessionKey, struct{}{}); already {
 		return
 	}
 
 	r.emit(ctx, BuildSessionInitEvent(SessionInitInput{
-		SessionID:  sessionID,
+		SessionID:  sessionIDFromContext(ctx),
 		ActorSeed:  r.actorSeed(ctx),
 		StartedAt:  time.Now(),
 		ClientInfo: info,
@@ -271,9 +283,9 @@ func (r *Recorder) onUnregisterSession(_ context.Context, session server.ClientS
 	if session == nil {
 		return
 	}
-	sid := session.SessionID()
-	r.sessionInfo.Delete(sid)
-	r.emittedSession.Delete(sid)
+	key := sessionKeyForSession(session)
+	r.sessionInfo.Delete(key)
+	r.emittedSession.Delete(key)
 }
 
 // ---------- helpers ----------
@@ -296,18 +308,18 @@ func (r *Recorder) actorSeed(ctx context.Context) string {
 	return r.cfg.ActorSeed(ctx)
 }
 
-func (r *Recorder) clientInfoFor(sessionID string) *ClientInfo {
-	if sessionID == "" {
+func (r *Recorder) clientInfoFor(sessionKey any) *ClientInfo {
+	if sessionKey == nil || isEmptySessionKey(sessionKey) {
 		return nil
 	}
-	if v, ok := r.sessionInfo.Load(sessionID); ok {
+	if v, ok := r.sessionInfo.Load(sessionKey); ok {
 		return v.(*ClientInfo)
 	}
 	return nil
 }
 
-func (r *Recorder) takeCall(sessionID string, id any) (callContext, bool) {
-	v, ok := r.pendingCalls.LoadAndDelete(callKey(sessionID, id))
+func (r *Recorder) takeCall(sessionKey, id any) (callContext, bool) {
+	v, ok := r.pendingCalls.LoadAndDelete(callKey(sessionKey, id))
 	if !ok {
 		return callContext{}, false
 	}
@@ -320,7 +332,16 @@ func (r *Recorder) emit(ctx context.Context, ev Event) {
 	if r.client == nil {
 		return
 	}
+	// Register with inflight under closeMu: once Close flips closed, no new
+	// POST can start, so Close's Flush covers everything that got in.
+	r.closeMu.Lock()
+	if r.closed.Load() {
+		r.closeMu.Unlock()
+		atomic.AddUint64(&r.dropped, 1)
+		return
+	}
 	r.inflight.Add(1)
+	r.closeMu.Unlock()
 	// Detach from caller's context to avoid being cancelled by request
 	// teardown; honour our own per-request timeout via the http.Client.
 	go func() {
@@ -350,15 +371,40 @@ func sessionIDFromContext(ctx context.Context) string {
 	return ""
 }
 
+// sessionKeyFromContext returns a comparable per-connection key for pending
+// calls, client-info tracking, and session_init dedup. It prefers the
+// session id string; when the transport reports an empty id, the
+// ClientSession value itself is used so concurrent sessionless connections
+// do not collide on "".
+func sessionKeyFromContext(ctx context.Context) any {
+	if s := server.ClientSessionFromContext(ctx); s != nil {
+		return sessionKeyForSession(s)
+	}
+	return ""
+}
+
+func sessionKeyForSession(s server.ClientSession) any {
+	if sid := s.SessionID(); sid != "" {
+		return sid
+	}
+	return s
+}
+
+// isEmptySessionKey reports whether key is the shared no-session fallback.
+func isEmptySessionKey(key any) bool {
+	s, ok := key.(string)
+	return ok && s == ""
+}
+
 // callKey scopes a JSON-RPC request id by session so two concurrent sessions
 // with colliding ids do not stomp each other's pending-call entries.
 type callKeyT struct {
-	sessionID string
-	id        any
+	sessionKey any
+	id         any
 }
 
-func callKey(sessionID string, id any) callKeyT {
-	return callKeyT{sessionID: sessionID, id: id}
+func callKey(sessionKey, id any) callKeyT {
+	return callKeyT{sessionKey: sessionKey, id: id}
 }
 
 // extractToolErrorFlag pulls IsError off an mcp.CallToolResult-shaped value.

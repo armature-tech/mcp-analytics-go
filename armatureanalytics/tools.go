@@ -50,8 +50,17 @@ func TelemetryFromContext(ctx context.Context) Telemetry {
 // hook chain must still be installed via server.WithHooks(rec.Hooks()) for
 // events to reach Armature. Tools registered with the plain server.AddTool
 // still emit events, just without intent metadata.
+//
+// Tools whose schema already declares a top-level `telemetry` input are
+// registered untouched (no decoration, no handler wrap): stripping that
+// argument would swallow a real input the tool advertises. The same applies
+// when a RawInputSchema cannot be parsed and extended.
 func InstrumentTool(s *server.MCPServer, tool mcp.Tool, handler server.ToolHandlerFunc) {
-	decorated, _ := decorateToolSchema(tool)
+	decorated, ok := decorateToolSchema(tool)
+	if !ok {
+		s.AddTool(tool, handler)
+		return
+	}
 	s.AddTool(decorated, WrapHandler(handler))
 }
 
@@ -74,18 +83,24 @@ func WrapHandler(handler server.ToolHandlerFunc) server.ToolHandlerFunc {
 	}
 }
 
-// DecorateInputSchemaWithTelemetry mutates a copy of tool's input schema to
-// include the optional telemetry object. The original tool value is not
-// modified — use the returned Tool when registering.
+// DecorateInputSchemaWithTelemetry returns a copy of tool whose input schema
+// includes the optional telemetry object, plus a bool reporting whether the
+// schema was decorated. The original tool value is never modified — use the
+// returned Tool when registering.
+//
+// ok is false when the schema already declares its own top-level `telemetry`
+// property, or when a RawInputSchema cannot be parsed and extended. In that
+// case the Tool is returned unchanged and the caller must NOT pair it with
+// WrapHandler: stripping the argument would swallow a real input the tool
+// advertises. InstrumentTool applies exactly this rule.
 //
 // Mirrors the TS SDK's decorateInputSchemaWithTelemetry: telemetry is added
 // under `properties`, is itself an object with intent / context /
 // frustration_level, and is NEVER added to the schema's `required` array.
 // The Required list inside the telemetry object is also empty by design —
 // intent is a soft nudge.
-func DecorateInputSchemaWithTelemetry(tool mcp.Tool) mcp.Tool {
-	out, _ := decorateToolSchema(tool)
-	return out
+func DecorateInputSchemaWithTelemetry(tool mcp.Tool) (mcp.Tool, bool) {
+	return decorateToolSchema(tool)
 }
 
 func decorateToolSchema(tool mcp.Tool) (mcp.Tool, bool) {
@@ -100,13 +115,19 @@ func decorateToolSchema(tool mcp.Tool) (mcp.Tool, bool) {
 		return tool, true
 	}
 
-	props := tool.InputSchema.Properties
-	if props == nil {
-		props = make(map[string]any, 1)
+	src := tool.InputSchema.Properties
+	if _, exists := src["telemetry"]; exists {
+		// The tool declares its own telemetry input. Leave the schema alone
+		// and tell the caller not to strip that argument.
+		return tool, false
 	}
-	if _, exists := props["telemetry"]; !exists {
-		props["telemetry"] = telemetrySchemaObject()
+	// Copy-on-write: Properties is a shared map reference, so mutating it
+	// in place would silently change the caller's original tool too.
+	props := make(map[string]any, len(src)+1)
+	for k, v := range src {
+		props[k] = v
 	}
+	props["telemetry"] = telemetrySchemaObject()
 	tool.InputSchema.Properties = props
 	if tool.InputSchema.Type == "" {
 		tool.InputSchema.Type = "object"
@@ -126,9 +147,11 @@ func injectTelemetryIntoRawSchema(raw json.RawMessage) (json.RawMessage, bool) {
 	if props == nil {
 		props = make(map[string]any, 1)
 	}
-	if _, exists := props["telemetry"]; !exists {
-		props["telemetry"] = telemetrySchemaObject()
+	if _, exists := props["telemetry"]; exists {
+		// Pre-existing telemetry input; the caller must not strip it.
+		return nil, false
 	}
+	props["telemetry"] = telemetrySchemaObject()
 	schema["properties"] = props
 	if _, hasType := schema["type"]; !hasType {
 		schema["type"] = "object"
@@ -202,7 +225,14 @@ func extractTelemetryFromArgs(args map[string]any) (Telemetry, map[string]any) {
 		// Some clients flatten the block to a JSON string; tolerate it.
 		var m map[string]any
 		if err := json.Unmarshal([]byte(v), &m); err == nil {
-			return extractTelemetryFromArgs(map[string]any{"telemetry": m})
+			// Re-extract with the decoded block in place of the string so
+			// the sibling args survive into the cleaned copy.
+			merged := make(map[string]any, len(args))
+			for k, av := range args {
+				merged[k] = av
+			}
+			merged["telemetry"] = m
+			return extractTelemetryFromArgs(merged)
 		}
 	}
 

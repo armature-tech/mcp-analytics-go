@@ -57,6 +57,11 @@ func main() {
 	go func() {
 		<-stop
 		log.Printf("shutting down...")
+		// os.Exit skips deferred functions, so drain in-flight analytics
+		// batches explicitly before exiting.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = rec.Close(ctx)
 		os.Exit(0)
 	}()
 

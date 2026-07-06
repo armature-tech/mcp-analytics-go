@@ -43,20 +43,23 @@ func TestNewMCPServerWithConfig_BuildsRecorderWhenAPIKeySet(t *testing.T) {
 	}
 }
 
-func TestNewMCPServerWithConfig_BadConfig_CallsOnErrorAndContinues(t *testing.T) {
+func TestNewMCPServerWithConfig_NegativeTimeout_Normalized(t *testing.T) {
 	var captured error
 	s, shutdown := NewMCPServerWithConfig("test", "0", Config{
 		APIKey:  "test-key",
-		Timeout: -1, // invalid; New() should reject
+		Timeout: -1, // NewClient normalizes non-positive timeouts to DefaultTimeout
 		OnError: func(err error, _ Batch) { captured = err },
 	})
 	if s == nil {
-		t.Fatal("server should still be returned on bad config")
+		t.Fatal("server should be returned")
 	}
-	if shutdown == nil || shutdown(context.Background()) != nil {
-		t.Fatal("shutdown should be a no-op when recorder failed to init")
+	if captured != nil {
+		t.Fatalf("OnError should not fire for a normalized timeout, got: %v", captured)
 	}
-	// captured may or may not be non-nil depending on whether New()
-	// validates Timeout — the contract is just that OnError gets a chance.
-	_ = captured
+	if shutdown == nil {
+		t.Fatal("shutdown nil")
+	}
+	if err := shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown returned error: %v", err)
+	}
 }

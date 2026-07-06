@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ## [0.1.0] — Unreleased
 
+### Changed
+
+- `DecorateInputSchemaWithTelemetry` now returns `(mcp.Tool, bool)`. The
+  bool reports whether the schema was decorated, so custom registration
+  paths can skip `WrapHandler` when a tool declares its own `telemetry`
+  input (or when a raw schema cannot be extended).
+
+### Fixed
+
+- String-encoded `telemetry` arguments no longer drop the tool's sibling
+  arguments during extraction.
+- `InstrumentTool` and `DecorateInputSchemaWithTelemetry` leave tools that
+  declare their own top-level `telemetry` input untouched instead of
+  stripping a real argument before the handler runs.
+- Pending tool-call state and `session_init` dedup are keyed per client
+  session even when the transport reports an empty session id, so concurrent
+  sessionless connections no longer collide on shared JSON-RPC ids or emit
+  duplicate `session_init` events on re-initialize.
+- Tool-call completions that land after `Close` clean up their pending-call
+  state instead of leaking it.
+- `decorateToolSchema` no longer mutates the caller's `Properties` map; the
+  decorated copy gets its own map, as the docs promised.
+- A completion racing `Close` can no longer start an ingest POST after
+  `Close` has returned: the closed transition and in-flight registration
+  are serialized, so `Close` drains everything that got in and drops the
+  rest.
+- `tool_call` events on sessionless transports now carry `client_name` /
+  `client_version` / `protocol_version`; client info is tracked by the
+  per-connection session key instead of the (empty) session id string.
+- `examples/minimal` drains in-flight analytics before exiting on
+  SIGINT/SIGTERM (`os.Exit` skips deferred functions).
+
 ### Added
 
 - Initial `armatureanalytics` package: drop-in observability for any MCP

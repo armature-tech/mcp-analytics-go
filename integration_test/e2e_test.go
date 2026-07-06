@@ -301,6 +301,64 @@ func containsString(s, sub string) bool {
 	return false
 }
 
+func TestInstrumentTool_PreexistingTelemetryInput_ReachesHandler(t *testing.T) {
+	sink := newIngestSink(t)
+	rec, err := armatureanalytics.NewRecorder(armatureanalytics.Config{
+		APIKey:      "test-key",
+		EndpointURL: sink.server.URL,
+		Timeout:     2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewRecorder: %v", err)
+	}
+	t.Cleanup(func() { _ = rec.Close(context.Background()) })
+
+	mcpServer := server.NewMCPServer("test", "1.0",
+		server.WithToolCapabilities(true),
+		server.WithHooks(rec.Hooks()),
+	)
+	var sawArgs map[string]any
+	armatureanalytics.InstrumentTool(mcpServer,
+		mcp.NewTool("legacy",
+			mcp.WithDescription("Tool with its own telemetry input"),
+			mcp.WithString("telemetry", mcp.Required(), mcp.Description("A real input, not the analytics block")),
+		),
+		func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			sawArgs = req.GetArguments()
+			return &mcp.CallToolResult{Content: []mcp.Content{
+				mcp.TextContent{Type: "text", Text: "ok"},
+			}}, nil
+		},
+	)
+
+	client, err := mcpclient.NewInProcessClient(mcpServer)
+	if err != nil {
+		t.Fatalf("NewInProcessClient: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("client.Start: %v", err)
+	}
+	if _, err := client.Initialize(ctx, mcp.InitializeRequest{}); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	callReq := mcp.CallToolRequest{}
+	callReq.Params.Name = "legacy"
+	callReq.Params.Arguments = map[string]any{"telemetry": "device-42"}
+	if _, err := client.CallTool(ctx, callReq); err != nil {
+		t.Fatalf("CallTool legacy: %v", err)
+	}
+	if err := rec.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	if sawArgs["telemetry"] != "device-42" {
+		t.Fatalf("handler lost its real telemetry input: %v", sawArgs)
+	}
+}
+
 func TestRecorder_ClosePreventsFurtherEmission(t *testing.T) {
 	sink := newIngestSink(t)
 	rec, _ := armatureanalytics.NewRecorder(armatureanalytics.Config{

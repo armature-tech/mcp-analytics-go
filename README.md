@@ -80,7 +80,7 @@ Hook timing is captured in `BeforeAny` (filtered to `tools/call`) and completed 
 
 - **Existing `*server.MCPServer`** — `armatureanalytics.NewRecorder(cfg)` returns a recorder, `rec.Hooks()` returns hooks you pass to `server.WithHooks(...)`. Use when you already construct the server yourself and want to keep that wiring. Mirrors the TS SDK's `createAnalyticsRecorder`.
 - **Existing `*server.Hooks` bundle** — `rec.Install(hooks)` adds the recorder's hooks alongside yours (OTEL, structured logging, etc.) without replacing them. Use when you already register other hooks at construction time.
-- **Custom tool dispatcher** — `armatureanalytics.WrapHandler(handler)` + `DecorateInputSchemaWithTelemetry(tool)` are the two halves of `InstrumentTool`. Use when you register tools through a path other than `s.AddTool` (custom registries, code-gen) and want to keep telemetry capture. Mirrors the TS SDK's `decorateInputSchemaWithTelemetry`.
+- **Custom tool dispatcher** — `armatureanalytics.WrapHandler(handler)` + `DecorateInputSchemaWithTelemetry(tool)` are the two halves of `InstrumentTool`. Use when you register tools through a path other than `s.AddTool` (custom registries, code-gen) and want to keep telemetry capture. `DecorateInputSchemaWithTelemetry` returns `(tool, ok)`: when `ok` is false the tool already declares its own `telemetry` input — register it untouched and skip `WrapHandler`, otherwise the handler loses a real argument. Mirrors the TS SDK's `decorateInputSchemaWithTelemetry`.
 
 `WithTelemetry` / `TelemetryFromContext` let custom paths attach a `Telemetry` value to the request context so the recorder's hooks pick it up regardless of how the tool was registered.
 

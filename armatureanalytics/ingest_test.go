@@ -17,12 +17,12 @@ type recordingServer struct {
 	t      *testing.T
 	server *httptest.Server
 
-	mu       sync.Mutex
-	bodies   [][]byte
-	auth     string
-	ua       string
-	respond  int
-	delay    time.Duration
+	mu      sync.Mutex
+	bodies  [][]byte
+	auth    string
+	ua      string
+	respond int
+	delay   time.Duration
 }
 
 func newRecordingServer(t *testing.T) *recordingServer {
