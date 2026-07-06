@@ -1,0 +1,116 @@
+name: Publish
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-go-module
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Tag Go module release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.repository == 'armature-tech/mcp-analytics-go'
+    env:
+      MODULE_PATH: github.com/armature-tech/mcp-analytics-go
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check whether this commit is already released
+        id: existing_release
+        run: |
+          set -euo pipefail
+          tag="$(git tag --points-at HEAD --list 'v*' | sort -V | tail -1 || true)"
+          if [[ -n "${tag}" ]]; then
+            echo "Commit ${GITHUB_SHA} already has release tag ${tag}; skipping publish."
+            echo "published=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "published=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Setup Go
+        if: steps.existing_release.outputs.published != 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Run checks
+        if: steps.existing_release.outputs.published != 'true'
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Resolve next patch version
+        if: steps.existing_release.outputs.published != 'true'
+        id: version
+        env:
+          INITIAL_VERSION: "0.1.0"
+        run: |
+          set -euo pipefail
+
+          versions_file="$(mktemp)"
+
+          # proxy.golang.org is append-only: a version it has ever served can
+          # never be reused, even if the tag is later deleted, so the proxy
+          # list is part of the baseline alongside git tags. 404/410 just
+          # means the proxy has never seen the module (e.g. it was private).
+          if proxy_list="$(curl -fsS --max-time 15 "https://proxy.golang.org/${MODULE_PATH}/@v/list")"; then
+            printf '%s\n' "${proxy_list}" >> "${versions_file}"
+          else
+            echo "Could not read proxy.golang.org version list for ${MODULE_PATH}; falling back to git tags." >&2
+          fi
+
+          git fetch --tags --force >/dev/null 2>&1 || true
+          git tag -l 'v*' >> "${versions_file}"
+
+          highest="$(grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' "${versions_file}" | sort -V | tail -1 || true)"
+          if [[ -z "${highest}" ]]; then
+            next_version="${INITIAL_VERSION}"
+          else
+            IFS=. read -r major minor patch <<< "${highest#v}"
+            next_version="${major}.${minor}.$((patch + 1))"
+          fi
+
+          echo "next_version=${next_version}" >> "${GITHUB_OUTPUT}"
+          echo "Publishing ${MODULE_PATH}@v${next_version}"
+
+      - name: Create GitHub release
+        if: steps.existing_release.outputs.published != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT_VERSION: ${{ steps.version.outputs.next_version }}
+        run: |
+          set -euo pipefail
+          gh release create "v${NEXT_VERSION}" \
+            --target "${GITHUB_SHA}" \
+            --title "v${NEXT_VERSION}" \
+            --notes "Published ${MODULE_PATH}@v${NEXT_VERSION} from ${GITHUB_SHA}."
+
+      - name: Request version from the Go module proxy
+        if: steps.existing_release.outputs.published != 'true'
+        env:
+          NEXT_VERSION: ${{ steps.version.outputs.next_version }}
+        run: |
+          set -euo pipefail
+          # Asking the proxy for the new version makes it fetch and cache the
+          # release immediately, which also feeds the pkg.go.dev index.
+          # Best-effort: while the repository is private the proxy cannot see
+          # it, and the tag alone is still a complete release.
+          if curl -fsS --max-time 60 "https://proxy.golang.org/${MODULE_PATH}/@v/v${NEXT_VERSION}.info"; then
+            echo
+            echo "proxy.golang.org now serves ${MODULE_PATH}@v${NEXT_VERSION}."
+          else
+            echo "proxy.golang.org could not fetch ${MODULE_PATH}@v${NEXT_VERSION} (repository private or proxy delay); the tag is still published." >&2
+          fi
