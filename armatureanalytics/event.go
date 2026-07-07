@@ -65,7 +65,7 @@ type ToolCallInput struct {
 	StartedAt   time.Time
 	FinishedAt  time.Time
 	ClientInfo  *ClientInfo
-	Telemetry   Telemetry // optional LLM-supplied intent / context / frustration_level
+	Telemetry   Telemetry // optional LLM-supplied telemetry (V1 or pre-V1 spellings; normalized on emit)
 }
 
 // SessionInitInput is the typed input to BuildSessionInitEvent.
@@ -114,11 +114,19 @@ func BuildToolCallEvent(in ToolCallInput) Event {
 		errPtr = &msg
 	}
 
+	// Canonicalize onto the V1 field names (legacy input spellings accepted)
+	// and emit both key sets: the V1 keys plus legacy mirrors, so an ingest
+	// that hasn't picked up the V1 schema keeps reading events from this SDK.
+	tel := NormalizeTelemetry(in.Telemetry)
 	meta := map[string]any{
 		"tool_name":         in.ToolName,
-		"intent":            stringOrNil(in.Telemetry.Intent),
-		"context":           stringOrNil(in.Telemetry.Context),
-		"frustration_level": stringOrNil(in.Telemetry.FrustrationLevel),
+		"user_turn":         intOrNil(tel.UserTurn),
+		"user_intent":       stringOrNil(tel.UserIntent),
+		"agent_thinking":    stringOrNil(tel.AgentThinking),
+		"user_frustration":  stringOrNil(tel.UserFrustration),
+		"intent":            stringOrNil(tel.UserIntent),
+		"context":           stringOrNil(tel.AgentThinking),
+		"frustration_level": stringOrNil(tel.UserFrustration),
 		"input_preview":     inputPreview,
 	}
 	mergeClientInfo(meta, in.ClientInfo)
@@ -279,4 +287,13 @@ func stringOrNil(s string) any {
 		return nil
 	}
 	return s
+}
+
+// intOrNil returns the int when positive, otherwise nil. Used for the
+// 1-based user_turn metadata field (`integer | null` on the wire).
+func intOrNil(n int) any {
+	if n < 1 {
+		return nil
+	}
+	return n
 }

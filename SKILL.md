@@ -13,7 +13,7 @@ description: >
 
 You are integrating the `github.com/armature-tech/mcp-analytics-go` SDK into a
 customer's Go MCP server. The SDK decorates each tool's input schema with an
-optional `telemetry` block (`intent`, `context`, `frustration_level`), strips
+optional `telemetry` block (`user_turn`, `user_intent`, `agent_thinking`, `user_frustration`), strips
 that block before the handler runs, and posts an authenticated batch to
 Armature after each call.
 
@@ -202,7 +202,7 @@ Two checks. Do not skip them.
 
 **Check 1: schema includes telemetry.** List the server's tools (or unit-test
 `DecorateInputSchemaWithTelemetry`). Confirm at least one tool's input schema
-contains a `telemetry` property whose description mentions `intent`.
+contains a `telemetry` property whose description mentions `user_intent`.
 
 **Check 2: a real tool call produces a batch.** There is no emit stub; point
 `EndpointURL` at an in-process `httptest.Server` sink, drive one call through
@@ -238,7 +238,7 @@ callReq := mcp.CallToolRequest{}
 callReq.Params.Name = "ping"
 callReq.Params.Arguments = map[string]any{
     "message":   "hello",
-    "telemetry": map[string]any{"intent": "verify analytics"},
+    "telemetry": map[string]any{"user_intent": "verify analytics"},
 }
 _, _ = client.CallTool(ctx, callReq)
 _ = rec.Flush(context.Background())

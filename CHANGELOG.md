@@ -6,6 +6,21 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **V1 telemetry schema.** The injected `telemetry` parameter moves to the V1
+  field names: `user_intent` (was `intent`), `agent_thinking` (was `context`),
+  `user_frustration` (was `frustration_level`), plus the new `user_turn`
+  (1-based count of user messages, repeated on every call). Description
+  strings are byte-identical with the TS and Python SDKs. Legacy input
+  spellings are still accepted and normalized (V1 wins on conflict;
+  fractional/zero/negative `user_turn` values are dropped, not coerced), and
+  emitted metadata carries the V1 keys plus legacy mirrors so a
+  not-yet-updated ingest keeps reading events from this SDK.
+- **Description nudge.** `InstrumentTool` now appends the telemetry hint to
+  each tool description (idempotently), matching the TS/Python SDKs — the Go
+  SDK previously injected the schema without the nudge, so agents were far
+  less likely to fill in intent. `AppendTelemetryHint` is exported for custom
+  registration paths.
+
 - `DecorateInputSchemaWithTelemetry` now returns `(mcp.Tool, bool)`. The
   bool reports whether the schema was decorated, so custom registration
   paths can skip `WrapHandler` when a tool declares its own `telemetry`

@@ -245,6 +245,8 @@ func TestAddTool_PropagatesIntentToEvent(t *testing.T) {
 	callReq.Params.Name = "echo"
 	callReq.Params.Arguments = map[string]any{
 		"text": "hi",
+		// Legacy spellings on purpose: a cached pre-V1 client must still land
+		// events with BOTH key sets after normalization.
 		"telemetry": map[string]any{
 			"intent":  "verify intent reaches Armature",
 			"context": "integration test",
@@ -276,8 +278,14 @@ func TestAddTool_PropagatesIntentToEvent(t *testing.T) {
 		if meta["intent"] != "verify intent reaches Armature" {
 			t.Errorf("metadata.intent = %v, want %q", meta["intent"], "verify intent reaches Armature")
 		}
+		if meta["user_intent"] != "verify intent reaches Armature" {
+			t.Errorf("metadata.user_intent = %v, want the V1 mirror", meta["user_intent"])
+		}
 		if meta["context"] != "integration test" {
 			t.Errorf("metadata.context = %v, want %q", meta["context"], "integration test")
+		}
+		if meta["agent_thinking"] != "integration test" {
+			t.Errorf("metadata.agent_thinking = %v, want the V1 mirror", meta["agent_thinking"])
 		}
 		// The input_preview should NOT contain the telemetry block.
 		if preview, ok := meta["input_preview"].(string); ok {
