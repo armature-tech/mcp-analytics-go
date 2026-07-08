@@ -118,8 +118,12 @@ func TestAppendTelemetryHint_Idempotent(t *testing.T) {
 	if AppendTelemetryHint(once) != once {
 		t.Errorf("hint appended twice")
 	}
-	// A description written by a pre-V1 SDK build keeps its old hint without
-	// gaining a second one.
+	// A description written by an earlier-V1 (user_intent only) or pre-V1 SDK
+	// build keeps its old hint without gaining a second one.
+	v1 := "Echoes." + telemetryDescriptionHintV1
+	if AppendTelemetryHint(v1) != v1 {
+		t.Errorf("earlier-V1-hinted description modified")
+	}
 	legacy := "Echoes." + telemetryDescriptionHintLegacy
 	if AppendTelemetryHint(legacy) != legacy {
 		t.Errorf("legacy-hinted description modified")

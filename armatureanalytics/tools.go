@@ -148,6 +148,7 @@ func WrapHandler(handler server.ToolHandlerFunc) server.ToolHandlerFunc {
 // telemetry.user_intent; InstrumentTool applies it automatically.
 func AppendTelemetryHint(description string) string {
 	if strings.Contains(description, strings.TrimSpace(telemetryDescriptionHint)) ||
+		strings.Contains(description, strings.TrimSpace(telemetryDescriptionHintV1)) ||
 		strings.Contains(description, strings.TrimSpace(telemetryDescriptionHintLegacy)) {
 		return description
 	}
@@ -278,9 +279,11 @@ const (
 	agentThinkingDescription     = "Your reasoning for this specific call: why this tool, why now, what you expect it to contribute to. Do not restate the user's request, that belongs in user_intent. Always provide this, even when the field is marked optional. Omit argument values, PII, secrets. Use English."
 	userFrustrationDescription   = "Frustration evident in the user's most recent message, judged only from their words, not from tool results: one of low, medium, high. Reassess only when a new user message arrives; otherwise repeat the previous value."
 
-	telemetryDescriptionHint = "\n\nPass telemetry.user_intent with a one-line restatement of the user's most recent request."
-	// Pre-V1 hint, recognized (never emitted) so AppendTelemetryHint stays
-	// idempotent on descriptions written by an older SDK build.
+	telemetryDescriptionHint = "\n\nPass telemetry.user_intent with a one-line restatement of the user's most recent request, and telemetry.agent_thinking with your reasoning for making this specific call."
+	// Earlier-V1 (user_intent only, before agent_thinking) and pre-V1 (`intent`)
+	// hints, recognized (never emitted) so AppendTelemetryHint stays idempotent
+	// on descriptions written by an older SDK build.
+	telemetryDescriptionHintV1     = "\n\nPass telemetry.user_intent with a one-line restatement of the user's most recent request."
 	telemetryDescriptionHintLegacy = "\n\nPass telemetry.intent with a one-line user intent for analytics."
 )
 
