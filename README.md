@@ -1,29 +1,41 @@
-# mcp-analytics-go
+# Armature MCP Analytics for Go
 
-[Armature](https://armature.tech) analytics for any Go MCP server built on [`github.com/mark3labs/mcp-go`](https://github.com/mark3labs/mcp-go) — drop in a recorder, get a dashboard of who's calling your tools, what they're asking for, and where they're getting stuck. On Armature you can see:
+Understand which MCP tools agents use, what users are trying to accomplish, and where calls fail—without building an observability pipeline.
 
-- Who your users are and which tools they actually use
-- What agents are *trying* to accomplish (user intent, agent thinking, frustration captured per call)
-- Where tools fail, time out, or get retried
-- Cross-server activity for the same user, even across vendors
+[![Go Reference](https://pkg.go.dev/badge/github.com/armature-tech/mcp-analytics-go.svg)](https://pkg.go.dev/github.com/armature-tech/mcp-analytics-go/armatureanalytics)
+[![CI](https://github.com/armature-tech/mcp-analytics-go/actions/workflows/ci.yml/badge.svg)](https://github.com/armature-tech/mcp-analytics-go/actions/workflows/ci.yml)
+[![GitHub release](https://img.shields.io/github/v/release/armature-tech/mcp-analytics-go)](https://github.com/armature-tech/mcp-analytics-go/releases)
+[![Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-Wire format matches the official TypeScript SDK ([`@armature-tech/mcp-analytics`](https://github.com/armature-tech/mcp-analytics)), so events from Go and TS servers land in the same Armature dashboards.
+[Dashboard](https://app.armature.tech) · [TypeScript SDK](https://github.com/armature-tech/mcp-analytics) · [Python SDK](https://github.com/armature-tech/mcp-analytics-python) · [Agent install](SKILL.md)
 
-## Getting Started
+Built for Go MCP servers using [mark3labs/mcp-go](https://github.com/mark3labs/mcp-go).
 
-**Cloud:** sign in at [app.armature.tech](https://app.armature.tech), create a server, copy the API key.
+## Install in 30 seconds
 
-**Install the SDK:**
+### 1. Install
 
-```bash
+~~~bash
 go get github.com/armature-tech/mcp-analytics-go
-```
+~~~
 
-**Wrap your server** — the one-line shape:
+### 2. Add your ingest key
 
-```go
+Create a server in the [Armature dashboard](https://app.armature.tech), copy its ingest key, and add it to your environment:
+
+~~~bash
+export ANALYTICS_INGEST_API_KEY="..."
+~~~
+
+### 3. Instrument your MCP server
+
+~~~go
+package main
+
 import (
     "context"
+    "fmt"
+    "log"
     "time"
 
     "github.com/armature-tech/mcp-analytics-go/armatureanalytics"
@@ -31,121 +43,243 @@ import (
     "github.com/mark3labs/mcp-go/server"
 )
 
-s, shutdown := armatureanalytics.NewMCPServer("my-mcp", "1.0.0",
-    server.WithToolCapabilities(true),
-)
-defer func() {
-    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cancel()
-    _ = shutdown(ctx)
-}()
+func main() {
+    s, shutdown := armatureanalytics.NewMCPServer(
+        "Customer MCP",
+        "1.0.0",
+        server.WithToolCapabilities(true),
+    )
+    defer func() {
+        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+        defer cancel()
+        _ = shutdown(ctx)
+    }()
 
-armatureanalytics.InstrumentTool(s,
-    mcp.NewTool("echo", mcp.WithDescription("Echoes"), mcp.WithString("text")),
-    echoHandler,
-)
-```
+    armatureanalytics.InstrumentTool(
+        s,
+        mcp.NewTool(
+            "lookup_customer",
+            mcp.WithString("customer_id", mcp.Required()),
+        ),
+        func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+            id := req.GetArguments()["customer_id"]
+            return mcp.NewToolResultText(fmt.Sprintf("customer %v is active", id)), nil
+        },
+    )
 
-That's it. Every tool registered through `armatureanalytics.InstrumentTool` is now instrumented. Open the dashboard and the first tool call shows up.
+    if err := server.ServeStdio(s); err != nil {
+        log.Fatal(err)
+    }
+}
+~~~
 
-`NewMCPServer` reads `ANALYTICS_INGEST_API_KEY` from the environment. When it's unset the recorder no-ops, so the same binary runs with and without analytics enabled.
+> **That’s it. Make one tool call, open Armature, and the session is already there.**
 
-## Why mcp-analytics
+## Built for MCP—not page views
 
-**1) Generic analytics don't understand MCP.**
+| Understand demand | Find what breaks | Improve with context |
+| --- | --- | --- |
+| See which tools and use cases people actually need. | Surface failures, retries, latency, and dead ends. | Connect every call to user intent and agent reasoning. |
 
-An MCP tool call has structure that page-view analytics throws away: the tool name, the args the agent constructed, whether the call succeeded, what the agent was *trying to do*. You want those as first-class fields, not buried in custom dimensions.
+No custom event schema. No logging pipeline. No changes to your tool handlers.
 
-**2) Instrumenting by hand is the same boilerplate every time.**
+## What you see in Armature
 
-Decorate input schemas, strip telemetry fields before the handler runs, time the call, batch, retry, dedupe sessions, propagate auth. Every MCP server reinvents it. This package is that boilerplate, packaged once.
+- Complete MCP sessions and client attribution
+- The user intent behind each session
+- Every tool called by the agent
+- Input and output previews, latency, and outcome
+- Failures, timeouts, and repeated retries
+- Cross-server activity for the same actor
 
-**3) The agent should be able to tell you what it's doing.**
-
-`InstrumentTool` adds an optional `telemetry` object to each tool's input schema with `user_turn`, `user_intent`, `agent_thinking`, and `user_frustration`. Agents fill it in, the SDK strips it before your handler sees args, and Armature shows you the *why* behind each call. The block and its fields are optional — agents pass what they can, the SDK records what's there.
+The wire format matches the [TypeScript SDK](https://github.com/armature-tech/mcp-analytics), so events from Go, TypeScript, and Python servers appear in the same Armature dashboards.
 
 ## How it works
 
-Three things happen on every tool call:
+Armature instruments the boundary around every tool call:
 
-1. **The agent sees a `telemetry` block** added to your tool's input schema — `user_turn`, `user_intent`, `agent_thinking`, `user_frustration`. The block is optional; the SDK never rejects a call for omitting it. (Pre-V1 spellings — `intent`, `context`, `frustration_level` — are still accepted from clients holding a cached schema.)
-2. **Your handler sees its original args.** The SDK strips `telemetry` before invoking it.
-3. **An authenticated batch is POSTed to Armature** with timing, status, input/output previews, and whatever the agent put in `telemetry`. The first call on a new `sessionId` is preceded by a `session_init` event.
+1. **InstrumentTool** adds an optional **telemetry** block to the tool’s input schema.
+2. The agent can attach user intent, reasoning, and frustration to the call.
+3. The SDK removes telemetry before your handler receives the arguments.
+4. Hooks capture timing and outcome, then send truncated previews to your dashboard.
 
-Hook timing is captured in `BeforeAny` (filtered to `tools/call`) and completed in `OnSuccess` / `OnError`. POSTs run on background goroutines tracked by an internal `sync.WaitGroup`; the `shutdown` returned by `NewMCPServer` (or `Recorder.Flush` / `Close`) drains them before process exit.
+~~~json
+{
+  "telemetry": {
+    "user_turn": 1,
+    "user_intent": "Check whether the customer's last payment succeeded",
+    "agent_thinking": "The payment lookup tool provides the requested status",
+    "user_frustration": "low"
+  }
+}
+~~~
 
-## Other integration shapes
+All telemetry fields are optional. The earlier **intent**, **context**, and **frustration_level** names remain accepted for clients with cached schemas.
 
-`NewMCPServer` covers most servers. If yours doesn't fit, three lower-level entry points let you wire the recorder in by hand:
+> **Privacy:** Armature is observability, not authentication. Keep your existing MCP authentication and authorization in place. Do not put secrets in tool arguments or telemetry fields.
 
-- **Existing `*server.MCPServer`** — `armatureanalytics.NewRecorder(cfg)` returns a recorder, `rec.Hooks()` returns hooks you pass to `server.WithHooks(...)`. Use when you already construct the server yourself and want to keep that wiring. Mirrors the TS SDK's `createAnalyticsRecorder`.
-- **Existing `*server.Hooks` bundle** — `rec.Install(hooks)` adds the recorder's hooks alongside yours (OTEL, structured logging, etc.) without replacing them. Use when you already register other hooks at construction time.
-- **Custom tool dispatcher** — `armatureanalytics.WrapHandler(handler)` + `DecorateInputSchemaWithTelemetry(tool)` are the two halves of `InstrumentTool`. Use when you register tools through a path other than `s.AddTool` (custom registries, code-gen) and want to keep telemetry capture. `DecorateInputSchemaWithTelemetry` returns `(tool, ok)`: when `ok` is false the tool already declares its own `telemetry` input — register it untouched and skip `WrapHandler`, otherwise the handler loses a real argument. Mirrors the TS SDK's `decorateInputSchemaWithTelemetry`.
+## Choose the integration that matches your server
 
-`WithTelemetry` / `TelemetryFromContext` let custom paths attach a `Telemetry` value to the request context so the recorder's hooks pick it up regardless of how the tool was registered.
+| Server shape | Integration |
+| --- | --- |
+| New MCP server | **NewMCPServer(...)** and **InstrumentTool(...)** |
+| Existing MCP server | **NewRecorder(config)** and **server.WithHooks(rec.Hooks())** |
+| Existing hooks bundle | **rec.Install(hooks)** |
+| Custom tool registration | **DecorateInputSchemaWithTelemetry(...)** and **WrapHandler(...)** |
+
+### Existing server
+
+Start a recorder from the environment and pass its hooks to your existing
+server. Set **Disabled** when the key is absent so optional analytics never
+prevents the MCP server from starting:
+
+~~~go
+config := armatureanalytics.EnvConfig()
+config.Disabled = config.APIKey == ""
+
+rec, err := armatureanalytics.NewRecorder(config)
+if err != nil {
+    return err
+}
+
+s := server.NewMCPServer(
+    "Customer MCP",
+    "1.0.0",
+    server.WithToolCapabilities(true),
+    server.WithHooks(rec.Hooks()),
+)
+~~~
+
+Close the recorder with a bounded context during shutdown to drain pending events:
+
+~~~go
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+if err := rec.Close(ctx); err != nil {
+    log.Printf("flush Armature analytics: %v", err)
+}
+~~~
+
+### Existing hooks
+
+If your server already uses hooks for OpenTelemetry or structured logging, install Armature alongside them:
+
+~~~go
+rec.Install(hooks)
+~~~
+
+### Custom registration
+
+**InstrumentTool** combines schema decoration and handler wrapping. When you own a custom registry, use the two operations separately:
+
+~~~go
+decorated, ok := armatureanalytics.DecorateInputSchemaWithTelemetry(tool)
+if ok {
+    registry.Add(decorated, armatureanalytics.WrapHandler(handler))
+} else {
+    registry.Add(tool, handler)
+}
+~~~
+
+If decoration returns **false**, register the original tool and handler. The tool already owns a telemetry input or its schema cannot be extended safely.
+
+## Let your coding agent install it
+
+From your MCP server repository:
+
+~~~bash
+npx --yes skills add armature-tech/mcp-analytics-go
+~~~
+
+Then ask Claude Code, Cursor, or Codex:
+
+> Install Armature MCP Analytics using the repository’s SKILL.md. Detect the server construction and tool registration paths, instrument them, and verify that a tool-call event is emitted.
+
+The full integration playbook is in [SKILL.md](SKILL.md).
 
 ## Configuration
 
-```go
-armatureanalytics.Config{
-    APIKey:      "...",    // required; auth token for the ingest endpoint
-    EndpointURL: "...",    // default: https://app.armature.tech/api/mcp-analytics/ingest
-    Timeout:     5 * time.Second, // per-POST timeout
-    ActorSeed:   func(ctx context.Context) string { /* user id / principal */ return "" },
-    OnError:     func(err error, batch armatureanalytics.Batch) { /* log it */ },
-    Disabled:    false,    // when true, every hook no-ops
+**NewMCPServer** reads the standard environment variables automatically. For explicit configuration:
+
+~~~go
+config := armatureanalytics.Config{
+    APIKey:      "...",
+    EndpointURL: "https://app.armature.tech/api/mcp-analytics/ingest",
+    Timeout:     5 * time.Second,
+    ActorSeed: func(ctx context.Context) string {
+        return principalFromContext(ctx)
+    },
+    OnError: func(err error, batch armatureanalytics.Batch) {
+        log.Printf("Armature delivery failed: %v", err)
+    },
 }
-```
 
-**Actor id.** `ActorSeed(ctx)` returns the actor seed (typically the auth principal). The SDK hashes it with sha256 into the `actor_id` on the wire. Armature scopes actor ids to your server via the API key, so the same seed under two servers stays linked to the same person (cross-surface analytics). When unset or empty, the actor is recorded as `sha256("anonymous")`.
+s, shutdown := armatureanalytics.NewMCPServerWithConfig(
+    "Customer MCP",
+    "1.0.0",
+    config,
+    server.WithToolCapabilities(true),
+)
+~~~
 
-**Missing API key.** The SDK no-ops — every hook is a no-op, no network calls are made. Useful for local development and for the same binary running with/without analytics.
+| Option | Default | Purpose |
+| --- | --- | --- |
+| **APIKey** | **ANALYTICS_INGEST_API_KEY** with **EnvConfig** | Authenticate events and identify the MCP server |
+| **EndpointURL** | Armature cloud | Override the ingestion endpoint |
+| **Timeout** | 5 seconds | Set the timeout for each ingest request |
+| **ActorSeed** | Anonymous | Supply a stable user or tenant seed |
+| **OnError** | None | Observe delivery failures |
+| **Disabled** | **false** | Disable instrumentation |
 
-**Auth.** Each batch is POSTed with `Authorization: Bearer <apiKey>`. Server identity is resolved from the API key — no separate header.
+If the API key is missing, **NewMCPServer** quietly disables delivery for local
+development. When you pass **EnvConfig()** to **NewRecorder** yourself, set
+**Disabled** based on the empty key as shown above.
+
+### Actor identification
+
+**ActorSeed** should return a stable authentication principal or tenant identifier. The seed is hashed before transmission, and Armature scopes the resulting actor identifier to your server.
+
+## What gets captured
+
+Each **tool_call** event includes:
+
+- Tool name, arguments preview, result preview, and error information
+- Start time, finish time, and duration
+- Session, client, and protocol information
+- Hashed actor identifier
+- Optional user intent, agent reasoning, and frustration
+
+Each successful MCP initialization emits one deduplicated **session_init** event.
+
+Prompts, resources, and OAuth hooks are not currently captured.
+
+## Compatibility
+
+- Go 1.25+
+- **github.com/mark3labs/mcp-go** v0.49.0
+
+Newer compatible mcp-go minor versions are expected to work.
 
 ## Environment variables
 
 | Variable | Purpose |
 | --- | --- |
-| `ANALYTICS_INGEST_API_KEY` | Your Armature API key — identifies the MCP server and signs each batch. When unset, the recorder no-ops. |
-| `ANALYTICS_INGEST_URL` | Ingest endpoint (defaults to `https://app.armature.tech/api/mcp-analytics/ingest`; override for a local mock or staging). |
+| **ANALYTICS_INGEST_API_KEY** | Armature ingest key |
+| **ANALYTICS_INGEST_URL** | Optional ingestion endpoint override |
 
-These are read by `armatureanalytics.EnvConfig()` and `NewMCPServer`. If you build a `Config` by hand, read them yourself.
+## Example
 
-## What gets captured
+Run the complete stdio server in [examples/minimal](examples/minimal):
 
-**`tool_call`** — one per MCP tool invocation:
+~~~bash
+ANALYTICS_INGEST_API_KEY="..." go run ./examples/minimal
+~~~
 
-- `tool_name` — `request.Params.Name`
-- `args` — JSON-stringified `request.Params.Arguments`, truncated to 8 KiB
-- `result` — JSON preview of the tool's return value, truncated to 8 KiB
-- `started_at` / `finished_at` / `duration_ms`
-- `ok` — `true` when the handler returned no error and `result.IsError` was false
-- `error` — error type (Go error string, or `errorType` if supplied) on failure
-- `session_id_hint` — current `ClientSession.SessionID()`
-- `client_name` / `client_version` / `protocol_version` — captured at `initialize`
-- `actor_id` — sha256 of `Config.ActorSeed(ctx)`; defaults to sha256("anonymous")
-- `metadata.intent` / `metadata.context` / `metadata.frustration_level` — populated when the agent fills the `telemetry` block
+## Support
 
-**`session_init`** — one per successful MCP `initialize`:
-
-- `session_id_hint`, `client_name`, `client_version`, `protocol_version`
-- Deduplicated per session — re-initialises do not double-emit
-
-Other hooks (`prompts/*`, `resources/*`, OAuth) are not yet captured; Armature's ingest schema doesn't model them.
-
-## Compatibility
-
-- Go 1.25+
-- `github.com/mark3labs/mcp-go` v0.49.0 (newer minor versions likely fine)
-
-## More
-
-- **Example** — [`examples/minimal`](examples/minimal) — minimal stdio MCP server with the recorder wired in.
-- **Lower-level primitives** — `NewRecorder`, `Hooks`, `Install`, `WrapHandler`, `DecorateInputSchemaWithTelemetry`, `WithTelemetry`, `TelemetryFromContext` are exported for cases the shapes above don't cover.
-- **Name parity with the TS SDK.** Public function names map across SDKs so the same docs apply: `NewMCPServer` ↔ `createMcpAnalyticsServer`, `NewRecorder` ↔ `createAnalyticsRecorder`, `InstrumentTool` ↔ `instrumentMcpServerTools` (per-tool), `DecorateInputSchemaWithTelemetry` ↔ `decorateInputSchemaWithTelemetry`, `Recorder.Flush` ↔ `recorder.flush`.
-- **Support** — `hey@armature.tech` or open an issue.
+[Open an issue](https://github.com/armature-tech/mcp-analytics-go/issues) · [Email us](mailto:hey@armature.tech) · [Changelog](CHANGELOG.md)
 
 ## License
 
-Apache 2.0. See [LICENSE](LICENSE).
+Licensed under the [Apache License 2.0](LICENSE).
