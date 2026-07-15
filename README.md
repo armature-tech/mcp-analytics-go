@@ -7,7 +7,7 @@ Understand which MCP tools agents use, what users are trying to accomplish, and 
 [![GitHub release](https://img.shields.io/github/v/release/armature-tech/mcp-analytics-go)](https://github.com/armature-tech/mcp-analytics-go/releases)
 [![Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-[Dashboard](https://app.armature.tech) · [TypeScript SDK](https://github.com/armature-tech/mcp-analytics) · [Python SDK](https://github.com/armature-tech/mcp-analytics-python) · [Agent install](SKILL.md)
+[Armature](https://armature.tech) · [TypeScript SDK](https://github.com/armature-tech/mcp-analytics) · [Python SDK](https://github.com/armature-tech/mcp-analytics-python) · [Agent install](SKILL.md)
 
 Built for Go MCP servers using [mark3labs/mcp-go](https://github.com/mark3labs/mcp-go).
 
