@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- Cross-language stateless HTTP helpers: `ResolveStatelessHTTPSession`,
+  identity-bearing session IDs, official-SDK session generators, and a
+  mark3labs request-scoped session manager.
+- `DeliveryAwait` and custom `Config.Emit` delivery for serverless functions
+  and custom pipelines.
+- Workflow-run markers derived from `X-Armature-Workflow-Run-Id`, plus the
+  Authorization-header actor fallback used by the TypeScript and Python SDKs.
+- Process-scoped stdio session IDs, lazy `session_init` on cold tool-call
+  instances, bounded session dedup, and client identity recovery from
+  stateless session IDs.
+- Explicit `ToolCallInput.RequestID`; otherwise each call receives a fresh UUID
+  so reconnecting JSON-RPC counters cannot collide at ingest.
+
 - Official `github.com/modelcontextprotocol/go-sdk/mcp` support through the
   `armatureanalytics/official` adapter. It provides receiving middleware,
   factory and recorder integration, typed `InstrumentTool`, schema decoration,
@@ -17,6 +30,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Sessionless official-SDK requests no longer share an empty metadata-cache
+  key, and requests without an evictable server session are not retained.
+- Cancelled mark3labs calls that never reach a completion hook now emit a
+  cancelled tool event and release their pending arguments.
+- Pending-call registration is serialized with recorder shutdown, preventing
+  calls from being retained after `Close` performs its cleanup sweep.
 - Installation commands now target importable package paths instead of the
   package-less module root, so clean consumer builds receive transitive sums.
 - CI and the module minimum now use patched Go 1.25.12 rather than Go 1.25.5.

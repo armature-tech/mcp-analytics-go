@@ -49,31 +49,36 @@ type Event struct {
 	Calls                 []any          `json:"calls"`
 	Logs                  []any          `json:"logs"`
 	SearchCalls           []any          `json:"search_calls"`
+	IsWorkflow            bool           `json:"is_workflow,omitempty"`
+	WorkflowRunID         string         `json:"workflow_run_id,omitempty"`
 }
 
 // ToolCallInput is the typed input to BuildToolCallEvent — what every hook
 // integration needs to surface for a single MCP tool call.
 type ToolCallInput struct {
-	ToolName    string
-	Args        any
-	Result      any
-	Err         error
-	IsToolError bool   // set when the tool returned an MCP error result without raising err
-	ErrorType   string // optional classification (e.g. "auth_failed"); falls back to err.Error()
-	SessionID   string
-	ActorSeed   string // typically the auth principal; hashed into actor_id
-	StartedAt   time.Time
-	FinishedAt  time.Time
-	ClientInfo  *ClientInfo
-	Telemetry   Telemetry // optional LLM-supplied telemetry (V1 or pre-V1 spellings; normalized on emit)
+	ToolName      string
+	RequestID     string // optional explicit idempotency key; defaults to a fresh UUID
+	Args          any
+	Result        any
+	Err           error
+	IsToolError   bool   // set when the tool returned an MCP error result without raising err
+	ErrorType     string // optional classification (e.g. "auth_failed"); falls back to err.Error()
+	SessionID     string
+	ActorSeed     string // typically the auth principal; hashed into actor_id
+	StartedAt     time.Time
+	FinishedAt    time.Time
+	ClientInfo    *ClientInfo
+	Telemetry     Telemetry // optional LLM-supplied telemetry (V1 or pre-V1 spellings; normalized on emit)
+	WorkflowRunID string    // optional Armature workflow-run UUID; marks synthetic traffic
 }
 
 // SessionInitInput is the typed input to BuildSessionInitEvent.
 type SessionInitInput struct {
-	SessionID  string
-	ActorSeed  string
-	StartedAt  time.Time
-	ClientInfo *ClientInfo
+	SessionID     string
+	ActorSeed     string
+	StartedAt     time.Time
+	ClientInfo    *ClientInfo
+	WorkflowRunID string // optional Armature workflow-run UUID; marks synthetic traffic
 }
 
 // ClientInfo mirrors the MCP InitializeRequest's clientInfo block plus
@@ -88,7 +93,10 @@ type ClientInfo struct {
 // BuildToolCallEvent constructs the wire-shape Event for a single tool call.
 func BuildToolCallEvent(in ToolCallInput) Event {
 	actorID := ActorID(in.ActorSeed)
-	requestID := requestIDFor(actorID, KindToolCall, in.ToolName, in.FinishedAt)
+	requestID := in.RequestID
+	if requestID == "" {
+		requestID = randomUUID()
+	}
 
 	source, sourceTrunc := truncateUTF8("MCP tool call: "+in.ToolName+"\n\nInput:\n"+stringifyPreview(in.Args), MaxSourceBytes)
 	inputPreview, _ := truncateUTF8(stringifyPreview(in.Args), MaxPreviewBytes)
@@ -149,6 +157,8 @@ func BuildToolCallEvent(in ToolCallInput) Event {
 		Calls:                 []any{},
 		Logs:                  []any{},
 		SearchCalls:           []any{},
+		IsWorkflow:            in.WorkflowRunID != "",
+		WorkflowRunID:         in.WorkflowRunID,
 	}
 }
 
@@ -191,6 +201,8 @@ func BuildSessionInitEvent(in SessionInitInput) Event {
 		Calls:         []any{},
 		Logs:          []any{},
 		SearchCalls:   []any{},
+		IsWorkflow:    in.WorkflowRunID != "",
+		WorkflowRunID: in.WorkflowRunID,
 	}
 }
 
@@ -229,10 +241,6 @@ func ActorID(seed string) string {
 // Matches the TS SDK shape: sha256(actor_id + " " + kind + " " + request_id).
 func EventID(actorID, kind, requestID string) string {
 	return sha256Hex(actorID + " " + kind + " " + requestID)
-}
-
-func requestIDFor(actorID, kind, toolName string, finishedAt time.Time) string {
-	return actorID + ":" + kind + ":" + toolName + ":" + finishedAt.UTC().Format(time.RFC3339Nano)
 }
 
 func sha256Hex(v string) string {

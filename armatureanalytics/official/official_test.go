@@ -166,6 +166,53 @@ func TestOfficialSDKEndToEnd(t *testing.T) {
 	}
 }
 
+func TestSessionlessRequestsDoNotShareCachedIdentity(t *testing.T) {
+	recorder, err := NewRecorder(Config{
+		Delivery: armatureanalytics.DeliveryAwait,
+		Emit:     func(context.Context, armatureanalytics.Batch) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqA := &mcp.ServerRequest[*mcp.InitializeParams]{
+		Params: &mcp.InitializeParams{},
+		Extra:  &mcp.RequestExtra{Header: http.Header{}},
+	}
+	reqB := &mcp.ServerRequest[*mcp.InitializeParams]{
+		Params: &mcp.InitializeParams{},
+		Extra:  &mcp.RequestExtra{Header: http.Header{}},
+	}
+	if sessionKey(reqA) == sessionKey(reqB) {
+		t.Fatal("unrelated sessionless requests received the same cache key")
+	}
+	if !recorder.rememberSession(sessionKey(reqA), nil, "", &armatureanalytics.ClientInfo{Name: "a"}) ||
+		!recorder.rememberSession(sessionKey(reqB), nil, "", &armatureanalytics.ClientInfo{Name: "b"}) {
+		t.Fatal("sessionless requests were incorrectly deduplicated")
+	}
+	if len(recorder.sessions) != 0 {
+		t.Fatalf("sessionless metadata was cached without an eviction signal: %#v", recorder.sessions)
+	}
+
+	sessionID := armatureanalytics.BuildStatelessSessionID(
+		&armatureanalytics.ClientInfo{Name: "stateless-client"},
+	)
+	reqA.Extra.Header.Set("Mcp-Session-Id", sessionID)
+	if got := recorder.analyticsSessionID(reqA); got != sessionID {
+		t.Fatalf("analytics session id = %q, want echoed %q", got, sessionID)
+	}
+
+	reqA.Extra.Header.Del("Mcp-Session-Id")
+	fallback := armatureanalytics.ResolveStatelessHTTPSession(
+		armatureanalytics.StatelessHTTPInput{
+			Body:    map[string]any{"method": "tools/call"},
+			Headers: reqA.Extra.Header,
+		},
+	)
+	if got := recorder.analyticsSessionID(reqA); got != fallback.SessionID {
+		t.Fatalf("analytics fallback id = %q, want %q", got, fallback.SessionID)
+	}
+}
+
 func TestDecorateDerivedStructSchema(t *testing.T) {
 	type input struct {
 		Message string `json:"message" jsonschema:"message to echo"`

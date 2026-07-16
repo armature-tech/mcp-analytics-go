@@ -181,6 +181,59 @@ All telemetry fields are optional. The earlier **intent**, **context**, and **fr
 | Official SDK, new server | `official.NewMCPServer(...)` and `official.InstrumentTool(...)` |
 | Official SDK, existing server | `official.NewRecorder(config)`, then `rec.Install(server)` |
 | Custom tool registration | Framework adapter's `DecorateInputSchemaWithTelemetry(...)` and `WrapHandler(...)` |
+| Stateless HTTP / serverless | `ResolveStatelessHTTPSession(...)` per request |
+
+### Stateless HTTP and serverless
+
+Initialization and tool calls can land on different instances. Resolve every
+request before constructing its per-request MCP server/transport:
+
+~~~go
+var body any
+raw, _ := io.ReadAll(r.Body)
+_ = json.Unmarshal(raw, &body)
+r.Body = io.NopCloser(bytes.NewReader(raw))
+
+session := armatureanalytics.ResolveStatelessHTTPSession(
+    armatureanalytics.StatelessHTTPInput{Body: body, Headers: r.Header},
+)
+~~~
+
+For the official SDK, set the initialize-only generator on the per-request
+server and keep the transport stateless:
+
+~~~go
+s, shutdown := official.NewMCPServer(
+    &mcp.Implementation{Name: "Customer MCP", Version: "1.0.0"},
+    &mcp.ServerOptions{GetSessionID: session.SessionIDGenerator()},
+)
+defer shutdown(r.Context())
+
+handler := mcp.NewStreamableHTTPHandler(
+    func(*http.Request) *mcp.Server { return s },
+    &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true},
+)
+handler.ServeHTTP(w, r)
+~~~
+
+For mark3labs, pass the request-scoped no-store manager:
+
+~~~go
+handler := server.NewStreamableHTTPServer(
+    s,
+    server.WithSessionIdManager(session.Mark3labsSessionIDManager()),
+)
+handler.ServeHTTP(w, r)
+~~~
+
+The helper mints `mcp_<client>_v_<version>_<uuid>` at `initialize`; compliant
+clients echo it in `Mcp-Session-Id`, so later cold invocations recover the same
+session and client identity without shared storage. If a later request omits
+the echo, the helper injects a one-off fallback into the supplied request
+headers so the framework adapter still records a distinct request boundary.
+Treat the ID as
+observability, never authentication. Set `Config.Delivery` to
+`armatureanalytics.DeliveryAwait` in serverless handlers.
 
 ### Existing mark3labs server
 
@@ -283,6 +336,7 @@ config := armatureanalytics.Config{
     APIKey:      "...",
     EndpointURL: "https://app.armature.tech/api/mcp-analytics/ingest",
     Timeout:     5 * time.Second,
+    Delivery:    armatureanalytics.DeliveryAwait,
     ActorSeed: func(ctx context.Context) string {
         return principalFromContext(ctx)
     },
@@ -307,7 +361,9 @@ The official adapter accepts the same `Config` fields through
 | **APIKey** | **ANALYTICS_INGEST_API_KEY** with **EnvConfig** | Authenticate events and identify the MCP server |
 | **EndpointURL** | Armature cloud | Override the ingestion endpoint |
 | **Timeout** | 5 seconds | Set the timeout for each ingest request |
-| **ActorSeed** | Anonymous | Supply a stable user or tenant seed |
+| **Delivery** | `DeliveryBackground` | Use `DeliveryAwait` for serverless and short-lived handlers |
+| **Emit** | Network emitter | Replace delivery for tests or custom pipelines; makes APIKey optional |
+| **ActorSeed** | Authorization header, then anonymous | Supply a stable user or tenant seed |
 | **OnError** | None | Observe delivery failures |
 | **Disabled** | **false** | Disable instrumentation |
 
@@ -315,8 +371,8 @@ If the API key is missing, **NewMCPServer** quietly disables delivery for local
 development. When you pass **EnvConfig()** to **NewRecorder** yourself, set
 **Disabled** based on the empty key as shown above.
 
-For production and external pilots, set `OnError`; delivery is asynchronous,
-so otherwise an invalid key or ingest failure is intentionally silent.
+For production and external pilots, set `OnError`; otherwise an invalid key or
+ingest failure is intentionally silent.
 
 ### Actor identification
 
@@ -337,6 +393,9 @@ Each **tool_call** event includes:
 - Optional user intent, agent reasoning, and frustration
 
 Each successful MCP initialization emits one deduplicated **session_init** event.
+On a cold stateless tool-call instance, the recorder lazily re-emits the same
+stable session event; ingest coalesces it by event ID. Stdio servers receive a
+process-scoped session ID so separate CLI conversations never merge.
 
 Prompts, resources, and OAuth hooks are not currently captured.
 

@@ -7,7 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,9 +34,10 @@ type Batch = armatureanalytics.Batch
 type Shutdown = armatureanalytics.Shutdown
 
 type sessionInfo struct {
-	clientInfo *armatureanalytics.ClientInfo
-	emitted    bool
-	session    *mcp.ServerSession
+	clientInfo         *armatureanalytics.ClientInfo
+	analyticsSessionID string
+	emitted            bool
+	session            *mcp.ServerSession
 }
 
 // Recorder installs official-SDK middleware and owns analytics delivery.
@@ -54,7 +57,8 @@ func EnvConfig() Config {
 }
 
 // NewRecorder constructs an official-SDK recorder. An empty API key returns
-// armatureanalytics.ErrMissingAPIKey unless cfg.Disabled is true.
+// armatureanalytics.ErrMissingAPIKey unless cfg.Disabled is true or cfg.Emit
+// replaces network delivery.
 func NewRecorder(cfg Config) (*Recorder, error) {
 	core, err := armatureanalytics.NewRecorder(cfg)
 	if err != nil {
@@ -77,7 +81,7 @@ func NewMCPServer(impl *mcp.Implementation, opts *mcp.ServerOptions) (*mcp.Serve
 // NewMCPServerWithConfig is NewMCPServer with explicit analytics config.
 func NewMCPServerWithConfig(impl *mcp.Implementation, opts *mcp.ServerOptions, cfg Config) (*mcp.Server, Shutdown) {
 	s := mcp.NewServer(impl, opts)
-	if cfg.APIKey == "" && !cfg.Disabled {
+	if cfg.APIKey == "" && cfg.Emit == nil && !cfg.Disabled {
 		return s, func(context.Context) error { return nil }
 	}
 
@@ -178,13 +182,16 @@ func (r *Recorder) recordInitialize(ctx context.Context, req mcp.Request, starte
 
 	key := sessionKey(req)
 	session, _ := req.GetSession().(*mcp.ServerSession)
-	if !r.rememberSession(key, session, info) {
+	analyticsSessionID := r.analyticsSessionID(req)
+	if !r.rememberSession(key, session, analyticsSessionID, info) {
 		return
 	}
 	r.core.RecordSessionInit(ctx, armatureanalytics.SessionInitInput{
-		SessionID:  sessionID(req),
-		StartedAt:  startedAt,
-		ClientInfo: info,
+		SessionID:     analyticsSessionID,
+		ActorSeed:     r.core.ResolveActorSeed(ctx, requestHeaders(req)),
+		StartedAt:     startedAt,
+		ClientInfo:    info,
+		WorkflowRunID: armatureanalytics.WorkflowRunIDFromHeaders(requestHeaders(req)),
 	})
 }
 
@@ -203,31 +210,47 @@ func (r *Recorder) recordToolCall(
 	}
 
 	telemetry, _, preview := parseArguments(params.Arguments)
+	analyticsSessionID := r.analyticsSessionID(req)
 	isToolError := false
 	if toolResult, ok := result.(*mcp.CallToolResult); ok && toolResult != nil {
 		isToolError = toolResult.IsError
 	}
 	r.core.RecordToolCall(ctx, armatureanalytics.ToolCallInput{
-		ToolName:    params.Name,
-		Args:        preview,
-		Result:      result,
-		Err:         callErr,
-		IsToolError: isToolError,
-		SessionID:   sessionID(req),
-		StartedAt:   startedAt,
-		FinishedAt:  finishedAt,
-		ClientInfo:  clientInfo,
-		Telemetry:   telemetry,
+		ToolName:      params.Name,
+		Args:          preview,
+		Result:        result,
+		Err:           callErr,
+		IsToolError:   isToolError,
+		SessionID:     analyticsSessionID,
+		ActorSeed:     r.core.ResolveActorSeed(ctx, requestHeaders(req)),
+		StartedAt:     startedAt,
+		FinishedAt:    finishedAt,
+		ClientInfo:    clientInfo,
+		Telemetry:     telemetry,
+		WorkflowRunID: armatureanalytics.WorkflowRunIDFromHeaders(requestHeaders(req)),
 	})
 }
 
-func (r *Recorder) rememberSession(key any, session *mcp.ServerSession, info *armatureanalytics.ClientInfo) bool {
+func requestHeaders(req mcp.Request) http.Header {
+	if req == nil || req.GetExtra() == nil {
+		return nil
+	}
+	return req.GetExtra().Header
+}
+
+func (r *Recorder) rememberSession(key any, session *mcp.ServerSession, analyticsSessionID string, info *armatureanalytics.ClientInfo) bool {
+	// A request without a ServerSession has no lifecycle signal we can use to
+	// evict cached metadata. Do not cache it: stateless tool requests recover
+	// client identity from their echoed identity-bearing session ID instead.
+	if session == nil {
+		return true
+	}
 	r.sessionsMu.Lock()
 	if existing, ok := r.sessions[key]; ok && existing.emitted {
 		r.sessionsMu.Unlock()
 		return false
 	}
-	r.sessions[key] = sessionInfo{clientInfo: info, emitted: true, session: session}
+	r.sessions[key] = sessionInfo{clientInfo: info, analyticsSessionID: analyticsSessionID, emitted: true, session: session}
 	r.sessionsMu.Unlock()
 
 	// A ServerSession remains stable for the lifetime of a persistent MCP
@@ -254,21 +277,63 @@ func (r *Recorder) clientInfo(key any) *armatureanalytics.ClientInfo {
 	return r.sessions[key].clientInfo
 }
 
-func sessionKey(req mcp.Request) any {
-	if req == nil || req.GetSession() == nil {
-		return ""
+func requestSession(req mcp.Request) mcp.Session {
+	if req == nil {
+		return nil
 	}
-	if id := req.GetSession().ID(); id != "" {
-		return id
+	session := req.GetSession()
+	if session == nil {
+		return nil
 	}
-	return req.GetSession()
+	value := reflect.ValueOf(session)
+	if (value.Kind() == reflect.Pointer || value.Kind() == reflect.Interface) && value.IsNil() {
+		return nil
+	}
+	return session
 }
 
-func sessionID(req mcp.Request) string {
-	if req == nil || req.GetSession() == nil {
+func sessionKey(req mcp.Request) any {
+	if req == nil {
 		return ""
 	}
-	return req.GetSession().ID()
+	if session := requestSession(req); session != nil {
+		if id := session.ID(); id != "" {
+			return id
+		}
+		return session
+	}
+	if id := strings.TrimSpace(requestHeaders(req).Get("Mcp-Session-Id")); id != "" {
+		return id
+	}
+	// Request implementations in the official SDK are pointer-backed. Keeping
+	// the request itself as the fallback prevents unrelated sessionless calls
+	// from sharing the empty-string key.
+	return req
+}
+
+func (r *Recorder) analyticsSessionID(req mcp.Request) string {
+	if req == nil {
+		return ""
+	}
+	if session := requestSession(req); session != nil {
+		if id := session.ID(); id != "" {
+			return id
+		}
+		key := sessionKey(req)
+		r.sessionsMu.Lock()
+		if existing := r.sessions[key].analyticsSessionID; existing != "" {
+			r.sessionsMu.Unlock()
+			return existing
+		}
+		r.sessionsMu.Unlock()
+	}
+	if id := strings.TrimSpace(requestHeaders(req).Get("Mcp-Session-Id")); id != "" {
+		return id
+	}
+	if req.GetExtra() != nil && req.GetExtra().Header != nil {
+		return ""
+	}
+	return armatureanalytics.ProcessScopedSessionID()
 }
 
 // InstrumentTool registers a typed official-SDK tool with analytics schema

@@ -63,7 +63,8 @@ mechanisms. Never commit a real value.
 | `ANALYTICS_INGEST_URL` | Optional endpoint override; defaults to Armature cloud |
 
 Factory helpers quietly disable analytics when the API key is absent. Direct
-`NewRecorder` calls return `ErrMissingAPIKey` unless `Config.Disabled` is true:
+`NewRecorder` calls return `ErrMissingAPIKey` unless `Config.Disabled` is true
+or `Config.Emit` replaces network delivery:
 
 ```go
 cfg := adapter.EnvConfig()
@@ -86,10 +87,26 @@ Wire exactly one bounded drain:
 | Runtime | Drain |
 | --- | --- |
 | Long-lived process | `shutdown(ctx)` from the factory, or `rec.Close(ctx)` |
-| Short-lived/serverless process | `rec.Flush(ctx)` before process/request exit |
+| Short-lived/serverless process | `Config.Delivery = armatureanalytics.DeliveryAwait` |
 
 Use `context.WithTimeout`; do not flush inside every tool handler. Analytics
 POSTs run off the request path and are tracked until the drain completes.
+
+### Stateless HTTP / serverless sessions
+
+When initialize and tool calls can land on different instances, call
+`ResolveStatelessHTTPSession` for every parsed request. Use
+`session.SessionIDGenerator()` with the official SDK's per-request
+`mcp.ServerOptions.GetSessionID`, or `session.Mark3labsSessionIDManager()` with
+mark3labs `server.WithSessionIdManager`. Never use mark3labs
+`WithStateLess(true)` here: it intentionally returns no session ID and splits
+one conversation into one analytics session per call.
+
+The client must echo the issued `Mcp-Session-Id`. Use `DeliveryAwait` so the
+serverless invocation does not freeze before ingestion finishes.
+Pass the live `r.Header` map into `StatelessHTTPInput`; if the client omits its
+echo, the resolver injects a one-off fallback there so the adapter preserves a
+distinct request boundary. Treat these IDs as attribution, not authentication.
 
 ## 5. Verify behavior
 

@@ -66,12 +66,13 @@ func NewMCPServer(name, version string, opts ...server.ServerOption) (*server.MC
 // config layer, tests, or apps that want to set Config.OnError /
 // Config.Timeout).
 //
-// Same semantics as NewMCPServer: cfg.APIKey == "" disables analytics
-// cleanly; cfg.OnError is called both for ingest failures and for a
-// failed recorder init (so callers see the error without panicking).
+// Same semantics as NewMCPServer: cfg.APIKey == "" disables network
+// analytics unless cfg.Emit supplies custom delivery. cfg.OnError is called
+// both for ingest failures and for a failed recorder init (so callers see the
+// error without panicking).
 func NewMCPServerWithConfig(name, version string, cfg Config, opts ...server.ServerOption) (*server.MCPServer, Shutdown) {
 	var rec *Recorder
-	if cfg.APIKey != "" {
+	if cfg.APIKey != "" || cfg.Emit != nil {
 		r, err := NewRecorder(cfg)
 		if err != nil {
 			if cfg.OnError != nil {

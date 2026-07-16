@@ -15,13 +15,14 @@
 // The recorder captures one tool_call event per MCP tool invocation
 // (BeforeAny + OnSuccess/OnError filtered to "tools/call") and one
 // session_init event per session (AfterInitialize). Events are POSTed to the
-// Armature ingest endpoint on background goroutines tracked by an internal
-// WaitGroup; Close drains in-flight emissions before returning.
+// Armature ingest endpoint on background goroutines by default; await delivery
+// is available for serverless handlers. Close drains in-flight emissions.
 package armatureanalytics
 
 import (
 	"context"
 	"errors"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,10 +31,20 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-// Config configures the Recorder. APIKey is required. Other fields take the
-// package defaults when zero.
+// DeliveryMode controls whether event delivery runs off the request path or
+// completes before RecordToolCall/RecordSessionInit return.
+type DeliveryMode string
+
+const (
+	DeliveryBackground DeliveryMode = "background"
+	DeliveryAwait      DeliveryMode = "await"
+)
+
+// Config configures the Recorder. APIKey is required unless Emit replaces
+// network delivery. Other fields take package defaults when zero.
 type Config struct {
-	// APIKey authenticates with the Armature ingest endpoint. Required.
+	// APIKey authenticates with the Armature ingest endpoint. It is required
+	// unless Emit replaces network delivery.
 	APIKey string
 
 	// EndpointURL overrides the ingest URL (default: DefaultEndpointURL).
@@ -41,6 +52,14 @@ type Config struct {
 
 	// Timeout caps each ingest POST (default: DefaultTimeout).
 	Timeout time.Duration
+
+	// Delivery defaults to DeliveryBackground. Use DeliveryAwait in serverless
+	// or short-lived handlers so telemetry is delivered before they freeze.
+	Delivery DeliveryMode
+
+	// Emit replaces network delivery, primarily for custom pipelines and tests.
+	// When set, APIKey is optional.
+	Emit func(context.Context, Batch) error
 
 	// ActorSeed returns the actor seed (typically the auth principal) for a
 	// given request context. The seed is sha256-hashed into the actor_id on
@@ -60,15 +79,16 @@ type Config struct {
 }
 
 // Recorder owns the ingest client and the hook closures. Once registered on
-// an mcp-go server via Hooks() or Install(), it tracks per-request timing
-// and emits events asynchronously.
+// an mcp-go server via Hooks() or Install(), it tracks per-request timing and
+// emits according to Config.Delivery.
 type Recorder struct {
-	cfg    Config
-	client *Client
+	cfg  Config
+	send func(context.Context, Batch) error
 
 	pendingCalls   sync.Map // requestKey → callContext
 	sessionInfo    sync.Map // sessionID → *ClientInfo
-	emittedSession sync.Map // sessionID → struct{}; dedup session_init
+	emittedSession *boundedKeySet
+	lazySessions   *boundedKeySet
 
 	inflight sync.WaitGroup
 	// closeMu serializes the closed transition against emit's inflight.Add
@@ -81,28 +101,37 @@ type Recorder struct {
 }
 
 type callContext struct {
-	toolName   string
-	args       any
-	telemetry  Telemetry
-	startedAt  time.Time
-	sessionID  string
-	sessionKey any
-	actorSeed  string
+	toolName      string
+	args          any
+	telemetry     Telemetry
+	startedAt     time.Time
+	sessionID     string
+	clientInfo    *ClientInfo
+	actorSeed     string
+	workflowRunID string
 }
 
-// NewRecorder constructs a Recorder. Returns ErrMissingAPIKey when
-// Config.APIKey is empty (unless Config.Disabled is true, in which case the
-// Recorder no-ops). Mirrors the TS SDK's createAnalyticsRecorder.
+// NewRecorder constructs a Recorder. Returns ErrMissingAPIKey when both
+// Config.APIKey and Config.Emit are empty (unless Config.Disabled is true, in
+// which case the Recorder no-ops). Mirrors the TS SDK's recorder factory.
 func NewRecorder(cfg Config) (*Recorder, error) {
-	r := &Recorder{cfg: cfg}
+	r := &Recorder{
+		cfg:            cfg,
+		emittedSession: newBoundedKeySet(10_000),
+		lazySessions:   newBoundedKeySet(10_000),
+	}
 	if cfg.Disabled {
+		return r, nil
+	}
+	if cfg.Emit != nil {
+		r.send = cfg.Emit
 		return r, nil
 	}
 	client, err := NewClient(cfg.APIKey, cfg.EndpointURL, cfg.Timeout)
 	if err != nil {
 		return nil, err
 	}
-	r.client = client
+	r.send = client.Send
 	return r, nil
 }
 
@@ -152,6 +181,10 @@ func (r *Recorder) Close(ctx context.Context) error {
 	r.closeMu.Lock()
 	r.closed.Store(true)
 	r.closeMu.Unlock()
+	r.pendingCalls.Range(func(key, _ any) bool {
+		r.pendingCalls.Delete(key)
+		return true
+	})
 	return r.Flush(ctx)
 }
 
@@ -170,9 +203,23 @@ func (r *Recorder) RecordToolCall(ctx context.Context, in ToolCallInput) {
 		return
 	}
 	if in.ActorSeed == "" {
-		in.ActorSeed = r.actorSeed(ctx)
+		in.ActorSeed = r.ResolveActorSeed(ctx, nil)
 	}
-	r.emit(ctx, BuildToolCallEvent(in))
+	if in.ClientInfo == nil {
+		in.ClientInfo = ParseStatelessSessionClientInfo(in.SessionID)
+	}
+	events := make([]Event, 0, 2)
+	if in.SessionID != "" && r.lazySessions.Add(ActorID(in.ActorSeed)+":"+in.SessionID) {
+		events = append(events, BuildSessionInitEvent(SessionInitInput{
+			SessionID:     in.SessionID,
+			ActorSeed:     in.ActorSeed,
+			StartedAt:     in.StartedAt,
+			ClientInfo:    in.ClientInfo,
+			WorkflowRunID: in.WorkflowRunID,
+		}))
+	}
+	events = append(events, BuildToolCallEvent(in))
+	r.emit(ctx, events)
 }
 
 // RecordSessionInit emits a framework-neutral session-init event through this
@@ -183,9 +230,15 @@ func (r *Recorder) RecordSessionInit(ctx context.Context, in SessionInitInput) {
 		return
 	}
 	if in.ActorSeed == "" {
-		in.ActorSeed = r.actorSeed(ctx)
+		in.ActorSeed = r.ResolveActorSeed(ctx, nil)
 	}
-	r.emit(ctx, BuildSessionInitEvent(in))
+	if in.ClientInfo == nil {
+		in.ClientInfo = ParseStatelessSessionClientInfo(in.SessionID)
+	}
+	if in.SessionID != "" && !r.lazySessions.Add(ActorID(in.ActorSeed)+":"+in.SessionID) {
+		return
+	}
+	r.emit(ctx, []Event{BuildSessionInitEvent(in)})
 }
 
 // ---------- hooks ----------
@@ -207,15 +260,21 @@ func (r *Recorder) onBeforeAny(ctx context.Context, id any, method mcp.MCPMethod
 	// double-show the same intent string.
 	telemetry, cleanedArgs := extractTelemetryFromArgs(req.GetArguments())
 	sessionKey := sessionKeyFromContext(ctx)
-	r.pendingCalls.Store(callKey(sessionKey, id), callContext{
-		toolName:   req.Params.Name,
-		args:       cleanedArgs,
-		telemetry:  telemetry,
-		startedAt:  time.Now(),
-		sessionID:  sessionIDFromContext(ctx),
-		sessionKey: sessionKey,
-		actorSeed:  r.actorSeed(ctx),
+	key := callKey(sessionKey, id)
+	registered := r.storePendingCall(key, callContext{
+		toolName:      req.Params.Name,
+		args:          cleanedArgs,
+		telemetry:     telemetry,
+		startedAt:     time.Now(),
+		sessionID:     sessionIDFromContext(ctx),
+		clientInfo:    r.clientInfoFor(sessionKey),
+		actorSeed:     r.ResolveActorSeed(ctx, req.Header),
+		workflowRunID: WorkflowRunIDFromHeaders(req.Header),
 	})
+	if !registered {
+		return
+	}
+	context.AfterFunc(ctx, func() { r.onAbandonedCall(ctx, key) })
 }
 
 func (r *Recorder) onSuccess(ctx context.Context, id any, method mcp.MCPMethod, _ any, result any) {
@@ -231,16 +290,17 @@ func (r *Recorder) onSuccess(ctx context.Context, id any, method mcp.MCPMethod, 
 
 	isErr, _ := extractToolErrorFlag(result)
 	r.RecordToolCall(ctx, ToolCallInput{
-		ToolName:    cc.toolName,
-		Args:        cc.args,
-		Result:      result,
-		IsToolError: isErr,
-		SessionID:   cc.sessionID,
-		ActorSeed:   cc.actorSeed,
-		StartedAt:   cc.startedAt,
-		FinishedAt:  time.Now(),
-		ClientInfo:  r.clientInfoFor(cc.sessionKey),
-		Telemetry:   firstTelemetry(cc.telemetry, TelemetryFromContext(ctx)),
+		ToolName:      cc.toolName,
+		Args:          cc.args,
+		Result:        result,
+		IsToolError:   isErr,
+		SessionID:     cc.sessionID,
+		ActorSeed:     cc.actorSeed,
+		StartedAt:     cc.startedAt,
+		FinishedAt:    time.Now(),
+		ClientInfo:    cc.clientInfo,
+		Telemetry:     firstTelemetry(cc.telemetry, TelemetryFromContext(ctx)),
+		WorkflowRunID: cc.workflowRunID,
 	})
 }
 
@@ -257,15 +317,16 @@ func (r *Recorder) onError(ctx context.Context, id any, method mcp.MCPMethod, _ 
 		callErr = errors.New("tool_error")
 	}
 	r.RecordToolCall(ctx, ToolCallInput{
-		ToolName:   cc.toolName,
-		Args:       cc.args,
-		Err:        callErr,
-		SessionID:  cc.sessionID,
-		ActorSeed:  cc.actorSeed,
-		StartedAt:  cc.startedAt,
-		FinishedAt: time.Now(),
-		ClientInfo: r.clientInfoFor(cc.sessionKey),
-		Telemetry:  firstTelemetry(cc.telemetry, TelemetryFromContext(ctx)),
+		ToolName:      cc.toolName,
+		Args:          cc.args,
+		Err:           callErr,
+		SessionID:     cc.sessionID,
+		ActorSeed:     cc.actorSeed,
+		StartedAt:     cc.startedAt,
+		FinishedAt:    time.Now(),
+		ClientInfo:    cc.clientInfo,
+		Telemetry:     firstTelemetry(cc.telemetry, TelemetryFromContext(ctx)),
+		WorkflowRunID: cc.workflowRunID,
 	})
 }
 
@@ -293,15 +354,16 @@ func (r *Recorder) onAfterInitialize(ctx context.Context, _ any, message *mcp.In
 		r.sessionInfo.Store(sessionKey, info)
 	}
 
-	if _, already := r.emittedSession.LoadOrStore(sessionKey, struct{}{}); already {
+	if !r.emittedSession.Add(sessionKey) {
 		return
 	}
 
 	r.RecordSessionInit(ctx, SessionInitInput{
-		SessionID:  sessionIDFromContext(ctx),
-		ActorSeed:  r.actorSeed(ctx),
-		StartedAt:  time.Now(),
-		ClientInfo: info,
+		SessionID:     sessionIDFromContext(ctx),
+		ActorSeed:     r.ResolveActorSeed(ctx, message.Header),
+		StartedAt:     time.Now(),
+		ClientInfo:    info,
+		WorkflowRunID: WorkflowRunIDFromHeaders(message.Header),
 	})
 }
 
@@ -317,7 +379,7 @@ func (r *Recorder) onUnregisterSession(_ context.Context, session server.ClientS
 // ---------- helpers ----------
 
 func (r *Recorder) active() bool {
-	if r == nil || r.cfg.Disabled || r.client == nil {
+	if r == nil || r.cfg.Disabled || r.send == nil {
 		return false
 	}
 	if r.closed.Load() {
@@ -327,11 +389,15 @@ func (r *Recorder) active() bool {
 	return true
 }
 
-func (r *Recorder) actorSeed(ctx context.Context) string {
-	if r.cfg.ActorSeed == nil {
-		return ""
+// ResolveActorSeed applies the configured resolver, then mirrors the
+// TypeScript/Python default by falling back to the Authorization header.
+func (r *Recorder) ResolveActorSeed(ctx context.Context, headers http.Header) string {
+	if r.cfg.ActorSeed != nil {
+		if seed := r.cfg.ActorSeed(ctx); seed != "" {
+			return seed
+		}
 	}
-	return r.cfg.ActorSeed(ctx)
+	return headers.Get("Authorization")
 }
 
 func (r *Recorder) clientInfoFor(sessionKey any) *ClientInfo {
@@ -352,11 +418,57 @@ func (r *Recorder) takeCall(sessionKey, id any) (callContext, bool) {
 	return v.(callContext), true
 }
 
-// emit POSTs the event on a background goroutine tracked by inflight so
-// Close/Flush can drain.
-func (r *Recorder) emit(ctx context.Context, ev Event) {
-	if r.client == nil {
+// storePendingCall serializes registration with Close's closed transition.
+// A call is therefore either visible to Close's sweep or rejected after the
+// recorder is closed; it cannot be inserted into the gap between them.
+func (r *Recorder) storePendingCall(key callKeyT, call callContext) bool {
+	r.closeMu.Lock()
+	defer r.closeMu.Unlock()
+	if r.closed.Load() {
+		atomic.AddUint64(&r.dropped, 1)
+		return false
+	}
+	r.pendingCalls.Store(key, call)
+	return true
+}
+
+func (r *Recorder) onAbandonedCall(ctx context.Context, key callKeyT) {
+	value, ok := r.pendingCalls.LoadAndDelete(key)
+	if !ok || !r.active() {
 		return
+	}
+	cc := value.(callContext)
+	callErr := context.Cause(ctx)
+	if callErr == nil {
+		callErr = context.Canceled
+	}
+	r.RecordToolCall(context.Background(), ToolCallInput{
+		ToolName:      cc.toolName,
+		Args:          cc.args,
+		Err:           callErr,
+		SessionID:     cc.sessionID,
+		ActorSeed:     cc.actorSeed,
+		StartedAt:     cc.startedAt,
+		FinishedAt:    time.Now(),
+		ClientInfo:    cc.clientInfo,
+		Telemetry:     cc.telemetry,
+		WorkflowRunID: cc.workflowRunID,
+	})
+}
+
+// emit POSTs the events together, synchronously in await mode or on a tracked
+// background goroutine otherwise, so Close/Flush can drain.
+func (r *Recorder) emit(_ context.Context, events []Event) {
+	if r.send == nil || len(events) == 0 {
+		return
+	}
+	batch := Batch{SchemaVersion: SchemaVersion, Events: events}
+	run := func() {
+		emitCtx, cancel := context.WithTimeout(context.Background(), r.timeout())
+		defer cancel()
+		if err := r.send(emitCtx, batch); err != nil && r.cfg.OnError != nil {
+			r.cfg.OnError(err, batch)
+		}
 	}
 	// Register with inflight under closeMu: once Close flips closed, no new
 	// POST can start, so Close's Flush covers everything that got in.
@@ -368,18 +480,16 @@ func (r *Recorder) emit(ctx context.Context, ev Event) {
 	}
 	r.inflight.Add(1)
 	r.closeMu.Unlock()
+	if r.cfg.Delivery == DeliveryAwait {
+		defer r.inflight.Done()
+		run()
+		return
+	}
 	// Detach from caller's context to avoid being cancelled by request
 	// teardown; honour our own per-request timeout via the http.Client.
 	go func() {
 		defer r.inflight.Done()
-		emitCtx, cancel := context.WithTimeout(context.Background(), r.timeout())
-		defer cancel()
-		batch := Batch{SchemaVersion: SchemaVersion, Events: []Event{ev}}
-		if err := r.client.Send(emitCtx, batch); err != nil {
-			if r.cfg.OnError != nil {
-				r.cfg.OnError(err, batch)
-			}
-		}
+		run()
 	}()
 }
 
@@ -392,7 +502,10 @@ func (r *Recorder) timeout() time.Duration {
 
 func sessionIDFromContext(ctx context.Context) string {
 	if s := server.ClientSessionFromContext(ctx); s != nil {
-		return s.SessionID()
+		if id := s.SessionID(); id != "stdio" {
+			return id
+		}
+		return ProcessScopedSessionID()
 	}
 	return ""
 }

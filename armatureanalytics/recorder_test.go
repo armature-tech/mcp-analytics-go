@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -133,6 +134,83 @@ func TestPendingCalls_EmptySessionID_NoCrossConnectionCollision(t *testing.T) {
 	}
 	if !names["tool_a"] || !names["tool_b"] {
 		t.Fatalf("expected one event per tool, got %v", names)
+	}
+}
+
+func TestCancelledCallIsRecordedAndRemovedWithoutCompletionHook(t *testing.T) {
+	batches := make(chan Batch, 1)
+	rec, err := NewRecorder(Config{
+		Delivery: DeliveryAwait,
+		Emit: func(_ context.Context, batch Batch) error {
+			batches <- batch
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(sessionCtx(newFakeSession("cancelled-session")))
+	req := &mcp.CallToolRequest{}
+	req.Params.Name = "cancelled_tool"
+	rec.onBeforeAny(ctx, int64(9), mcp.MethodToolsCall, req)
+	cancel()
+
+	select {
+	case batch := <-batches:
+		var tool *Event
+		for i := range batch.Events {
+			if batch.Events[i].Kind == KindToolCall {
+				tool = &batch.Events[i]
+			}
+		}
+		if tool == nil || tool.OK || tool.Error == nil || *tool.Error != context.Canceled.Error() {
+			t.Fatalf("cancelled tool event = %#v", tool)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled call was not recorded")
+	}
+
+	pending := 0
+	rec.pendingCalls.Range(func(_, _ any) bool { pending++; return true })
+	if pending != 0 {
+		t.Fatalf("pending calls = %d after cancellation", pending)
+	}
+}
+
+func TestPendingRegistrationCannotRaceCloseSweep(t *testing.T) {
+	for i := 0; i < 250; i++ {
+		rec, err := NewRecorder(Config{
+			Emit: func(context.Context, Batch) error { return nil },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := sessionCtx(newFakeSession("closing-session"))
+		req := &mcp.CallToolRequest{}
+		req.Params.Name = "closing_tool"
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_ = rec.Close(context.Background())
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			rec.onBeforeAny(ctx, int64(i), mcp.MethodToolsCall, req)
+		}()
+		close(start)
+		wg.Wait()
+
+		pending := 0
+		rec.pendingCalls.Range(func(_, _ any) bool { pending++; return true })
+		if pending != 0 {
+			t.Fatalf("iteration %d retained %d pending calls after Close", i, pending)
+		}
 	}
 }
 
