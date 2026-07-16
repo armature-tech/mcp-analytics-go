@@ -162,6 +162,32 @@ func (r *Recorder) Dropped() uint64 {
 	return atomic.LoadUint64(&r.dropped)
 }
 
+// RecordToolCall emits a framework-neutral tool-call event through this
+// recorder. Adapter packages use this when their MCP framework does not expose
+// mcp-go Hooks. ActorSeed falls back to Config.ActorSeed when it is empty.
+func (r *Recorder) RecordToolCall(ctx context.Context, in ToolCallInput) {
+	if !r.active() {
+		return
+	}
+	if in.ActorSeed == "" {
+		in.ActorSeed = r.actorSeed(ctx)
+	}
+	r.emit(ctx, BuildToolCallEvent(in))
+}
+
+// RecordSessionInit emits a framework-neutral session-init event through this
+// recorder. Adapter packages use this when their MCP framework does not expose
+// mcp-go Hooks. ActorSeed falls back to Config.ActorSeed when it is empty.
+func (r *Recorder) RecordSessionInit(ctx context.Context, in SessionInitInput) {
+	if !r.active() {
+		return
+	}
+	if in.ActorSeed == "" {
+		in.ActorSeed = r.actorSeed(ctx)
+	}
+	r.emit(ctx, BuildSessionInitEvent(in))
+}
+
 // ---------- hooks ----------
 
 func (r *Recorder) onBeforeAny(ctx context.Context, id any, method mcp.MCPMethod, message any) {
@@ -204,7 +230,7 @@ func (r *Recorder) onSuccess(ctx context.Context, id any, method mcp.MCPMethod, 
 	}
 
 	isErr, _ := extractToolErrorFlag(result)
-	r.emit(ctx, BuildToolCallEvent(ToolCallInput{
+	r.RecordToolCall(ctx, ToolCallInput{
 		ToolName:    cc.toolName,
 		Args:        cc.args,
 		Result:      result,
@@ -215,7 +241,7 @@ func (r *Recorder) onSuccess(ctx context.Context, id any, method mcp.MCPMethod, 
 		FinishedAt:  time.Now(),
 		ClientInfo:  r.clientInfoFor(cc.sessionKey),
 		Telemetry:   firstTelemetry(cc.telemetry, TelemetryFromContext(ctx)),
-	}))
+	})
 }
 
 func (r *Recorder) onError(ctx context.Context, id any, method mcp.MCPMethod, _ any, callErr error) {
@@ -230,7 +256,7 @@ func (r *Recorder) onError(ctx context.Context, id any, method mcp.MCPMethod, _ 
 	if callErr == nil {
 		callErr = errors.New("tool_error")
 	}
-	r.emit(ctx, BuildToolCallEvent(ToolCallInput{
+	r.RecordToolCall(ctx, ToolCallInput{
 		ToolName:   cc.toolName,
 		Args:       cc.args,
 		Err:        callErr,
@@ -240,7 +266,7 @@ func (r *Recorder) onError(ctx context.Context, id any, method mcp.MCPMethod, _ 
 		FinishedAt: time.Now(),
 		ClientInfo: r.clientInfoFor(cc.sessionKey),
 		Telemetry:  firstTelemetry(cc.telemetry, TelemetryFromContext(ctx)),
-	}))
+	})
 }
 
 // firstTelemetry returns a if any field is set, else b. Used to prefer the
@@ -271,12 +297,12 @@ func (r *Recorder) onAfterInitialize(ctx context.Context, _ any, message *mcp.In
 		return
 	}
 
-	r.emit(ctx, BuildSessionInitEvent(SessionInitInput{
+	r.RecordSessionInit(ctx, SessionInitInput{
 		SessionID:  sessionIDFromContext(ctx),
 		ActorSeed:  r.actorSeed(ctx),
 		StartedAt:  time.Now(),
 		ClientInfo: info,
-	}))
+	})
 }
 
 func (r *Recorder) onUnregisterSession(_ context.Context, session server.ClientSession) {

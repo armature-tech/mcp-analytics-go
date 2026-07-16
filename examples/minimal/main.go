@@ -20,7 +20,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-func main() {
+func run() error {
 	rec, err := armatureanalytics.NewRecorder(armatureanalytics.Config{
 		APIKey:      os.Getenv("ANALYTICS_INGEST_API_KEY"),
 		EndpointURL: os.Getenv("ANALYTICS_INGEST_URL"),
@@ -29,7 +29,7 @@ func main() {
 		},
 	})
 	if err != nil {
-		log.Fatalf("armatureanalytics.NewRecorder: %v", err)
+		return fmt.Errorf("armatureanalytics.NewRecorder: %w", err)
 	}
 	var closeOnce sync.Once
 	closeRecorder := func() {
@@ -69,6 +69,13 @@ func main() {
 	}()
 
 	if err := server.ServeStdio(s); err != nil {
-		log.Fatalf("server: %v", err)
+		return fmt.Errorf("serve stdio: %w", err)
+	}
+	return nil
+}
+
+func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
 	}
 }

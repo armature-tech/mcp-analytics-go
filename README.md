@@ -9,14 +9,22 @@ Understand which MCP tools agents use, what users are trying to accomplish, and 
 
 [Armature](https://armature.tech) · [TypeScript SDK](https://github.com/armature-tech/mcp-analytics) · [Python SDK](https://github.com/armature-tech/mcp-analytics-python) · [Agent install](SKILL.md)
 
-Built for Go MCP servers using [mark3labs/mcp-go](https://github.com/mark3labs/mcp-go).
+Built for Go MCP servers using either
+[mark3labs/mcp-go](https://github.com/mark3labs/mcp-go) or the official
+[modelcontextprotocol/go-sdk](https://github.com/modelcontextprotocol/go-sdk).
 
 ## Install in 30 seconds
 
 ### 1. Install
 
+Choose the package matching your MCP framework:
+
 ~~~bash
-go get github.com/armature-tech/mcp-analytics-go
+# mark3labs/mcp-go
+go get github.com/armature-tech/mcp-analytics-go/armatureanalytics@latest
+
+# official modelcontextprotocol/go-sdk
+go get github.com/armature-tech/mcp-analytics-go/armatureanalytics/official@latest
 ~~~
 
 ### 2. Add your ingest key
@@ -28,6 +36,8 @@ export ANALYTICS_INGEST_API_KEY="..."
 ~~~
 
 ### 3. Instrument your MCP server
+
+#### mark3labs/mcp-go
 
 ~~~go
 package main
@@ -75,6 +85,49 @@ func main() {
 
 > **That’s it. Make one tool call, open Armature, and the session is already there.**
 
+#### Official modelcontextprotocol/go-sdk
+
+The official adapter preserves the SDK's typed handler signature:
+
+~~~go
+import (
+    "context"
+    "time"
+
+    "github.com/armature-tech/mcp-analytics-go/armatureanalytics/official"
+    "github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+type LookupInput struct {
+    CustomerID string `json:"customer_id" jsonschema:"customer id"`
+}
+
+type LookupOutput struct {
+    Active bool `json:"active"`
+}
+
+s, shutdown := official.NewMCPServer(
+    &mcp.Implementation{Name: "Customer MCP", Version: "1.0.0"},
+    nil,
+)
+defer func() {
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    _ = shutdown(ctx)
+}()
+
+official.InstrumentTool(s, &mcp.Tool{
+    Name:        "lookup_customer",
+    Description: "Look up a customer",
+}, func(ctx context.Context, req *mcp.CallToolRequest, input LookupInput) (
+    *mcp.CallToolResult,
+    LookupOutput,
+    error,
+) {
+    return nil, LookupOutput{Active: true}, nil
+})
+~~~
+
 ## Built for MCP—not page views
 
 | Understand demand | Find what breaks | Improve with context |
@@ -120,14 +173,16 @@ All telemetry fields are optional. The earlier **intent**, **context**, and **fr
 
 ## Choose the integration that matches your server
 
-| Server shape | Integration |
+| Framework / server shape | Integration |
 | --- | --- |
-| New MCP server | **NewMCPServer(...)** and **InstrumentTool(...)** |
-| Existing MCP server | **NewRecorder(config)** and **server.WithHooks(rec.Hooks())** |
-| Existing hooks bundle | **rec.Install(hooks)** |
-| Custom tool registration | **DecorateInputSchemaWithTelemetry(...)** and **WrapHandler(...)** |
+| mark3labs, new server | `armatureanalytics.NewMCPServer(...)` and `InstrumentTool(...)` |
+| mark3labs, existing server | `NewRecorder(config)` and `server.WithHooks(rec.Hooks())` |
+| mark3labs, existing hooks bundle | `rec.Install(hooks)` |
+| Official SDK, new server | `official.NewMCPServer(...)` and `official.InstrumentTool(...)` |
+| Official SDK, existing server | `official.NewRecorder(config)`, then `rec.Install(server)` |
+| Custom tool registration | Framework adapter's `DecorateInputSchemaWithTelemetry(...)` and `WrapHandler(...)` |
 
-### Existing server
+### Existing mark3labs server
 
 Start a recorder from the environment and pass its hooks to your existing
 server. Set **Disabled** when the key is absent so optional analytics never
@@ -169,7 +224,28 @@ If your server already uses hooks for OpenTelemetry or structured logging, insta
 rec.Install(hooks)
 ~~~
 
-### Custom registration
+### Existing official-SDK server
+
+Install receiving middleware without replacing the server or its existing
+middleware:
+
+~~~go
+config := official.EnvConfig()
+config.Disabled = config.APIKey == ""
+
+rec, err := official.NewRecorder(config)
+if err != nil {
+    return err
+}
+rec.Install(server)
+~~~
+
+Register typed tools through `official.InstrumentTool` instead of
+`mcp.AddTool`. The adapter derives the same input schema as the official SDK,
+adds telemetry, and removes telemetry from both the typed map input and raw
+request before the handler runs.
+
+### Custom mark3labs registration
 
 **InstrumentTool** combines schema decoration and handler wrapping. When you own a custom registry, use the two operations separately:
 
@@ -223,6 +299,9 @@ s, shutdown := armatureanalytics.NewMCPServerWithConfig(
 )
 ~~~
 
+The official adapter accepts the same `Config` fields through
+`official.NewMCPServerWithConfig(implementation, serverOptions, config)`.
+
 | Option | Default | Purpose |
 | --- | --- | --- |
 | **APIKey** | **ANALYTICS_INGEST_API_KEY** with **EnvConfig** | Authenticate events and identify the MCP server |
@@ -236,9 +315,16 @@ If the API key is missing, **NewMCPServer** quietly disables delivery for local
 development. When you pass **EnvConfig()** to **NewRecorder** yourself, set
 **Disabled** based on the empty key as shown above.
 
+For production and external pilots, set `OnError`; delivery is asynchronous,
+so otherwise an invalid key or ingest failure is intentionally silent.
+
 ### Actor identification
 
 **ActorSeed** should return a stable authentication principal or tenant identifier. The seed is hashed before transmission, and Armature scopes the resulting actor identifier to your server.
+
+With the official adapter, if `ActorSeed` reads values added by auth receiving
+middleware, install analytics first and add the auth middleware afterward so
+the derived context reaches analytics.
 
 ## What gets captured
 
@@ -256,10 +342,12 @@ Prompts, resources, and OAuth hooks are not currently captured.
 
 ## Compatibility
 
-- Go 1.25+
-- **github.com/mark3labs/mcp-go** v0.49.0
+- Go 1.25.12+
+- **github.com/mark3labs/mcp-go** v0.49.0 through v0.56.0
+- **github.com/modelcontextprotocol/go-sdk** v1.6.1
 
-Newer compatible mcp-go minor versions are expected to work.
+The CI suite tests the declared minimum mark3labs version; a compatibility leg
+also tests the current v0.56 line.
 
 ## Environment variables
 
@@ -270,10 +358,11 @@ Newer compatible mcp-go minor versions are expected to work.
 
 ## Example
 
-Run the complete stdio server in [examples/minimal](examples/minimal):
+Run either complete stdio example:
 
 ~~~bash
 ANALYTICS_INGEST_API_KEY="..." go run ./examples/minimal
+ANALYTICS_INGEST_API_KEY="..." go run ./examples/official
 ~~~
 
 ## Support

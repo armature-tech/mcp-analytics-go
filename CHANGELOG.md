@@ -2,7 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.1.0] — Unreleased
+## Unreleased
+
+### Added
+
+- Official `github.com/modelcontextprotocol/go-sdk/mcp` support through the
+  `armatureanalytics/official` adapter. It provides receiving middleware,
+  factory and recorder integration, typed `InstrumentTool`, schema decoration,
+  handler cleanup, session initialization, and end-to-end tests.
+- Framework-neutral `Recorder.RecordToolCall` and `RecordSessionInit` entry
+  points for additional adapters.
+- A complete official-SDK stdio example and framework-specific skill
+  references.
+
+### Fixed
+
+- Installation commands now target importable package paths instead of the
+  package-less module root, so clean consumer builds receive transitive sums.
+- CI and the module minimum now use patched Go 1.25.12 rather than Go 1.25.5.
+- Both stdio examples return through their bounded analytics drain before
+  `log.Fatal` handles a server error.
+
+## [0.1.5] — 2026-07-15
 
 ### Changed
 

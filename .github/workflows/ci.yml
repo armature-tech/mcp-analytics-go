@@ -34,3 +34,27 @@ jobs:
         run: |
           go vet ./...
           go test ./...
+
+  mark3labs-current:
+    name: mark3labs v0.56 compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Test current mark3labs release
+        run: |
+          go get github.com/mark3labs/mcp-go/server@v0.56.0
+          go mod tidy
+          go test ./...

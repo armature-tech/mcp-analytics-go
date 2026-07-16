@@ -53,6 +53,20 @@ func TelemetryFromContext(ctx context.Context) Telemetry {
 	return Telemetry{}
 }
 
+// ExtractTelemetryFromArguments returns the normalized telemetry block and
+// args with the top-level telemetry property removed. When telemetry is absent,
+// the original map may be returned. Adapter packages use this to share parsing
+// and legacy-field behavior.
+func ExtractTelemetryFromArguments(args map[string]any) (Telemetry, map[string]any) {
+	return extractTelemetryFromArgs(args)
+}
+
+// TelemetryInputSchema returns a fresh JSON Schema fragment for the optional
+// telemetry object injected by the framework adapters.
+func TelemetryInputSchema() map[string]any {
+	return telemetrySchemaObject()
+}
+
 // NormalizeTelemetry canonicalizes t onto the V1 field names and fills the
 // legacy mirrors so both spellings always agree. Legacy spellings lose to an
 // explicit V1 value when both are present; UserFrustration only keeps
