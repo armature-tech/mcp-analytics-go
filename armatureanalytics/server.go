@@ -3,9 +3,15 @@ package armatureanalytics
 import (
 	"context"
 	"os"
+	"sync"
 
 	"github.com/mark3labs/mcp-go/server"
 )
+
+// serverTelemetryConfigs lets InstrumentTool inherit the capture policy from
+// NewMCPServerWithConfig without changing its established call signature.
+// Entries are removed by the paired Shutdown function.
+var serverTelemetryConfigs sync.Map // *server.MCPServer -> Config
 
 // Shutdown flushes in-flight analytics batches. It is always safe to call,
 // including when analytics is disabled — in that case it is a no-op. Pass
@@ -87,8 +93,10 @@ func NewMCPServerWithConfig(name, version string, cfg Config, opts ...server.Ser
 		opts = append(opts, server.WithHooks(rec.Hooks()))
 	}
 	s := server.NewMCPServer(name, version, opts...)
+	serverTelemetryConfigs.Store(s, cfg)
 
 	shutdown := Shutdown(func(ctx context.Context) error {
+		defer serverTelemetryConfigs.Delete(s)
 		if rec == nil {
 			return nil
 		}

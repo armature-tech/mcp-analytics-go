@@ -76,6 +76,34 @@ type Config struct {
 	// ingest endpoint. Useful for opt-in via env var without restructuring
 	// the call site.
 	Disabled bool
+
+	// CaptureTelemetry is the master switch for conversation-derived telemetry
+	// (user_intent, agent_thinking, user_frustration, user_turn). nil or true
+	// means on. When false the SDK injects no telemetry schema, appends no
+	// description nudges (see InstrumentToolWithConfig), and never exports
+	// telemetry values — including values sent by clients holding a cached
+	// schema, which are stripped and dropped. Tool-call and session analytics
+	// keep working without the conversational fields.
+	CaptureTelemetry *bool
+
+	// Redact, if set, runs over sanitized tool inputs/outputs (and the
+	// normalized telemetry and error strings) before they are serialized into
+	// event previews. It must return the value to serialize; a panic fails
+	// closed — the affected payload is replaced with "[redaction failed]" and
+	// the event still ships.
+	Redact func(any) any
+
+	// TelemetryFieldMap opts specific customer-owned argument fields into
+	// export as Armature telemetry (TELEMETRY-CONTRACT.md). Keys are the V1
+	// telemetry field names (user_turn, user_intent, agent_thinking,
+	// user_frustration); values are top-level argument property names to READ
+	// (never strip) from the tool's arguments. Ignored while CaptureTelemetry
+	// is false.
+	TelemetryFieldMap map[string]string
+}
+
+func (c Config) captureEnabled() bool {
+	return c.CaptureTelemetry == nil || *c.CaptureTelemetry
 }
 
 // Recorder owns the ingest client and the hook closures. Once registered on
@@ -205,6 +233,22 @@ func (r *Recorder) RecordToolCall(ctx context.Context, in ToolCallInput) {
 	if in.ActorSeed == "" {
 		in.ActorSeed = r.ResolveActorSeed(ctx, nil)
 	}
+	// Single choke point for capture-off and field ownership
+	// (TELEMETRY-CONTRACT.md): telemetry handed in by any path — the hooks,
+	// adapter packages, direct callers, a cached-schema client — is dropped
+	// here before the event is built, so it can never reach ingest or
+	// OnError. A tool recorded as owning its telemetry field never exports
+	// supplied telemetry either; the opt-in field map is the explicit way to
+	// export customer fields, and it only applies while capture is on.
+	if !r.cfg.captureEnabled() {
+		in.Telemetry = Telemetry{}
+	} else {
+		if IsTelemetryOwnedTool(in.ToolName) {
+			in.Telemetry = Telemetry{}
+		}
+		in.Telemetry = applyTelemetryFieldMap(in.Telemetry, in.Args, r.cfg.TelemetryFieldMap)
+	}
+	in.Redact = r.cfg.Redact
 	if in.ClientInfo == nil {
 		in.ClientInfo = ParseStatelessSessionClientInfo(in.SessionID)
 	}
@@ -257,8 +301,14 @@ func (r *Recorder) onBeforeAny(ctx context.Context, id any, method mcp.MCPMethod
 	// Extract telemetry up-front so it survives into OnSuccess / OnError
 	// regardless of whether the tool was registered via AddTool. Args used
 	// for the input preview have telemetry stripped so the dashboards don't
-	// double-show the same intent string.
-	telemetry, cleanedArgs := extractTelemetryFromArgs(req.GetArguments())
+	// double-show the same intent string. Tools that own their telemetry
+	// field (TELEMETRY-CONTRACT.md, mode "owned") are exempt: their arguments
+	// pass through untouched and nothing is interpreted as Armature telemetry.
+	var telemetry Telemetry
+	cleanedArgs := any(req.GetArguments())
+	if !IsTelemetryOwnedTool(req.Params.Name) {
+		telemetry, cleanedArgs = extractTelemetryFromArgs(req.GetArguments())
+	}
 	sessionKey := sessionKeyFromContext(ctx)
 	key := callKey(sessionKey, id)
 	registered := r.storePendingCall(key, callContext{

@@ -36,18 +36,29 @@ func (s StatelessHTTPSession) SessionIDGenerator() func() string {
 var statelessSessionIDRE = regexp.MustCompile(
 	`^mcp_([A-Za-z0-9.-]+)_v_([A-Za-z0-9.-]*)_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$`,
 )
+var statelessSessionSeedRE = regexp.MustCompile(
+	`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`,
+)
 
 const anonymousStatelessClient = "unknown"
 
 // BuildStatelessSessionID mints an identity-bearing MCP session ID. Client
 // attribution is observability only; callers must not treat the ID as auth.
 func BuildStatelessSessionID(clientInfo *ClientInfo) string {
+	return buildStatelessSessionID(clientInfo, "")
+}
+
+func buildStatelessSessionID(clientInfo *ClientInfo, sessionSeed string) string {
 	name, version := anonymousStatelessClient, ""
 	if clientInfo != nil {
 		name = slugSessionPart(clientInfo.Name, anonymousStatelessClient)
 		version = slugSessionPart(clientInfo.Version, "")
 	}
-	return "mcp_" + name + "_v_" + version + "_" + randomUUID()
+	sessionUUID := strings.ToLower(strings.TrimSpace(sessionSeed))
+	if !statelessSessionSeedRE.MatchString(sessionUUID) {
+		sessionUUID = randomUUID()
+	}
+	return "mcp_" + name + "_v_" + version + "_" + sessionUUID
 }
 
 // ParseStatelessSessionClientInfo recovers best-effort client identity from an
@@ -68,7 +79,8 @@ func ParseStatelessSessionClientInfo(sessionID string) *ClientInfo {
 func ResolveStatelessHTTPSession(input StatelessHTTPInput) StatelessHTTPSession {
 	body := decodeStatelessBody(input.Body)
 	if initialize := findInitializeMessage(body); initialize != nil {
-		sessionID := BuildStatelessSessionID(clientInfoFromInitialize(initialize))
+		clientInfo := clientInfoFromInitialize(initialize)
+		sessionID := buildStatelessSessionID(clientInfo, input.Headers.Get("X-Armature-Session-Seed"))
 		return StatelessHTTPSession{SessionID: sessionID, IsInitialize: true}
 	}
 	sessionID := strings.TrimSpace(input.Headers.Get("Mcp-Session-Id"))

@@ -324,6 +324,53 @@ func TestMissingKeyFactoryIsNoOp(t *testing.T) {
 	}
 }
 
+func TestFactoryThreadsCapturePolicyToInstrumentTool(t *testing.T) {
+	type input struct {
+		Query string `json:"query"`
+	}
+	capture := false
+	s, shutdown := NewMCPServerWithConfig(
+		&mcp.Implementation{Name: "capture-off", Version: "1.0.0"},
+		nil,
+		Config{CaptureTelemetry: &capture},
+	)
+	t.Cleanup(func() { _ = shutdown(context.Background()) })
+	tool := &mcp.Tool{Name: "search", Description: "Search"}
+	InstrumentTool(s, tool, func(_ context.Context, _ *mcp.CallToolRequest, in input) (*mcp.CallToolResult, input, error) {
+		return nil, in, nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	go func() { _ = s.Run(ctx, serverTransport) }()
+	client := mcp.NewClient(&mcp.Implementation{Name: "capture-off-client", Version: "1.0.0"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("connect client: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+
+	tools, err := session.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	if len(tools.Tools) != 1 {
+		t.Fatalf("got %d tools, want 1", len(tools.Tools))
+	}
+	schema, ok := tools.Tools[0].InputSchema.(map[string]any)
+	if !ok {
+		t.Fatalf("input schema type = %T, want map[string]any", tools.Tools[0].InputSchema)
+	}
+	properties, _ := schema["properties"].(map[string]any)
+	if _, exists := properties["telemetry"]; exists {
+		t.Fatal("plain InstrumentTool injected telemetry despite the server capture policy")
+	}
+	if tools.Tools[0].Description != tool.Description {
+		t.Fatalf("description changed with capture off: %q", tools.Tools[0].Description)
+	}
+}
+
 func TestSessionMetadataLivesUntilSessionCloses(t *testing.T) {
 	sink := newRecordingSink(t)
 	recorder, err := NewRecorder(Config{APIKey: "test-key", EndpointURL: sink.server.URL})

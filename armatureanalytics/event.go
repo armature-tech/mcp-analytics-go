@@ -70,6 +70,11 @@ type ToolCallInput struct {
 	ClientInfo    *ClientInfo
 	Telemetry     Telemetry // optional LLM-supplied telemetry (V1 or pre-V1 spellings; normalized on emit)
 	WorkflowRunID string    // optional Armature workflow-run UUID; marks synthetic traffic
+	// Redact runs over the sanitized args/result (and the normalized telemetry
+	// and error string) before serialization. Recorder.RecordToolCall fills it
+	// from Config.Redact; direct BuildToolCallEvent callers may set it
+	// themselves. A panicking hook fails closed to "[redaction failed]".
+	Redact func(any) any
 }
 
 // SessionInitInput is the typed input to BuildSessionInitEvent.
@@ -90,6 +95,41 @@ type ClientInfo struct {
 	Capabilities    map[string]any
 }
 
+// redactTelemetry runs the customer redaction hook over the normalized
+// telemetry. Telemetry text is agent-authored but routinely quotes the user,
+// so the hook sees it too; whatever it returns is re-normalized, and a
+// panicking hook drops the telemetry entirely (fail closed).
+func redactTelemetry(t Telemetry, redact func(any) any) Telemetry {
+	if redact == nil || t == (Telemetry{}) {
+		return t
+	}
+	generic, ok := toGenericJSON(t)
+	if !ok {
+		return Telemetry{}
+	}
+	redacted := safeRedact(redact, generic)
+	data, err := json.Marshal(redacted)
+	if err != nil {
+		return Telemetry{}
+	}
+	var out Telemetry
+	if err := json.Unmarshal(data, &out); err != nil {
+		return Telemetry{}
+	}
+	return NormalizeTelemetry(out)
+}
+
+func redactErrorMessage(message string, redact func(any) any) string {
+	if redact == nil || message == "" {
+		return message
+	}
+	redacted := safeRedact(redact, message)
+	if s, ok := redacted.(string); ok {
+		return s
+	}
+	return stringifyPreview(redacted)
+}
+
 // BuildToolCallEvent constructs the wire-shape Event for a single tool call.
 func BuildToolCallEvent(in ToolCallInput) Event {
 	actorID := ActorID(in.ActorSeed)
@@ -98,12 +138,17 @@ func BuildToolCallEvent(in ToolCallInput) Event {
 		requestID = randomUUID()
 	}
 
-	source, sourceTrunc := truncateUTF8("MCP tool call: "+in.ToolName+"\n\nInput:\n"+stringifyPreview(in.Args), MaxSourceBytes)
-	inputPreview, _ := truncateUTF8(stringifyPreview(in.Args), MaxPreviewBytes)
+	// Contract pipeline (TELEMETRY-CONTRACT.md): sanitize → customer redact →
+	// stringify → truncate, for every payload that can carry customer data —
+	// input preview, the source built from the input, the result preview, the
+	// error string, and the telemetry text.
+	safeArgs := prepareForPreview(in.Args, in.Redact)
+	source, sourceTrunc := truncateUTF8("MCP tool call: "+in.ToolName+"\n\nInput:\n"+stringifyPreview(safeArgs), MaxSourceBytes)
+	inputPreview, _ := truncateUTF8(stringifyPreview(safeArgs), MaxPreviewBytes)
 	var resultPtr *string
 	var resultTrunc bool
 	if in.Result != nil {
-		preview, trunc := truncateUTF8(stringifyPreview(in.Result), MaxPreviewBytes)
+		preview, trunc := truncateUTF8(stringifyPreview(prepareForPreview(in.Result, in.Redact)), MaxPreviewBytes)
 		resultPtr = &preview
 		resultTrunc = trunc
 	}
@@ -119,13 +164,14 @@ func BuildToolCallEvent(in ToolCallInput) Event {
 				msg = "tool_error"
 			}
 		}
+		msg = redactErrorMessage(msg, in.Redact)
 		errPtr = &msg
 	}
 
 	// Canonicalize onto the V1 field names (legacy input spellings accepted)
 	// and emit both key sets: the V1 keys plus legacy mirrors, so an ingest
 	// that hasn't picked up the V1 schema keeps reading events from this SDK.
-	tel := NormalizeTelemetry(in.Telemetry)
+	tel := redactTelemetry(NormalizeTelemetry(in.Telemetry), in.Redact)
 	meta := map[string]any{
 		"tool_name":         in.ToolName,
 		"user_turn":         intOrNil(tel.UserTurn),

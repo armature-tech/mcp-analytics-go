@@ -6,6 +6,26 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Telemetry capture switch.** `Config.CaptureTelemetry *bool` (nil = on) plus
+  `InstrumentToolWithConfig` in both packages: with capture off, tool schemas
+  and descriptions pass through untouched, and telemetry sent by cached-schema
+  clients is stripped and dropped at the `RecordToolCall` choke point before it
+  can reach ingest or `OnError`. Shared cross-SDK behavior is specified in the
+  monorepo's `packages/TELEMETRY-CONTRACT.md` with shared test vectors.
+- **Telemetry field ownership in the hooks.** Tools whose schema declares a
+  top-level `telemetry` property were already registered untouched; ownership
+  is now also recorded (`MarkTelemetryOwnedTool` / `IsTelemetryOwnedTool`) and
+  honored by the mark3labs recorder hooks and the official-SDK middleware, so
+  a customer-owned `telemetry` argument is never interpreted as Armature
+  telemetry and stays visible to the tool and its input preview. A collision
+  warning is logged once per tool. `Config.TelemetryFieldMap` opts specific
+  customer fields into export explicitly (read, never stripped).
+- **Preview sanitization and redaction.** Image/audio content-block `data`,
+  resource `blob`s, base64 data URIs, and long base64-only strings are replaced
+  with contract placeholders before previews are serialized. `Config.Redact`
+  runs over the sanitized inputs/outputs, error strings, and telemetry text
+  (sanitize → redact → stringify → truncate); a panicking hook fails closed to
+  `[redaction failed]` while the event still ships.
 - Cross-language stateless HTTP helpers: `ResolveStatelessHTTPSession`,
   identity-bearing session IDs, official-SDK session generators, and a
   mark3labs request-scoped session manager.
@@ -18,7 +38,6 @@ All notable changes to this project will be documented in this file.
   stateless session IDs.
 - Explicit `ToolCallInput.RequestID`; otherwise each call receives a fresh UUID
   so reconnecting JSON-RPC counters cannot collide at ingest.
-
 - Official `github.com/modelcontextprotocol/go-sdk/mcp` support through the
   `armatureanalytics/official` adapter. It provides receiving middleware,
   factory and recorder integration, typed `InstrumentTool`, schema decoration,

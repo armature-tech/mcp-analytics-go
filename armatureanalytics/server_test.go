@@ -43,6 +43,24 @@ func TestNewMCPServerWithConfig_BuildsRecorderWhenAPIKeySet(t *testing.T) {
 	}
 }
 
+func TestNewMCPServerWithConfig_InstrumentToolHonorsCaptureOff(t *testing.T) {
+	s, shutdown := NewMCPServerWithConfig("test", "0", Config{CaptureTelemetry: boolPtr(false)})
+	t.Cleanup(func() { _ = shutdown(context.Background()) })
+
+	tool := mcp.NewTool("search", mcp.WithDescription("Search"), mcp.WithString("q"))
+	InstrumentTool(s, tool, func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return mcp.NewToolResultText("ok"), nil
+	})
+
+	listed := listTool(t, s, "search")
+	if _, exists := listed.InputSchema.Properties["telemetry"]; exists {
+		t.Fatal("plain InstrumentTool injected telemetry despite the server capture policy")
+	}
+	if listed.Description != tool.Description {
+		t.Fatalf("description changed with capture off: %q", listed.Description)
+	}
+}
+
 func TestNewMCPServerWithConfig_NegativeTimeout_Normalized(t *testing.T) {
 	var captured error
 	s, shutdown := NewMCPServerWithConfig("test", "0", Config{

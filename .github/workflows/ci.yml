@@ -15,7 +15,7 @@ jobs:
   checks:
     name: Checks
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions:
       contents: read
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
@@ -34,6 +34,9 @@ jobs:
         run: |
           go vet ./...
           go test ./...
+
+      - name: Test external consumer module
+        run: ./scripts/run-publish-canary.sh
 
   mark3labs-current:
     name: mark3labs v0.56 compatibility

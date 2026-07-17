@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -73,6 +74,44 @@ func TestResolveStatelessHTTPSessionRecoversEchoedIdentity(t *testing.T) {
 	}
 	if _, err := manager.Validate("wrong"); err == nil {
 		t.Fatal("mark3labs validation accepted wrong id")
+	}
+}
+
+func TestResolveStatelessHTTPSessionSeedSurvivesProxyReconnect(t *testing.T) {
+	seed := "11111111-2222-4333-8444-555555555555"
+	body := map[string]any{
+		"method": "initialize",
+		"params": map[string]any{"clientInfo": map[string]any{
+			"name": "mcp-tester-claude-remote-proxy", "version": "0.1.0",
+		}},
+	}
+	resolve := func() StatelessHTTPSession {
+		return ResolveStatelessHTTPSession(StatelessHTTPInput{
+			Body:    body,
+			Headers: http.Header{"X-Armature-Session-Seed": []string{seed}},
+		})
+	}
+	first, reconnected := resolve(), resolve()
+	if first.SessionID != reconnected.SessionID {
+		t.Fatalf("reconnect split %q from %q", first.SessionID, reconnected.SessionID)
+	}
+	want := "mcp_mcp-tester-claude-remote-proxy_v_0.1.0_" + seed
+	clientInfo := ParseStatelessSessionClientInfo(first.SessionID)
+	if first.SessionID != want || clientInfo == nil || clientInfo.Name != "mcp-tester-claude-remote-proxy" {
+		t.Fatalf("seeded session = %#v, want id %q with client info", first, want)
+	}
+}
+
+func TestResolveStatelessHTTPSessionRejectsInvalidSeed(t *testing.T) {
+	session := ResolveStatelessHTTPSession(StatelessHTTPInput{
+		Body: map[string]any{
+			"method": "initialize",
+			"params": map[string]any{"clientInfo": map[string]any{"name": "client"}},
+		},
+		Headers: http.Header{"X-Armature-Session-Seed": []string{"attacker-controlled"}},
+	})
+	if !regexp.MustCompile(`^mcp_client_v__[0-9a-f-]{36}$`).MatchString(session.SessionID) || strings.Contains(session.SessionID, "attacker") {
+		t.Fatalf("invalid seed controlled session id %q", session.SessionID)
 	}
 }
 

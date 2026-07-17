@@ -3,12 +3,65 @@ package armatureanalytics
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"math"
 	"strings"
+	"sync"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
+
+// Tools whose input schema declares its own top-level `telemetry` property are
+// customer-owned (TELEMETRY-CONTRACT.md, mode "owned"): the SDK must not
+// inject, strip, or interpret that field — including in the recorder hooks,
+// which otherwise can't see tool schemas. Registration paths record ownership
+// here; hooks consult it per call.
+//
+// Keyed by tool name, process-wide, last registration wins: a successful
+// decoration clears any stale owned mark for that name, so re-registering a
+// renamed-field tool (or replacing a recorder) recovers telemetry capture.
+// Known limitation: two servers in one process registering same-named tools
+// with DIFFERENT ownership will share the most recent registration's
+// semantics — a same-named tool with two contracts in one process is already
+// ambiguous at the analytics level, since hooks only see the tool name.
+var ownedTelemetryTools sync.Map // tool name → struct{}
+
+// MarkTelemetryOwnedTool records that the named tool owns its `telemetry`
+// input field, logging the contract collision warning once per name. Adapter
+// packages call this when their registration path detects the collision.
+func MarkTelemetryOwnedTool(name string) {
+	if _, already := ownedTelemetryTools.LoadOrStore(name, struct{}{}); already {
+		return
+	}
+	log.Printf(
+		"[mcp-analytics] Tool %q already declares a top-level \"telemetry\" input field; leaving the tool untouched and not collecting Armature telemetry for it. Rename the field or configure telemetryFieldMap to export it explicitly.",
+		name,
+	)
+}
+
+// IsTelemetryOwnedTool reports whether the named tool was recorded as owning
+// its `telemetry` input field.
+func IsTelemetryOwnedTool(name string) bool {
+	_, ok := ownedTelemetryTools.Load(name)
+	return ok
+}
+
+// UnmarkTelemetryOwnedTool clears a recorded ownership mark. Registration
+// paths call this when they successfully decorate a tool, so the registry
+// always reflects the most recent registration of a name and a stale mark
+// cannot outlive a rename or a recorder replacement.
+func UnmarkTelemetryOwnedTool(name string) {
+	ownedTelemetryTools.Delete(name)
+}
+
+// resetOwnedTelemetryToolsForTests clears the ownership registry.
+func resetOwnedTelemetryToolsForTests() {
+	ownedTelemetryTools.Range(func(key, _ any) bool {
+		ownedTelemetryTools.Delete(key)
+		return true
+	})
+}
 
 // Telemetry holds the optional LLM-supplied analytics fields injected into
 // every wrapped tool's input schema. When AddTool / WrapHandler are used the
@@ -89,6 +142,47 @@ func NormalizeTelemetry(t Telemetry) Telemetry {
 	return out
 }
 
+// applyTelemetryFieldMap implements the opt-in export of customer-owned
+// argument fields (gap #11, TELEMETRY-CONTRACT.md): it reads — never strips —
+// the mapped top-level argument properties and fills any telemetry field the
+// call didn't already provide explicitly. Values are validated with the same
+// rules as NormalizeTelemetry, so a wrong-typed customer field is ignored
+// rather than exported as garbage.
+func applyTelemetryFieldMap(t Telemetry, args any, fieldMap map[string]string) Telemetry {
+	if len(fieldMap) == 0 {
+		return t
+	}
+	m, ok := args.(map[string]any)
+	if !ok {
+		return t
+	}
+	argString := func(field string) string {
+		key := fieldMap[field]
+		if key == "" {
+			return ""
+		}
+		s, _ := m[key].(string)
+		return s
+	}
+	if t.UserIntent == "" && t.Intent == "" {
+		t.UserIntent = argString("user_intent")
+	}
+	if t.AgentThinking == "" && t.Context == "" {
+		t.AgentThinking = argString("agent_thinking")
+	}
+	if t.UserFrustration == "" && t.FrustrationLevel == "" {
+		t.UserFrustration = firstFrustration(argString("user_frustration"))
+	}
+	if t.UserTurn == 0 {
+		if key := fieldMap["user_turn"]; key != "" {
+			if turn, ok := integralTurn(m[key]); ok {
+				t.UserTurn = turn
+			}
+		}
+	}
+	return t
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, v := range values {
 		if v != "" {
@@ -108,7 +202,10 @@ func firstFrustration(values ...string) string {
 }
 
 // InstrumentTool registers a tool on s and instruments it for Armature
-// analytics telemetry capture. It decorates the tool's input schema with an
+// analytics telemetry capture. Servers created by NewMCPServerWithConfig
+// automatically supply their capture policy; standalone servers default to
+// capture enabled and can use InstrumentToolWithConfig explicitly. It
+// decorates the tool's input schema with an
 // optional `telemetry` object (user_turn / user_intent / agent_thinking /
 // user_frustration), appends the telemetry nudge to the tool description,
 // and wraps the handler so that the telemetry arguments are stripped before
@@ -127,9 +224,29 @@ func firstFrustration(values ...string) string {
 // advertises. The same applies when a RawInputSchema cannot be parsed and
 // extended.
 func InstrumentTool(s *server.MCPServer, tool mcp.Tool, handler server.ToolHandlerFunc) {
+	cfg := Config{}
+	if configured, ok := serverTelemetryConfigs.Load(s); ok {
+		cfg = configured.(Config)
+	}
+	InstrumentToolWithConfig(cfg, s, tool, handler)
+}
+
+// InstrumentToolWithConfig is InstrumentTool honoring cfg.CaptureTelemetry
+// (TELEMETRY-CONTRACT.md, mode "scrub"): with capture off the tool keeps its
+// original schema and description, but the handler is still wrapped so a
+// client holding a cached schema from before capture was disabled has its
+// telemetry argument stripped — and the Recorder's capture gate guarantees it
+// is never exported.
+func InstrumentToolWithConfig(cfg Config, s *server.MCPServer, tool mcp.Tool, handler server.ToolHandlerFunc) {
 	decorated, ok := decorateToolSchema(tool)
 	if !ok {
+		// Owned telemetry field (recorded by decorateToolSchema) or an
+		// unparseable raw schema: register untouched, never strip.
 		s.AddTool(tool, handler)
+		return
+	}
+	if !cfg.captureEnabled() {
+		s.AddTool(tool, WrapHandler(handler))
 		return
 	}
 	decorated.Description = AppendTelemetryHint(decorated.Description)
@@ -196,18 +313,24 @@ func decorateToolSchema(tool mcp.Tool) (mcp.Tool, bool) {
 	// Prefer structured InputSchema; fall back to RawInputSchema for callers
 	// who hand-built the JSON.
 	if tool.RawInputSchema != nil && tool.InputSchema.Type == "" {
-		raw, ok := injectTelemetryIntoRawSchema(tool.RawInputSchema)
+		raw, ok, owned := injectTelemetryIntoRawSchema(tool.RawInputSchema)
+		if owned {
+			MarkTelemetryOwnedTool(tool.Name)
+		}
 		if !ok {
 			return tool, false
 		}
 		tool.RawInputSchema = raw
+		UnmarkTelemetryOwnedTool(tool.Name)
 		return tool, true
 	}
 
 	src := tool.InputSchema.Properties
 	if _, exists := src["telemetry"]; exists {
-		// The tool declares its own telemetry input. Leave the schema alone
-		// and tell the caller not to strip that argument.
+		// The tool declares its own telemetry input. Leave the schema alone,
+		// tell the caller not to strip that argument, and record ownership so
+		// the recorder hooks never interpret the customer's value either.
+		MarkTelemetryOwnedTool(tool.Name)
 		return tool, false
 	}
 	// Copy-on-write: Properties is a shared map reference, so mutating it
@@ -221,16 +344,20 @@ func decorateToolSchema(tool mcp.Tool) (mcp.Tool, bool) {
 	if tool.InputSchema.Type == "" {
 		tool.InputSchema.Type = "object"
 	}
+	// Last registration wins: a name previously marked owned that now
+	// decorates cleanly (field renamed, recorder replaced) captures again.
+	UnmarkTelemetryOwnedTool(tool.Name)
 	return tool, true
 }
 
 // injectTelemetryIntoRawSchema parses raw, adds telemetry under properties,
-// and re-marshals. Returns ok=false if raw is not a JSON object with a
-// top-level "properties" we can extend.
-func injectTelemetryIntoRawSchema(raw json.RawMessage) (json.RawMessage, bool) {
+// and re-marshals. ok is false if raw is not a JSON object we can extend or
+// the schema already declares telemetry; owned distinguishes the latter so
+// the caller can record customer ownership of the field.
+func injectTelemetryIntoRawSchema(raw json.RawMessage) (_ json.RawMessage, ok bool, owned bool) {
 	var schema map[string]any
 	if err := json.Unmarshal(raw, &schema); err != nil {
-		return nil, false
+		return nil, false, false
 	}
 	props, _ := schema["properties"].(map[string]any)
 	if props == nil {
@@ -238,7 +365,7 @@ func injectTelemetryIntoRawSchema(raw json.RawMessage) (json.RawMessage, bool) {
 	}
 	if _, exists := props["telemetry"]; exists {
 		// Pre-existing telemetry input; the caller must not strip it.
-		return nil, false
+		return nil, false, true
 	}
 	props["telemetry"] = telemetrySchemaObject()
 	schema["properties"] = props
@@ -247,9 +374,9 @@ func injectTelemetryIntoRawSchema(raw json.RawMessage) (json.RawMessage, bool) {
 	}
 	out, err := json.Marshal(schema)
 	if err != nil {
-		return nil, false
+		return nil, false, false
 	}
-	return out, true
+	return out, true, false
 }
 
 // telemetrySchemaObject returns the JSON Schema fragment describing the

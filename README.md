@@ -366,6 +366,21 @@ The official adapter accepts the same `Config` fields through
 | **ActorSeed** | Authorization header, then anonymous | Supply a stable user or tenant seed |
 | **OnError** | None | Observe delivery failures |
 | **Disabled** | **false** | Disable instrumentation |
+| **CaptureTelemetry** | **nil** (on) | Disable conversation-derived telemetry entirely (see below) |
+| **Redact** | None | Redact sensitive data from previews before delivery (see below) |
+| **TelemetryFieldMap** | None | Export existing argument fields as telemetry (see below) |
+
+### Telemetry capture and privacy
+
+`InstrumentTool` injects an optional `telemetry` object (`user_intent`, `agent_thinking`, `user_frustration`, `user_turn`) into each wrapped tool's input schema. This is conversation-derived data: if your deployment cannot disclose it — for example in a privacy policy required for an app-store submission — set **CaptureTelemetry** to a false pointer and register tools through `InstrumentToolWithConfig` (both packages provide it). With capture off, tool schemas and descriptions pass through completely untouched, and telemetry sent by clients holding an older cached schema is stripped and never delivered anywhere (ingest or `OnError`). Tool-call and session analytics keep working without the conversational fields.
+
+Disclosure summary for privacy policies: with capture **on**, the SDK collects tool names, tool call inputs/outputs (size-capped previews), error messages, timing, a one-way hash of the actor seed, client name/version, and the agent-supplied `telemetry` fields above; recipients are your Armature workspace. With capture **off**, the `telemetry` fields are not collected.
+
+If a tool's own input schema already declares a top-level `telemetry` property, the SDK treats that field as **yours**: the schema, description, and arguments pass through untouched (including in the recorder hooks and middleware), nothing is interpreted as Armature telemetry, and a warning is logged once at registration. To export an existing, semantically equivalent field, opt in explicitly with **TelemetryFieldMap** — e.g. `map[string]string{"user_intent": "purpose"}` reads (never strips) the tool's `purpose` argument into `user_intent`. Explicit telemetry values always win over mapped ones, and the map is ignored while capture is off.
+
+### Redaction and binary payloads
+
+Before any preview is serialized, the SDK strips binary content automatically: image/audio content-block `data`, resource `blob`s, base64 data URIs, and long base64 strings are replaced with `"[binary removed]"` / `"[base64 removed]"` placeholders. A **Redact** hook then runs over the sanitized inputs, outputs, error strings, and telemetry text, and must return the value to serialize. The pipeline is sanitize → redact → stringify → truncate. If the hook panics, the SDK fails closed: the affected payload is replaced with `"[redaction failed]"` and the event still ships.
 
 If the API key is missing, **NewMCPServer** quietly disables delivery for local
 development. When you pass **EnvConfig()** to **NewRecorder** yourself, set

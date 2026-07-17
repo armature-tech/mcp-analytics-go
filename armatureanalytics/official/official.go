@@ -23,6 +23,11 @@ const (
 	methodToolsCall  = "tools/call"
 )
 
+// serverTelemetryConfigs lets InstrumentTool inherit the capture policy from
+// NewMCPServerWithConfig without changing its established call signature.
+// Entries are removed by the paired Shutdown function.
+var serverTelemetryConfigs sync.Map // *mcp.Server -> Config
+
 // Config configures analytics delivery. It is shared with the mark3labs
 // adapter so both integrations emit the same wire format.
 type Config = armatureanalytics.Config
@@ -81,8 +86,15 @@ func NewMCPServer(impl *mcp.Implementation, opts *mcp.ServerOptions) (*mcp.Serve
 // NewMCPServerWithConfig is NewMCPServer with explicit analytics config.
 func NewMCPServerWithConfig(impl *mcp.Implementation, opts *mcp.ServerOptions, cfg Config) (*mcp.Server, Shutdown) {
 	s := mcp.NewServer(impl, opts)
+	serverTelemetryConfigs.Store(s, cfg)
+	shutdown := func(close func(context.Context) error) Shutdown {
+		return func(ctx context.Context) error {
+			defer serverTelemetryConfigs.Delete(s)
+			return close(ctx)
+		}
+	}
 	if cfg.APIKey == "" && cfg.Emit == nil && !cfg.Disabled {
-		return s, func(context.Context) error { return nil }
+		return s, shutdown(func(context.Context) error { return nil })
 	}
 
 	rec, err := NewRecorder(cfg)
@@ -90,10 +102,10 @@ func NewMCPServerWithConfig(impl *mcp.Implementation, opts *mcp.ServerOptions, c
 		if cfg.OnError != nil {
 			cfg.OnError(err, Batch{})
 		}
-		return s, func(context.Context) error { return nil }
+		return s, shutdown(func(context.Context) error { return nil })
 	}
 	rec.Install(s)
-	return s, rec.Close
+	return s, shutdown(rec.Close)
 }
 
 // Install adds analytics receiving middleware to s. Repeated calls with the
@@ -209,7 +221,16 @@ func (r *Recorder) recordToolCall(
 		return
 	}
 
-	telemetry, _, preview := parseArguments(params.Arguments)
+	// Tools that own their telemetry field (TELEMETRY-CONTRACT.md, mode
+	// "owned") are exempt from extraction: their arguments pass through to
+	// the preview untouched and nothing is interpreted as Armature telemetry.
+	var telemetry armatureanalytics.Telemetry
+	var preview any
+	if armatureanalytics.IsTelemetryOwnedTool(params.Name) {
+		preview = decodeRawArguments(params.Arguments)
+	} else {
+		telemetry, _, preview = parseArguments(params.Arguments)
+	}
 	analyticsSessionID := r.analyticsSessionID(req)
 	isToolError := false
 	if toolResult, ok := result.(*mcp.CallToolResult); ok && toolResult != nil {
@@ -337,8 +358,25 @@ func (r *Recorder) analyticsSessionID(req mcp.Request) string {
 }
 
 // InstrumentTool registers a typed official-SDK tool with analytics schema
-// decoration and handler cleanup. The handler keeps its original signature.
+// decoration and handler cleanup. Servers created by NewMCPServerWithConfig
+// automatically supply their capture policy; standalone servers default to
+// capture enabled and can use InstrumentToolWithConfig explicitly. The
+// handler keeps its original signature.
 func InstrumentTool[In, Out any](s *mcp.Server, tool *mcp.Tool, handler mcp.ToolHandlerFor[In, Out]) {
+	cfg := Config{}
+	if configured, ok := serverTelemetryConfigs.Load(s); ok {
+		cfg = configured.(Config)
+	}
+	InstrumentToolWithConfig(cfg, s, tool, handler)
+}
+
+// InstrumentToolWithConfig is InstrumentTool honoring cfg.CaptureTelemetry
+// (TELEMETRY-CONTRACT.md, mode "scrub"): with capture off the tool keeps its
+// original schema and description, but the handler is still wrapped so a
+// client holding a cached schema from before capture was disabled has its
+// telemetry argument stripped — and the Recorder's capture gate guarantees it
+// is never exported.
+func InstrumentToolWithConfig[In, Out any](cfg Config, s *mcp.Server, tool *mcp.Tool, handler mcp.ToolHandlerFor[In, Out]) {
 	decorated, ok, err := DecorateInputSchemaWithTelemetry[In](tool)
 	if err != nil {
 		panic(fmt.Sprintf("armatureanalytics/official: instrument tool %q: %v", toolName(tool), err))
@@ -347,7 +385,17 @@ func InstrumentTool[In, Out any](s *mcp.Server, tool *mcp.Tool, handler mcp.Tool
 		mcp.AddTool(s, tool, handler)
 		return
 	}
+	if !CaptureEnabled(cfg) {
+		mcp.AddTool(s, tool, WrapHandler(handler))
+		return
+	}
 	mcp.AddTool(s, decorated, WrapHandler(handler))
+}
+
+// CaptureEnabled reports whether cfg collects conversation-derived telemetry
+// (Config.CaptureTelemetry nil or true).
+func CaptureEnabled(cfg Config) bool {
+	return cfg.CaptureTelemetry == nil || *cfg.CaptureTelemetry
 }
 
 // DecorateInputSchemaWithTelemetry returns a copy of tool whose inferred or
@@ -366,6 +414,9 @@ func DecorateInputSchemaWithTelemetry[In any](tool *mcp.Tool) (*mcp.Tool, bool, 
 		props = make(map[string]any)
 	}
 	if _, exists := props["telemetry"]; exists {
+		// Customer-owned telemetry field: record ownership so the middleware
+		// never interprets the customer's value as Armature telemetry either.
+		armatureanalytics.MarkTelemetryOwnedTool(tool.Name)
 		return tool, false, nil
 	}
 	props["telemetry"] = armatureanalytics.TelemetryInputSchema()
@@ -380,6 +431,9 @@ func DecorateInputSchemaWithTelemetry[In any](tool *mcp.Tool) (*mcp.Tool, bool, 
 	decorated := *tool
 	decorated.InputSchema = schema
 	decorated.Description = armatureanalytics.AppendTelemetryHint(decorated.Description)
+	// Last registration wins: a name previously marked owned that now
+	// decorates cleanly (field renamed, recorder replaced) captures again.
+	armatureanalytics.UnmarkTelemetryOwnedTool(tool.Name)
 	return &decorated, true, nil
 }
 
@@ -427,6 +481,21 @@ func inputSchemaFor[In any](provided any) (map[string]any, error) {
 		return nil, fmt.Errorf("decode input schema: %w", err)
 	}
 	return schema, nil
+}
+
+// decodeRawArguments decodes raw into a generic value for previews without
+// telemetry extraction (owned tools). Falls back to the raw bytes on error.
+func decodeRawArguments(raw json.RawMessage) any {
+	if len(raw) == 0 {
+		return nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var args any
+	if err := decoder.Decode(&args); err != nil {
+		return raw
+	}
+	return args
 }
 
 func parseArguments(raw json.RawMessage) (armatureanalytics.Telemetry, json.RawMessage, any) {
