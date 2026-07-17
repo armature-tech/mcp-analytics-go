@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- Removed `user_turn` from advertised schemas and newly emitted events. Cached
+  clients may still send it; the SDK strips and ignores it. `UserTurn` remains
+  deprecated for source compatibility.
+- `agent_thinking` is requested on every call; `user_intent` and
+  `user_frustration` are requested only on the first call after each new user
+  message.
+
 ### Added
 
 - **Telemetry capture switch.** `Config.CaptureTelemetry *bool` (nil = on) plus

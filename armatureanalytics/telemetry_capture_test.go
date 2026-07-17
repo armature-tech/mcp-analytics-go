@@ -43,7 +43,6 @@ func loadContractVectors(t *testing.T) contractVectors {
 
 // expectedTelemetry holds only the V1 fields the shared vectors use.
 type expectedTelemetry struct {
-	UserTurn        int    `json:"user_turn"`
 	UserIntent      string `json:"user_intent"`
 	AgentThinking   string `json:"agent_thinking"`
 	UserFrustration string `json:"user_frustration"`
@@ -81,8 +80,7 @@ func TestContractExtractionVectors(t *testing.T) {
 			if err := json.Unmarshal(vec.ExpectTelemetry, &expect); err != nil {
 				t.Fatalf("decode expect_telemetry: %v", err)
 			}
-			if tel.UserTurn != expect.UserTurn ||
-				tel.UserIntent != expect.UserIntent ||
+			if tel.UserIntent != expect.UserIntent ||
 				tel.AgentThinking != expect.AgentThinking ||
 				tel.UserFrustration != expect.UserFrustration {
 				t.Fatalf("telemetry: got %+v want %+v", tel, expect)
@@ -143,7 +141,10 @@ func TestCaptureOffDropsTelemetryAtChokePoint(t *testing.T) {
 		t.Fatalf("expected 1 event, got %d", len(events))
 	}
 	meta := events[0]["metadata"].(map[string]any)
-	for _, key := range []string{"user_intent", "agent_thinking", "user_frustration", "user_turn", "intent", "context"} {
+	if _, ok := meta["user_turn"]; ok {
+		t.Fatalf("removed user_turn metadata was emitted")
+	}
+	for _, key := range []string{"user_intent", "agent_thinking", "user_frustration", "intent", "context"} {
 		if meta[key] != nil {
 			t.Fatalf("metadata[%s] = %v, want nil", key, meta[key])
 		}

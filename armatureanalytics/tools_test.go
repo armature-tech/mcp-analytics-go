@@ -19,8 +19,8 @@ func TestExtractTelemetryFromArgs_AllFields(t *testing.T) {
 		},
 	}
 	tel, cleaned := extractTelemetryFromArgs(args)
-	if tel.UserTurn != 2 {
-		t.Errorf("UserTurn = %d", tel.UserTurn)
+	if tel.UserTurn != 0 {
+		t.Errorf("cached UserTurn must be ignored, got %d", tel.UserTurn)
 	}
 	if tel.UserIntent != "summarise the latest cpu metric" {
 		t.Errorf("UserIntent = %q", tel.UserIntent)
@@ -78,22 +78,16 @@ func TestExtractTelemetryFromArgs_V1WinsOverLegacy(t *testing.T) {
 	}
 }
 
-func TestExtractTelemetryFromArgs_UserTurnGuards(t *testing.T) {
-	// Fractional, zero, and negative turns are dropped rather than coerced;
-	// integral floats are accepted; off-spec frustration values are dropped.
-	for _, bad := range []any{1.9, float64(0), float64(-1)} {
-		args := map[string]any{"telemetry": map[string]any{"user_turn": bad, "user_frustration": "annoyed"}}
+func TestExtractTelemetryFromArgs_IgnoresCachedUserTurn(t *testing.T) {
+	for _, cached := range []any{1.9, float64(0), float64(-1), float64(2)} {
+		args := map[string]any{"telemetry": map[string]any{"user_turn": cached, "user_frustration": "annoyed"}}
 		tel, _ := extractTelemetryFromArgs(args)
 		if tel.UserTurn != 0 {
-			t.Errorf("user_turn %v should be dropped, got %d", bad, tel.UserTurn)
+			t.Errorf("user_turn %v should be ignored, got %d", cached, tel.UserTurn)
 		}
 		if tel.UserFrustration != "" {
 			t.Errorf("off-spec frustration should be dropped, got %q", tel.UserFrustration)
 		}
-	}
-	tel, _ := extractTelemetryFromArgs(map[string]any{"telemetry": map[string]any{"user_turn": 2.0}})
-	if tel.UserTurn != 2 {
-		t.Errorf("integral float user_turn should be kept, got %d", tel.UserTurn)
 	}
 }
 
@@ -123,6 +117,10 @@ func TestAppendTelemetryHint_Idempotent(t *testing.T) {
 	v1 := "Echoes." + telemetryDescriptionHintV1
 	if AppendTelemetryHint(v1) != v1 {
 		t.Errorf("earlier-V1-hinted description modified")
+	}
+	repeatedIntent := "Echoes." + telemetryDescriptionHintRepeatIntent
+	if AppendTelemetryHint(repeatedIntent) != repeatedIntent {
+		t.Errorf("prior repeated-intent description modified")
 	}
 	legacy := "Echoes." + telemetryDescriptionHintLegacy
 	if AppendTelemetryHint(legacy) != legacy {
@@ -190,7 +188,10 @@ func TestDecorateInputSchemaWithTelemetry_AddsOptionalTelemetry(t *testing.T) {
 		t.Errorf("telemetry property shape wrong: %+v", tel)
 	}
 	props, _ := tel["properties"].(map[string]any)
-	for _, key := range []string{"user_turn", "user_intent", "agent_thinking", "user_frustration"} {
+	if _, ok := props["user_turn"]; ok {
+		t.Errorf("removed user_turn sub-property still advertised")
+	}
+	for _, key := range []string{"user_intent", "agent_thinking", "user_frustration"} {
 		if _, ok := props[key]; !ok {
 			t.Errorf("missing %s sub-property", key)
 		}

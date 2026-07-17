@@ -36,13 +36,21 @@ func TestProductionPlatformSessionIsolation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	for _, session := range []string{"session-a", "session-b"} {
-		for call, failed := range map[string]bool{"call-1": false, "call-2": true} {
+		for _, step := range []struct {
+			call   string
+			failed bool
+		}{{"call-1", false}, {"call-2", true}} {
+			call, failed := step.call, step.failed
 			started := time.Now()
+			telemetry := armatureanalytics.Telemetry{AgentThinking: "exercise the canary path"}
+			if call == "call-1" {
+				telemetry.UserIntent = marker
+			}
 			recorder.RecordToolCall(ctx, armatureanalytics.ToolCallInput{
 				ToolName: map[bool]string{false: "canary_echo", true: "canary_expected_error"}[failed],
 				Args:     map[string]any{"marker": session + "/" + call}, Result: map[string]any{"marker": session + "/" + call},
 				IsToolError: failed, SessionID: marker + "/" + session, StartedAt: started, FinishedAt: time.Now(),
-				Telemetry: armatureanalytics.Telemetry{UserIntent: marker},
+				Telemetry: telemetry,
 			})
 		}
 	}

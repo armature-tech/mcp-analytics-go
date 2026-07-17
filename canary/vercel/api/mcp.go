@@ -82,7 +82,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	)
 	armatureanalytics.InstrumentTool(
 		mcpServer,
-		mcp.NewTool("canary_echo", mcp.WithDescription("Call exactly once after canary_identity to echo a marker. Set telemetry.user_intent exactly to "+intent+"."), mcp.WithString("marker", mcp.Required())),
+		mcp.NewTool("canary_echo", mcp.WithDescription("Call exactly once after canary_identity to echo a marker. Omit telemetry.user_intent because this continues the same user turn."), mcp.WithString("marker", mcp.Required())),
 		func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			return toolResult(map[string]string{"marker": req.GetString("marker", ""), "session_id": session.SessionID, "deployment": deployment}), nil
 		},

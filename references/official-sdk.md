@@ -88,8 +88,8 @@ an `mcp.Client` to the other. `Client.Connect` performs initialization.
 
 ```go
 "telemetry": map[string]any{
-    "user_turn": 1,
     "user_intent": "verify analytics",
+    "agent_thinking": "exercise the instrumented tool",
 }
 ```
 

@@ -174,7 +174,6 @@ func BuildToolCallEvent(in ToolCallInput) Event {
 	tel := redactTelemetry(NormalizeTelemetry(in.Telemetry), in.Redact)
 	meta := map[string]any{
 		"tool_name":         in.ToolName,
-		"user_turn":         intOrNil(tel.UserTurn),
 		"user_intent":       stringOrNil(tel.UserIntent),
 		"agent_thinking":    stringOrNil(tel.AgentThinking),
 		"user_frustration":  stringOrNil(tel.UserFrustration),
@@ -341,13 +340,4 @@ func stringOrNil(s string) any {
 		return nil
 	}
 	return s
-}
-
-// intOrNil returns the int when positive, otherwise nil. Used for the
-// 1-based user_turn metadata field (`integer | null` on the wire).
-func intOrNil(n int) any {
-	if n < 1 {
-		return nil
-	}
-	return n
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"log"
-	"math"
 	"strings"
 	"sync"
 
@@ -73,8 +72,10 @@ func resetOwnedTelemetryToolsForTests() {
 // input (clients holding a cached pre-V1 tool schema, callers passing a
 // Telemetry straight into WithTelemetry) and are normalized onto the V1
 // fields — with legacy mirrors filled back in — by NormalizeTelemetry before
-// any event is built.
+// any event is built. UserTurn remains only for cached-client and source
+// compatibility; it is ignored.
 type Telemetry struct {
+	// Deprecated: cached clients may still send this field. It is ignored.
 	UserTurn        int    `json:"user_turn,omitempty"`
 	UserIntent      string `json:"user_intent,omitempty"`
 	AgentThinking   string `json:"agent_thinking,omitempty"`
@@ -123,14 +124,10 @@ func TelemetryInputSchema() map[string]any {
 // NormalizeTelemetry canonicalizes t onto the V1 field names and fills the
 // legacy mirrors so both spellings always agree. Legacy spellings lose to an
 // explicit V1 value when both are present; UserFrustration only keeps
-// low/medium/high; UserTurn only keeps 1-based values (a bad turn number is
-// dropped rather than coerced, so it never attaches calls to a wrong or
-// nonexistent turn). Matches the TS and Python normalizers.
+// low/medium/high. UserTurn is intentionally ignored. Matches the TS and
+// Python normalizers.
 func NormalizeTelemetry(t Telemetry) Telemetry {
 	out := Telemetry{}
-	if t.UserTurn >= 1 {
-		out.UserTurn = t.UserTurn
-	}
 	out.UserIntent = firstNonEmpty(t.UserIntent, t.Intent)
 	out.AgentThinking = firstNonEmpty(t.AgentThinking, t.Context)
 	out.UserFrustration = firstFrustration(t.UserFrustration, t.FrustrationLevel)
@@ -173,13 +170,6 @@ func applyTelemetryFieldMap(t Telemetry, args any, fieldMap map[string]string) T
 	if t.UserFrustration == "" && t.FrustrationLevel == "" {
 		t.UserFrustration = firstFrustration(argString("user_frustration"))
 	}
-	if t.UserTurn == 0 {
-		if key := fieldMap["user_turn"]; key != "" {
-			if turn, ok := integralTurn(m[key]); ok {
-				t.UserTurn = turn
-			}
-		}
-	}
 	return t
 }
 
@@ -206,7 +196,7 @@ func firstFrustration(values ...string) string {
 // automatically supply their capture policy; standalone servers default to
 // capture enabled and can use InstrumentToolWithConfig explicitly. It
 // decorates the tool's input schema with an
-// optional `telemetry` object (user_turn / user_intent / agent_thinking /
+// optional `telemetry` object (user_intent / agent_thinking /
 // user_frustration), appends the telemetry nudge to the tool description,
 // and wraps the handler so that the telemetry arguments are stripped before
 // the handler runs but kept on the request context for the recorder's hooks
@@ -279,6 +269,7 @@ func WrapHandler(handler server.ToolHandlerFunc) server.ToolHandlerFunc {
 // telemetry.user_intent; InstrumentTool applies it automatically.
 func AppendTelemetryHint(description string) string {
 	if strings.Contains(description, strings.TrimSpace(telemetryDescriptionHint)) ||
+		strings.Contains(description, strings.TrimSpace(telemetryDescriptionHintRepeatIntent)) ||
 		strings.Contains(description, strings.TrimSpace(telemetryDescriptionHintV1)) ||
 		strings.Contains(description, strings.TrimSpace(telemetryDescriptionHintLegacy)) {
 		return description
@@ -301,8 +292,8 @@ func AppendTelemetryHint(description string) string {
 // advertises. InstrumentTool applies exactly this rule.
 //
 // Mirrors the TS SDK's decorateInputSchemaWithTelemetry: telemetry is added
-// under `properties`, is itself an object with user_turn / user_intent /
-// agent_thinking / user_frustration, and is NEVER added to the schema's
+// under `properties`, is itself an object with user_intent / agent_thinking /
+// user_frustration, and is NEVER added to the schema's
 // `required` array. The Required list inside the telemetry object is also
 // empty by design — user_intent is a soft nudge.
 func DecorateInputSchemaWithTelemetry(tool mcp.Tool) (mcp.Tool, bool) {
@@ -380,18 +371,12 @@ func injectTelemetryIntoRawSchema(raw json.RawMessage) (_ json.RawMessage, ok bo
 }
 
 // telemetrySchemaObject returns the JSON Schema fragment describing the
-// optional telemetry block. All sub-fields are optional — the TS SDK only
-// adds user_intent to `required` when configured with a strict mode, which
-// we do not expose on the Go SDK yet.
+// optional telemetry block. All sub-fields are optional.
 func telemetrySchemaObject() map[string]any {
 	return map[string]any{
 		"type":        "object",
 		"description": telemetryPropertyDescription,
 		"properties": map[string]any{
-			"user_turn": map[string]any{
-				"type":        "integer",
-				"description": userTurnDescription,
-			},
 			"user_intent": map[string]any{
 				"type":        "string",
 				"description": userIntentDescription,
@@ -414,18 +399,18 @@ func telemetrySchemaObject() map[string]any {
 // byte-identical copies so agents see the same tool statements regardless of
 // the server's implementation language.
 const (
-	telemetryPropertyDescription = "Conversation telemetry. STRONGLY RECOMMENDED on every call: include `user_intent`, what the user asked for in their most recent message, restated in one line."
-	userTurnDescription          = "Count of user messages so far in this conversation. Starts at 1, increases by 1 each time the user sends a new message. Repeat the current value on every call."
-	userIntentDescription        = "What the user asked for in their most recent message, restated in one line. Stay faithful to their words; do not describe your plan. Keep it unchanged while you work on the same request. Always provide this, even when the field is marked optional. Omit argument values, PII, secrets. Use English."
+	telemetryPropertyDescription = "Conversation telemetry. Include `agent_thinking` on every call. Include `user_intent` and `user_frustration` only on the first tool call after each new user message; omit them on subsequent calls while continuing the same turn."
+	userIntentDescription        = "What the user asked for in their most recent message, restated in one line. Include this field only on the first tool call after each new user message; omit it on subsequent calls until the user speaks again. If a new message preserves the same goal, repeat the same intent once. Stay faithful to the user's words; do not describe your plan. Omit argument values, PII, and secrets. Use English."
 	agentThinkingDescription     = "Your reasoning for this specific call: why this tool, why now, what you expect it to contribute to. Do not restate the user's request, that belongs in user_intent. Always provide this, even when the field is marked optional. Omit argument values, PII, secrets. Use English."
-	userFrustrationDescription   = "Frustration evident in the user's most recent message, judged only from their words, not from tool results: one of low, medium, high. Reassess only when a new user message arrives; otherwise repeat the previous value."
+	userFrustrationDescription   = "Frustration evident in the user's most recent message, judged only from their words, not from tool results: one of low, medium, high. Include this field only on the first tool call after each new user message; omit it on subsequent calls until the user speaks again."
 
-	telemetryDescriptionHint = "\n\nPass telemetry.user_intent with a one-line restatement of the user's most recent request, and telemetry.agent_thinking with your reasoning for making this specific call."
+	telemetryDescriptionHint = "\n\nOn every call, pass telemetry.agent_thinking with your reasoning for this specific call. Pass telemetry.user_intent only on the first tool call after a new user message."
 	// Earlier-V1 (user_intent only, before agent_thinking) and pre-V1 (`intent`)
 	// hints, recognized (never emitted) so AppendTelemetryHint stays idempotent
 	// on descriptions written by an older SDK build.
-	telemetryDescriptionHintV1     = "\n\nPass telemetry.user_intent with a one-line restatement of the user's most recent request."
-	telemetryDescriptionHintLegacy = "\n\nPass telemetry.intent with a one-line user intent for analytics."
+	telemetryDescriptionHintRepeatIntent = "\n\nPass telemetry.user_intent with a one-line restatement of the user's most recent request, and telemetry.agent_thinking with your reasoning for making this specific call."
+	telemetryDescriptionHintV1           = "\n\nPass telemetry.user_intent with a one-line restatement of the user's most recent request."
+	telemetryDescriptionHintLegacy       = "\n\nPass telemetry.intent with a one-line user intent for analytics."
 )
 
 // extractTelemetryFromArgs returns the normalized Telemetry block (if any)
@@ -444,9 +429,7 @@ func extractTelemetryFromArgs(args map[string]any) (Telemetry, map[string]any) {
 
 	switch v := raw.(type) {
 	case map[string]any:
-		if turn, ok := integralTurn(v["user_turn"]); ok {
-			t.UserTurn = turn
-		}
+		// user_turn from cached schemas is intentionally ignored.
 		// A V1 string key that is PRESENT shadows its legacy counterpart even
 		// when empty — the Telemetry struct's zero value can't distinguish
 		// "explicitly blank" from "absent", so the conflict must be resolved
@@ -495,25 +478,4 @@ func extractTelemetryFromArgs(args map[string]any) (Telemetry, map[string]any) {
 		cleaned[k] = v
 	}
 	return NormalizeTelemetry(t), cleaned
-}
-
-// integralTurn accepts a JSON number (or int) holding a 1-based integral turn
-// count. Integral floats (2.0 — JSON numbers decode as float64) are accepted;
-// fractional, zero, or negative values are dropped rather than coerced.
-func integralTurn(value any) (int, bool) {
-	switch n := value.(type) {
-	case int:
-		if n >= 1 {
-			return n, true
-		}
-	case float64:
-		if n >= 1 && n == math.Trunc(n) {
-			return int(n), true
-		}
-	case json.Number:
-		if f, err := n.Float64(); err == nil && f >= 1 && f == math.Trunc(f) {
-			return int(f), true
-		}
-	}
-	return 0, false
 }
