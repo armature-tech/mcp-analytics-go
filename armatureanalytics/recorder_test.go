@@ -101,6 +101,86 @@ func TestSessionInit_EmptySessionID_DedupedPerConnection(t *testing.T) {
 	}
 }
 
+func TestActorIdentifier_SentVerbatimAndEmittedOnlyOnChange(t *testing.T) {
+	sink := newRecordingSink(t)
+	identifier := "Ada <ada@example.com>"
+	resolverCalls := 0
+	rec, err := NewRecorder(Config{
+		APIKey:      "test-key",
+		EndpointURL: sink.srv.URL,
+		ActorIdentifier: func(context.Context) string {
+			resolverCalls++
+			return identifier
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewRecorder: %v", err)
+	}
+	t.Cleanup(func() { _ = rec.Close(context.Background()) })
+	ctx := sessionCtx(newFakeSession("s-identifier"))
+
+	emitCall := func(id int64) {
+		req := &mcp.CallToolRequest{}
+		req.Params.Name = "ping"
+		rec.onBeforeAny(ctx, id, mcp.MethodToolsCall, req)
+		rec.onSuccess(ctx, id, mcp.MethodToolsCall, req, &mcp.CallToolResult{})
+	}
+	emitCall(1)
+	emitCall(2)
+	identifier = "anything-at-all@example.com"
+	emitCall(3)
+	if err := rec.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	if resolverCalls != 3 {
+		t.Fatalf("ActorIdentifier calls = %d, want 3", resolverCalls)
+	}
+	identities := 0
+	identifiers := make(map[string]bool)
+	actorIDs := make(map[string]bool)
+	for _, ev := range sink.Events() {
+		if ev["kind"] != KindActorIdentity {
+			continue
+		}
+		identities++
+		meta := ev["metadata"].(map[string]any)
+		identifiers[meta["identifier"].(string)] = true
+		actorIDs[ev["actor_id"].(string)] = true
+	}
+	if identities != 2 {
+		t.Fatalf("actor_identity events = %d, want 2", identities)
+	}
+	if !identifiers["Ada <ada@example.com>"] || !identifiers["anything-at-all@example.com"] {
+		t.Fatalf("identifiers = %v, want both verbatim values", identifiers)
+	}
+	if !actorIDs[ActorID("Ada <ada@example.com>")] || !actorIDs[ActorID("anything-at-all@example.com")] {
+		t.Fatalf("actor IDs = %v, want hashes of both identifiers", actorIDs)
+	}
+}
+
+func TestActorIdentity_OmittedWithoutActorIdentifier(t *testing.T) {
+	sink := newRecordingSink(t)
+	rec, err := NewRecorder(Config{
+		APIKey: "test-key", EndpointURL: sink.srv.URL,
+	})
+	if err != nil {
+		t.Fatalf("NewRecorder: %v", err)
+	}
+	t.Cleanup(func() { _ = rec.Close(context.Background()) })
+	ctx := sessionCtx(newFakeSession("s-private"))
+	req := &mcp.CallToolRequest{}
+	req.Params.Name = "ping"
+	rec.onBeforeAny(ctx, int64(1), mcp.MethodToolsCall, req)
+	rec.onSuccess(ctx, int64(1), mcp.MethodToolsCall, req, &mcp.CallToolResult{})
+	_ = rec.Flush(context.Background())
+	for _, ev := range sink.Events() {
+		if ev["kind"] == KindActorIdentity {
+			t.Fatal("actor_identity emitted without ActorIdentifier")
+		}
+	}
+}
+
 func TestPendingCalls_EmptySessionID_NoCrossConnectionCollision(t *testing.T) {
 	sink := newRecordingSink(t)
 	rec := newSinkRecorder(t, sink)

@@ -15,6 +15,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Rich actor identification.** `ActorIdentifier` supplies any caller-provided
+  string for both the hashed `actor_id` and verbatim identity value.
+  `actor_identity` events emit only when the value changes; `ActorSeed` remains
+  the hashed-only fallback.
+
 - **Opt-in capability request tool.** `Config.RequestCapability` dynamically
   injects `request_capability` into mark3labs and official-SDK servers. The
   tool is off by default, suppressed by `Disabled` or missing delivery

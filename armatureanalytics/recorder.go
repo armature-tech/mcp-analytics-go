@@ -67,6 +67,10 @@ type Config struct {
 	// sha256("anonymous").
 	ActorSeed func(ctx context.Context) string
 
+	// ActorIdentifier returns an optional caller-provided identifier. The SDK
+	// stores the string verbatim and does not interpret its contents.
+	ActorIdentifier func(ctx context.Context) string
+
 	// OnError, if set, receives any ingest delivery failures. When nil,
 	// failures are silently dropped — call sites should set this in
 	// production to surface delivery problems through their own logger.
@@ -118,10 +122,12 @@ type Recorder struct {
 	cfg  Config
 	send func(context.Context, Batch) error
 
-	pendingCalls   sync.Map // requestKey → callContext
-	sessionInfo    sync.Map // sessionID → *ClientInfo
-	emittedSession *boundedKeySet
-	lazySessions   *boundedKeySet
+	pendingCalls     sync.Map // requestKey → callContext
+	sessionInfo      sync.Map // sessionID → *ClientInfo
+	emittedSession   *boundedKeySet
+	lazySessions     *boundedKeySet
+	identityMu       sync.Mutex
+	actorIdentifiers map[string]string
 
 	inflight sync.WaitGroup
 	// closeMu serializes the closed transition against emit's inflight.Add
@@ -157,9 +163,10 @@ type callContext struct {
 // which case the Recorder no-ops). Mirrors the TS SDK's recorder factory.
 func NewRecorder(cfg Config) (*Recorder, error) {
 	r := &Recorder{
-		cfg:            cfg,
-		emittedSession: newBoundedKeySet(10_000),
-		lazySessions:   newBoundedKeySet(10_000),
+		cfg:              cfg,
+		emittedSession:   newBoundedKeySet(10_000),
+		lazySessions:     newBoundedKeySet(10_000),
+		actorIdentifiers: make(map[string]string),
 	}
 	if cfg.Disabled {
 		return r, nil
@@ -318,8 +325,16 @@ func (r *Recorder) buildToolCallEvents(ctx context.Context, in ToolCallInput) []
 	if in.ClientInfo == nil {
 		in.ClientInfo = ParseStatelessSessionClientInfo(in.SessionID)
 	}
-	events := make([]Event, 0, 2)
-	if in.SessionID != "" && r.lazySessions.Add(ActorID(in.ActorSeed)+":"+in.SessionID) {
+	identifier := r.actorIdentifier(ctx)
+	if identifier != "" {
+		in.ActorSeed = identifier
+	}
+	actorID := ActorID(in.ActorSeed)
+	events := make([]Event, 0, 3)
+	if identity := r.identityEventFor(actorID, identifier, in.StartedAt); identity != nil {
+		events = append(events, *identity)
+	}
+	if in.SessionID != "" && r.lazySessions.Add(actorID+":"+in.SessionID) {
 		events = append(events, BuildSessionInitEvent(SessionInitInput{
 			SessionID:     in.SessionID,
 			ActorSeed:     in.ActorSeed,
@@ -345,10 +360,24 @@ func (r *Recorder) RecordSessionInit(ctx context.Context, in SessionInitInput) {
 	if in.ClientInfo == nil {
 		in.ClientInfo = ParseStatelessSessionClientInfo(in.SessionID)
 	}
-	if in.SessionID != "" && !r.lazySessions.Add(ActorID(in.ActorSeed)+":"+in.SessionID) {
+	identifier := r.actorIdentifier(ctx)
+	if identifier != "" {
+		in.ActorSeed = identifier
+	}
+	actorID := ActorID(in.ActorSeed)
+	identity := r.identityEventFor(actorID, identifier, in.StartedAt)
+	if in.SessionID != "" && !r.lazySessions.Add(actorID+":"+in.SessionID) {
+		if identity != nil {
+			r.emit(ctx, []Event{*identity})
+		}
 		return
 	}
-	r.emit(ctx, []Event{BuildSessionInitEvent(in)})
+	events := make([]Event, 0, 2)
+	if identity != nil {
+		events = append(events, *identity)
+	}
+	events = append(events, BuildSessionInitEvent(in))
+	r.emit(ctx, events)
 }
 
 // ---------- hooks ----------
@@ -565,6 +594,37 @@ func (r *Recorder) ResolveActorSeed(ctx context.Context, headers http.Header) st
 		}
 	}
 	return headers.Get("Authorization")
+}
+
+func (r *Recorder) actorIdentifier(ctx context.Context) string {
+	if r.cfg.ActorIdentifier == nil {
+		return ""
+	}
+	identifier := r.cfg.ActorIdentifier(ctx)
+	if identifier == "" || len([]byte(identifier)) > 8*1024 {
+		return ""
+	}
+	return identifier
+}
+
+func (r *Recorder) identityEventFor(actorID string, identifier string, startedAt time.Time) *Event {
+	if identifier == "" {
+		return nil
+	}
+	r.identityMu.Lock()
+	defer r.identityMu.Unlock()
+	if r.actorIdentifiers[actorID] == identifier {
+		return nil
+	}
+	if len(r.actorIdentifiers) >= 10_000 {
+		for oldest := range r.actorIdentifiers {
+			delete(r.actorIdentifiers, oldest)
+			break
+		}
+	}
+	r.actorIdentifiers[actorID] = identifier
+	event := BuildActorIdentityEvent(actorID, identifier, startedAt)
+	return &event
 }
 
 func (r *Recorder) clientInfoFor(sessionKey any) *ClientInfo {

@@ -337,8 +337,8 @@ config := armatureanalytics.Config{
     Timeout:     5 * time.Second,
     Delivery:    armatureanalytics.DeliveryAwait,
     RequestCapability: true,
-    ActorSeed: func(ctx context.Context) string {
-        return principalFromContext(ctx)
+    ActorIdentifier: func(ctx context.Context) string {
+        return "anything-at-all@example.com"
     },
     OnError: func(err error, batch armatureanalytics.Batch) {
         log.Printf("Armature delivery failed: %v", err)
@@ -364,6 +364,7 @@ The official adapter accepts the same `Config` fields through
 | **Delivery** | `DeliveryBackground` | Use `DeliveryAwait` for serverless and short-lived handlers |
 | **Emit** | Network emitter | Replace delivery for tests or custom pipelines; makes APIKey optional |
 | **ActorSeed** | Authorization header, then anonymous | Supply a stable user or tenant seed |
+| **ActorIdentifier** | None | Store a caller-provided identifier verbatim |
 | **OnError** | None | Observe delivery failures |
 | **Disabled** | **false** | Disable instrumentation |
 | **CaptureTelemetry** | **nil** (on) | Disable conversation-derived telemetry entirely (see below) |
@@ -392,7 +393,7 @@ recorders are rejected.
 
 `InstrumentTool` injects an optional `telemetry` object (`user_intent`, `agent_thinking`, `user_frustration`) into each wrapped tool's input schema. This is conversation-derived data: if your deployment cannot disclose it — for example in a privacy policy required for an app-store submission — set **CaptureTelemetry** to a false pointer and register tools through `InstrumentToolWithConfig` (both packages provide it). With capture off, tool schemas and descriptions pass through completely untouched, and telemetry sent by clients holding an older cached schema is stripped and never delivered anywhere (ingest or `OnError`). Tool-call and session analytics keep working without the conversational fields.
 
-Disclosure summary for privacy policies: with capture **on**, the SDK collects tool names, tool call inputs/outputs (size-capped previews), error messages, timing, a one-way hash of the actor seed, client name/version, and the agent-supplied `telemetry` fields above; recipients are your Armature workspace. With capture **off**, the `telemetry` fields are not collected.
+Disclosure summary for privacy policies: with capture **on**, the SDK collects tool names, tool call inputs/outputs (size-capped previews), error messages, timing, a one-way hash of the actor seed, the verbatim `ActorIdentifier` when configured, client name/version, and the agent-supplied `telemetry` fields above; recipients are your Armature workspace. With capture **off**, the `telemetry` fields are not collected.
 
 If a tool's own input schema already declares a top-level `telemetry` property, the SDK treats that field as **yours**: the schema, description, and arguments pass through untouched (including in the recorder hooks and middleware), nothing is interpreted as Armature telemetry, and a warning is logged once at registration. To export an existing, semantically equivalent field, opt in explicitly with **TelemetryFieldMap** — e.g. `map[string]string{"user_intent": "purpose"}` reads (never strips) the tool's `purpose` argument into `user_intent`. Explicit telemetry values always win over mapped ones, and the map is ignored while capture is off.
 
@@ -410,6 +411,13 @@ ingest failure is intentionally silent.
 ### Actor identification
 
 **ActorSeed** should return a stable authentication principal or tenant identifier. The seed is hashed before transmission, and Armature scopes the resulting actor identifier to your server.
+
+Optional **ActorIdentifier** attaches one caller-provided string. The SDK does
+not interpret its contents: it may be an internal ID, email, name, or any other
+non-empty string. It is hashed into `actor_id`, stored verbatim, and emitted in
+an **actor_identity** event only when it changes. The only additional limit is
+an 8 KiB cap. When **ActorIdentifier** is absent, **ActorSeed** retains its
+existing hashed-only behavior.
 
 With the official adapter, if `ActorSeed` reads values added by auth receiving
 middleware, install analytics first and add the auth middleware afterward so

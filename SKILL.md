@@ -80,6 +80,10 @@ failures are intentionally silent. If the server authenticates users, set
 `Config.ActorSeed` from a stable principal in the request context. Never put
 the API key in client-side code.
 
+Optional verbatim identification uses `Config.ActorIdentifier`. It accepts any
+non-empty string up to 8 KiB, hashes it into `actor_id`, and emits the verbatim
+value only when it changes. `ActorSeed` remains the hashed-only fallback.
+
 ## 4. Drain background delivery
 
 Wire exactly one bounded drain:

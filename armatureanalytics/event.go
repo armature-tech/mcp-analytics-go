@@ -13,8 +13,9 @@ import (
 const (
 	SchemaVersion = 1
 
-	KindToolCall    = "tool_call"
-	KindSessionInit = "session_init"
+	KindToolCall      = "tool_call"
+	KindSessionInit   = "session_init"
+	KindActorIdentity = "actor_identity"
 
 	MaxPreviewBytes      = 8 * 1024
 	MaxSourceBytes       = 32 * 1024
@@ -29,7 +30,7 @@ type Batch struct {
 	Events        []Event `json:"events"`
 }
 
-// Event is one entry in a Batch. Kind is "tool_call" or "session_init".
+// Event is one entry in a Batch. Kind is "tool_call", "session_init", or "actor_identity".
 // The shape mirrors src/events.ts in @armature-tech/mcp-analytics.
 type Event struct {
 	EventID               string         `json:"event_id"`
@@ -51,6 +52,23 @@ type Event struct {
 	SearchCalls           []any          `json:"search_calls"`
 	IsWorkflow            bool           `json:"is_workflow,omitempty"`
 	WorkflowRunID         string         `json:"workflow_run_id,omitempty"`
+}
+
+// BuildActorIdentityEvent constructs a content-addressed actor profile update.
+func BuildActorIdentityEvent(actorID string, identifier string, startedAt time.Time) Event {
+	stamp := startedAt.UTC().Format(time.RFC3339Nano)
+	return Event{
+		EventID:     EventID(actorID, KindActorIdentity, identifier),
+		Kind:        KindActorIdentity,
+		ActorID:     actorID,
+		StartedAt:   stamp,
+		FinishedAt:  stamp,
+		OK:          true,
+		Metadata:    map[string]any{"identifier": identifier},
+		Calls:       []any{},
+		Logs:        []any{},
+		SearchCalls: []any{},
+	}
 }
 
 // ToolCallInput is the typed input to BuildToolCallEvent — what every hook
