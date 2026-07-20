@@ -128,6 +128,17 @@ Do all of these:
 A build-only test is insufficient. Use the framework-specific in-process
 client pattern in the selected reference.
 
+Run the language-independent local doctor against the started server too:
+
+```bash
+npx @armature-tech/mcp-analytics doctor --url http://localhost:3000/mcp
+```
+
+Use the same `ANALYTICS_INGEST_API_KEY` and `ANALYTICS_INGEST_URL` as
+the Go server. The doctor verifies the MCP handshake, all served tool schemas,
+and ingest authentication with an empty batch containing no customer content.
+Include its result in the handoff.
+
 ## 6. Report the integration
 
 Tell the user:
