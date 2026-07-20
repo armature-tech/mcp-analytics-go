@@ -166,6 +166,232 @@ func TestOfficialSDKEndToEnd(t *testing.T) {
 	}
 }
 
+func TestRequestCapabilityOptIn(t *testing.T) {
+	var batches []armatureanalytics.Batch
+	s, shutdown := NewMCPServerWithConfig(
+		&mcp.Implementation{Name: "official-capability", Version: "1.0.0"},
+		nil,
+		Config{
+			RequestCapability: true,
+			Delivery:          armatureanalytics.DeliveryAwait,
+			Emit: func(_ context.Context, batch armatureanalytics.Batch) error {
+				batches = append(batches, batch)
+				return nil
+			},
+		},
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	go func() { _ = s.Run(ctx, serverTransport) }()
+	client := mcp.NewClient(&mcp.Implementation{Name: "official-client", Version: "1.0.0"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+
+	listed, err := session.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	if len(listed.Tools) != 1 {
+		t.Fatalf("tools = %d, want request_capability only", len(listed.Tools))
+	}
+	tool := listed.Tools[0]
+	if tool.Name != "request_capability" || tool.Description != requestCapabilityDescription {
+		t.Fatalf("tool = %#v", tool)
+	}
+	schema, ok := tool.InputSchema.(map[string]any)
+	if !ok {
+		t.Fatalf("schema type = %T", tool.InputSchema)
+	}
+	properties, _ := schema["properties"].(map[string]any)
+	if _, exists := properties["telemetry"]; exists {
+		t.Fatal("request_capability should not advertise telemetry")
+	}
+	capability, _ := properties["capability"].(map[string]any)
+	if got := capability["description"]; got != requestCapabilityArgDescription {
+		t.Fatalf("capability description = %q, want %q", got, requestCapabilityArgDescription)
+	}
+
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "request_capability",
+		Arguments: map[string]any{"capability": "send an SMS"},
+	})
+	if err != nil || result.IsError {
+		t.Fatalf("call result = %#v, err = %v", result, err)
+	}
+	if result.Meta != nil {
+		t.Fatalf("SDK provenance marker leaked into result metadata: %#v", result.Meta)
+	}
+	invalid, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "request_capability",
+		Arguments: map[string]any{"capability": "   "},
+	})
+	if err != nil {
+		t.Fatalf("invalid call transport error: %v", err)
+	}
+	if !invalid.IsError {
+		t.Fatalf("blank capability should return a tool error: %#v", invalid)
+	}
+	if err := shutdown(ctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	afterShutdown, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "request_capability",
+		Arguments: map[string]any{"capability": "send an email"},
+	})
+	if err != nil {
+		t.Fatalf("post-shutdown call transport error: %v", err)
+	}
+	if !afterShutdown.IsError {
+		t.Fatalf("post-shutdown call should return unavailable: %#v", afterShutdown)
+	}
+	if afterShutdown.Meta != nil {
+		t.Fatalf("inactive call should not carry capability provenance: %#v", afterShutdown.Meta)
+	}
+	for _, batch := range batches {
+		for _, event := range batch.Events {
+			if event.Kind == armatureanalytics.KindToolCall && event.OK {
+				if event.Metadata["capability_request"] != true {
+					t.Fatalf("SDK event missing provenance: %#v", event.Metadata)
+				}
+				return
+			}
+		}
+	}
+	t.Fatalf("no successful request_capability event in %#v", batches)
+}
+
+func TestRequestCapabilityProvenanceFollowsSDKHandler(t *testing.T) {
+	var batches []armatureanalytics.Batch
+	s, shutdown := NewMCPServerWithConfig(
+		&mcp.Implementation{Name: "official-capability-provenance", Version: "1.0.0"},
+		nil,
+		Config{
+			RequestCapability: true,
+			Delivery:          armatureanalytics.DeliveryAwait,
+			Emit: func(_ context.Context, batch armatureanalytics.Batch) error {
+				batches = append(batches, batch)
+				return nil
+			},
+		},
+	)
+
+	// Official SDK registrations are last-write-wins. A customer replacement
+	// with the reserved name must not inherit the injected handler's provenance.
+	mcp.AddTool(s, &mcp.Tool{
+		Name: "request_capability",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"capability": map[string]any{"type": "string"},
+			},
+		},
+	}, func(_ context.Context, _ *mcp.CallToolRequest, _ requestCapabilityInput) (*mcp.CallToolResult, any, error) {
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "customer tool"}}}, nil, nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	go func() { _ = s.Run(ctx, serverTransport) }()
+	client := mcp.NewClient(&mcp.Implementation{Name: "official-client", Version: "1.0.0"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "request_capability",
+		Arguments: map[string]any{"capability": "customer operation"},
+	})
+	if err != nil || result.IsError {
+		t.Fatalf("customer call result = %#v, err = %v", result, err)
+	}
+	if err := shutdown(ctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	for _, batch := range batches {
+		for _, event := range batch.Events {
+			if event.Kind != armatureanalytics.KindToolCall {
+				continue
+			}
+			if _, marked := event.Metadata["capability_request"]; marked {
+				t.Fatalf("customer event inherited SDK provenance: %#v", event.Metadata)
+			}
+			return
+		}
+	}
+	t.Fatalf("no customer tool_call event in %#v", batches)
+}
+
+func TestRequestCapabilityReservationSurvivesResultReplacement(t *testing.T) {
+	var batches []armatureanalytics.Batch
+	recorder, err := NewRecorder(Config{
+		RequestCapability: true,
+		Delivery:          armatureanalytics.DeliveryAwait,
+		Emit: func(_ context.Context, batch armatureanalytics.Batch) error {
+			batches = append(batches, batch)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := mcp.NewServer(&mcp.Implementation{Name: "official-capability-middleware", Version: "1.0.0"}, nil)
+	addRequestCapabilityTool(s, recorder)
+	s.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			result, err := next(ctx, method, req)
+			if method == methodToolsCall && err == nil {
+				return &mcp.CallToolResult{
+					Content: []mcp.Content{&mcp.TextContent{Text: "replacement result"}},
+				}, nil
+			}
+			return result, err
+		}
+	})
+	recorder.Install(s)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	go func() { _ = s.Run(ctx, serverTransport) }()
+	client := mcp.NewClient(&mcp.Implementation{Name: "official-client", Version: "1.0.0"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "request_capability",
+		Arguments: map[string]any{"capability": "send an SMS"},
+	})
+	if err != nil || result.IsError {
+		t.Fatalf("call result = %#v, err = %v", result, err)
+	}
+	if got := result.Content[0].(*mcp.TextContent).Text; got != "replacement result" {
+		t.Fatalf("result text = %q, want replacement result", got)
+	}
+	if err := recorder.Close(ctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	for _, batch := range batches {
+		for _, event := range batch.Events {
+			if event.Kind == armatureanalytics.KindToolCall && event.OK && event.Metadata["capability_request"] == true {
+				return
+			}
+		}
+	}
+	t.Fatalf("no successful request_capability event in %#v", batches)
+}
+
 func TestSessionlessRequestsDoNotShareCachedIdentity(t *testing.T) {
 	recorder, err := NewRecorder(Config{
 		Delivery: armatureanalytics.DeliveryAwait,

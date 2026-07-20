@@ -336,6 +336,7 @@ config := armatureanalytics.Config{
     EndpointURL: "https://app.armature.tech/api/mcp-analytics/ingest",
     Timeout:     5 * time.Second,
     Delivery:    armatureanalytics.DeliveryAwait,
+    RequestCapability: true,
     ActorSeed: func(ctx context.Context) string {
         return principalFromContext(ctx)
     },
@@ -368,6 +369,24 @@ The official adapter accepts the same `Config` fields through
 | **CaptureTelemetry** | **nil** (on) | Disable conversation-derived telemetry entirely (see below) |
 | **Redact** | None | Redact sensitive data from previews before delivery (see below) |
 | **TelemetryFieldMap** | None | Export existing argument fields as telemetry (see below) |
+| **RequestCapability** | **false** | Inject `request_capability` so agents can report an unmet tool need |
+
+### Capability requests
+
+Set `RequestCapability: true` with `NewMCPServerWithConfig` to inject a
+`request_capability` tool. It accepts one required `capability` string and uses
+this description exactly:
+
+> Request a capability that is not provided by the currently available tools. Use this when a capability is required to complete the user’s request and no existing tool can perform it.
+
+Calls flow through the normal analytics hooks and feed Armature's unmet-demand
+signals. The option defaults to false and is suppressed when `Disabled` is
+true or no API key/custom `Emit` delivery is configured. For a manually
+constructed mark3labs server, call
+`armatureanalytics.AddRequestCapabilityTool(s, rec)` after installing the recorder
+and handle its returned error. The recorder is required so every acknowledged
+request reaches the unmet-demand signal pipeline; nil, disabled, and closed
+recorders are rejected.
 
 ### Telemetry capture and privacy
 

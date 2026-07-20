@@ -94,6 +94,11 @@ func NewMCPServerWithConfig(name, version string, cfg Config, opts ...server.Ser
 	}
 	s := server.NewMCPServer(name, version, opts...)
 	serverTelemetryConfigs.Store(s, cfg)
+	if cfg.RequestCapability && !cfg.Disabled && rec != nil {
+		if err := AddRequestCapabilityTool(s, rec); err != nil && cfg.OnError != nil {
+			cfg.OnError(err, Batch{})
+		}
+	}
 
 	shutdown := Shutdown(func(ctx context.Context) error {
 		defer serverTelemetryConfigs.Delete(s)

@@ -15,6 +15,11 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Opt-in capability request tool.** `Config.RequestCapability` dynamically
+  injects `request_capability` into mark3labs and official-SDK servers. The
+  tool is off by default, suppressed by `Disabled` or missing delivery
+  configuration, preserves the requested description exactly, and records
+  provenance-marked calls through the normal analytics hooks.
 - **Telemetry capture switch.** `Config.CaptureTelemetry *bool` (nil = on) plus
   `InstrumentToolWithConfig` in both packages: with capture off, tool schemas
   and descriptions pass through untouched, and telemetry sent by cached-schema

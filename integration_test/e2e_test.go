@@ -205,6 +205,73 @@ func TestRecorder_DisabledIsNoop(t *testing.T) {
 	}
 }
 
+func TestRequestCapability_OptInEmitsNormalToolCall(t *testing.T) {
+	sink := newIngestSink(t)
+	mcpServer, shutdown := armatureanalytics.NewMCPServerWithConfig(
+		"test-server",
+		"1.0.0",
+		armatureanalytics.Config{
+			APIKey:            "test-key",
+			EndpointURL:       sink.server.URL,
+			Timeout:           2 * time.Second,
+			RequestCapability: true,
+		},
+		server.WithToolCapabilities(true),
+	)
+	t.Cleanup(func() { _ = shutdown(context.Background()) })
+
+	client, err := mcpclient.NewInProcessClient(mcpServer)
+	if err != nil {
+		t.Fatalf("NewInProcessClient: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.Start(ctx); err != nil {
+		t.Fatalf("client.Start: %v", err)
+	}
+
+	initReq := mcp.InitializeRequest{}
+	initReq.Params.ProtocolVersion = "2025-06-18"
+	initReq.Params.ClientInfo.Name = "test-client"
+	initReq.Params.ClientInfo.Version = "0.1"
+	if _, err := client.Initialize(ctx, initReq); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	callReq := mcp.CallToolRequest{}
+	callReq.Params.Name = "request_capability"
+	callReq.Params.Arguments = map[string]any{"capability": "send an SMS"}
+	result, err := client.CallTool(ctx, callReq)
+	if err != nil {
+		t.Fatalf("CallTool request_capability: %v", err)
+	}
+	if len(result.Content) != 1 {
+		t.Fatalf("response content = %#v, want one acknowledgment", result.Content)
+	}
+	text, ok := result.Content[0].(mcp.TextContent)
+	if !ok || text.Text != "Capability request acknowledged." {
+		t.Fatalf("response content = %#v, want acknowledgment text", result.Content[0])
+	}
+
+	if err := shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	for _, ev := range sink.Events() {
+		if ev["kind"] != "tool_call" {
+			continue
+		}
+		meta, _ := ev["metadata"].(map[string]any)
+		if meta["tool_name"] == "request_capability" {
+			if meta["capability_request"] != true {
+				t.Fatalf("request_capability event is missing provenance marker: %v", meta)
+			}
+			return
+		}
+	}
+	t.Fatalf("request_capability was not recorded as a normal tool_call: events=%v", sink.Events())
+}
+
 func TestAddTool_PropagatesIntentToEvent(t *testing.T) {
 	sink := newIngestSink(t)
 	rec, err := armatureanalytics.NewRecorder(armatureanalytics.Config{

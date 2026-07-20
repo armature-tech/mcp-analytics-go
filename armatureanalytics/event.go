@@ -70,6 +70,9 @@ type ToolCallInput struct {
 	ClientInfo    *ClientInfo
 	Telemetry     Telemetry // optional LLM-supplied telemetry (V1 or pre-V1 spellings; normalized on emit)
 	WorkflowRunID string    // optional Armature workflow-run UUID; marks synthetic traffic
+	// CapabilityRequest marks SDK-owned request_capability calls so ingest can
+	// distinguish them from a customer tool that happens to use the same name.
+	CapabilityRequest bool
 	// Redact runs over the sanitized args/result (and the normalized telemetry
 	// and error string) before serialization. Recorder.RecordToolCall fills it
 	// from Config.Redact; direct BuildToolCallEvent callers may set it
@@ -181,6 +184,9 @@ func BuildToolCallEvent(in ToolCallInput) Event {
 		"context":           stringOrNil(tel.AgentThinking),
 		"frustration_level": stringOrNil(tel.UserFrustration),
 		"input_preview":     inputPreview,
+	}
+	if in.CapabilityRequest {
+		meta["capability_request"] = true
 	}
 	mergeClientInfo(meta, in.ClientInfo)
 

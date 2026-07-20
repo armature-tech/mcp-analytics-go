@@ -45,6 +45,37 @@ type sessionInfo struct {
 	session            *mcp.ServerSession
 }
 
+type capabilityCallStateKey struct{}
+
+type capabilityCallState struct {
+	mu          sync.Mutex
+	reservation *armatureanalytics.CapabilityReservation
+}
+
+func (s *capabilityCallState) attach(reservation *armatureanalytics.CapabilityReservation) bool {
+	if s == nil || reservation == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reservation != nil {
+		return false
+	}
+	s.reservation = reservation
+	return true
+}
+
+func (s *capabilityCallState) take() *armatureanalytics.CapabilityReservation {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reservation := s.reservation
+	s.reservation = nil
+	return reservation
+}
+
 // Recorder installs official-SDK middleware and owns analytics delivery.
 type Recorder struct {
 	core *armatureanalytics.Recorder
@@ -104,6 +135,9 @@ func NewMCPServerWithConfig(impl *mcp.Implementation, opts *mcp.ServerOptions, c
 		}
 		return s, shutdown(func(context.Context) error { return nil })
 	}
+	if cfg.RequestCapability && !cfg.Disabled && rec != nil {
+		addRequestCapabilityTool(s, rec)
+	}
 	rec.Install(s)
 	return s, shutdown(rec.Close)
 }
@@ -159,6 +193,16 @@ func (r *Recorder) middleware(next mcp.MethodHandler) mcp.MethodHandler {
 		if method == methodToolsCall {
 			clientInfo = r.clientInfo(sessionKey(req))
 		}
+		var capabilityState *capabilityCallState
+		if method == methodToolsCall {
+			capabilityState = &capabilityCallState{}
+			ctx = context.WithValue(ctx, capabilityCallStateKey{}, capabilityState)
+			defer func() {
+				if reservation := capabilityState.take(); reservation != nil {
+					reservation.Release()
+				}
+			}()
+		}
 		startedAt := time.Now()
 		result, err := next(ctx, method, req)
 		finishedAt := time.Now()
@@ -169,7 +213,16 @@ func (r *Recorder) middleware(next mcp.MethodHandler) mcp.MethodHandler {
 				r.recordInitialize(ctx, req, startedAt)
 			}
 		case methodToolsCall:
-			r.recordToolCall(ctx, req, result, err, startedAt, finishedAt, clientInfo)
+			r.recordToolCall(
+				ctx,
+				req,
+				result,
+				err,
+				startedAt,
+				finishedAt,
+				clientInfo,
+				capabilityState.take(),
+			)
 		}
 		return result, err
 	}
@@ -215,9 +268,13 @@ func (r *Recorder) recordToolCall(
 	startedAt time.Time,
 	finishedAt time.Time,
 	clientInfo *armatureanalytics.ClientInfo,
+	capabilityReservation *armatureanalytics.CapabilityReservation,
 ) {
 	params, ok := req.GetParams().(*mcp.CallToolParamsRaw)
 	if !ok || params == nil {
+		if capabilityReservation != nil {
+			capabilityReservation.Release()
+		}
 		return
 	}
 
@@ -236,20 +293,26 @@ func (r *Recorder) recordToolCall(
 	if toolResult, ok := result.(*mcp.CallToolResult); ok && toolResult != nil {
 		isToolError = toolResult.IsError
 	}
-	r.core.RecordToolCall(ctx, armatureanalytics.ToolCallInput{
-		ToolName:      params.Name,
-		Args:          preview,
-		Result:        result,
-		Err:           callErr,
-		IsToolError:   isToolError,
-		SessionID:     analyticsSessionID,
-		ActorSeed:     r.core.ResolveActorSeed(ctx, requestHeaders(req)),
-		StartedAt:     startedAt,
-		FinishedAt:    finishedAt,
-		ClientInfo:    clientInfo,
-		Telemetry:     telemetry,
-		WorkflowRunID: armatureanalytics.WorkflowRunIDFromHeaders(requestHeaders(req)),
-	})
+	in := armatureanalytics.ToolCallInput{
+		ToolName:          params.Name,
+		Args:              preview,
+		Result:            result,
+		Err:               callErr,
+		IsToolError:       isToolError,
+		SessionID:         analyticsSessionID,
+		ActorSeed:         r.core.ResolveActorSeed(ctx, requestHeaders(req)),
+		StartedAt:         startedAt,
+		FinishedAt:        finishedAt,
+		ClientInfo:        clientInfo,
+		Telemetry:         telemetry,
+		WorkflowRunID:     armatureanalytics.WorkflowRunIDFromHeaders(requestHeaders(req)),
+		CapabilityRequest: capabilityReservation != nil,
+	}
+	if capabilityReservation != nil {
+		r.core.RecordReservedCapability(ctx, in, capabilityReservation)
+		return
+	}
+	r.core.RecordToolCall(ctx, in)
 }
 
 func requestHeaders(req mcp.Request) http.Header {

@@ -77,6 +77,11 @@ type Config struct {
 	// the call site.
 	Disabled bool
 
+	// RequestCapability, when true, adds the request_capability tool to
+	// servers constructed by NewMCPServerWithConfig. It is opt-in and false
+	// by default.
+	RequestCapability bool
+
 	// CaptureTelemetry is the master switch for conversation-derived telemetry
 	// (user_intent, agent_thinking, user_frustration). nil or true
 	// means on. When false the SDK injects no telemetry schema, appends no
@@ -126,6 +131,14 @@ type Recorder struct {
 
 	dropped uint64
 	closed  atomic.Bool
+}
+
+// CapabilityReservation coordinates an SDK-owned capability response with
+// recorder shutdown. Adapters reserve before acknowledging, then complete the
+// reservation from their normal completion hook after the event is built.
+type CapabilityReservation struct {
+	recorder *Recorder
+	claimed  atomic.Bool
 }
 
 type callContext struct {
@@ -209,11 +222,12 @@ func (r *Recorder) Close(ctx context.Context) error {
 	r.closeMu.Lock()
 	r.closed.Store(true)
 	r.closeMu.Unlock()
+	err := r.Flush(ctx)
 	r.pendingCalls.Range(func(key, _ any) bool {
 		r.pendingCalls.Delete(key)
 		return true
 	})
-	return r.Flush(ctx)
+	return err
 }
 
 // Dropped returns the count of events the recorder discarded because it was
@@ -230,6 +244,58 @@ func (r *Recorder) RecordToolCall(ctx context.Context, in ToolCallInput) {
 	if !r.active() {
 		return
 	}
+	r.emit(ctx, r.buildToolCallEvents(ctx, in))
+}
+
+// ReserveCapabilityRequest reserves delivery capacity before an SDK-owned
+// request_capability handler acknowledges a request. It returns nil after
+// shutdown has started.
+func (r *Recorder) ReserveCapabilityRequest() *CapabilityReservation {
+	if r == nil || r.cfg.Disabled || r.send == nil {
+		return nil
+	}
+	r.closeMu.Lock()
+	defer r.closeMu.Unlock()
+	if r.closed.Load() {
+		atomic.AddUint64(&r.dropped, 1)
+		return nil
+	}
+	r.inflight.Add(1)
+	return &CapabilityReservation{recorder: r}
+}
+
+// RecordReservedCapability completes a reservation by delivering its tool
+// event even if Close began after the handler reserved it.
+func (r *Recorder) RecordReservedCapability(ctx context.Context, in ToolCallInput, reservation *CapabilityReservation) {
+	if reservation == nil || reservation.recorder != r {
+		return
+	}
+	if !reservation.claimed.CompareAndSwap(false, true) {
+		return
+	}
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			r.inflight.Done()
+		}
+	}()
+	events := r.buildToolCallEvents(ctx, in)
+	handedOff = true
+	r.emitReserved(events)
+}
+
+// Release completes a reservation without emitting, for example when the
+// framework completion hook cannot recover the matching request context.
+func (r *CapabilityReservation) Release() {
+	if r == nil || r.recorder == nil {
+		return
+	}
+	if r.claimed.CompareAndSwap(false, true) {
+		r.recorder.inflight.Done()
+	}
+}
+
+func (r *Recorder) buildToolCallEvents(ctx context.Context, in ToolCallInput) []Event {
 	if in.ActorSeed == "" {
 		in.ActorSeed = r.ResolveActorSeed(ctx, nil)
 	}
@@ -263,7 +329,7 @@ func (r *Recorder) RecordToolCall(ctx context.Context, in ToolCallInput) {
 		}))
 	}
 	events = append(events, BuildToolCallEvent(in))
-	r.emit(ctx, events)
+	return events
 }
 
 // RecordSessionInit emits a framework-neutral session-init event through this
@@ -331,9 +397,34 @@ func (r *Recorder) onSuccess(ctx context.Context, id any, method mcp.MCPMethod, 
 	if method != mcp.MethodToolsCall {
 		return
 	}
+	// Consume provenance before checking recorder state or pending-call state so
+	// cancellation and shutdown cannot retain a completed handler result.
+	capabilityReservation := r.consumeCapabilityResult(result)
 	// Take the pending call before the active() check so a Close between
 	// BeforeAny and here still cleans up the entry instead of leaking it.
 	cc, ok := r.takeCall(sessionKeyFromContext(ctx), id)
+	if capabilityReservation != nil {
+		if !ok {
+			capabilityReservation.Release()
+			return
+		}
+		isErr, _ := extractToolErrorFlag(result)
+		r.RecordReservedCapability(ctx, ToolCallInput{
+			ToolName:          cc.toolName,
+			Args:              cc.args,
+			Result:            result,
+			IsToolError:       isErr,
+			SessionID:         cc.sessionID,
+			ActorSeed:         cc.actorSeed,
+			StartedAt:         cc.startedAt,
+			FinishedAt:        time.Now(),
+			ClientInfo:        cc.clientInfo,
+			Telemetry:         firstTelemetry(cc.telemetry, TelemetryFromContext(ctx)),
+			WorkflowRunID:     cc.workflowRunID,
+			CapabilityRequest: true,
+		}, capabilityReservation)
+		return
+	}
 	if !ok || !r.active() {
 		return
 	}
@@ -428,6 +519,10 @@ func (r *Recorder) onUnregisterSession(_ context.Context, session server.ClientS
 
 // ---------- helpers ----------
 
+func (r *Recorder) canRecord() bool {
+	return r != nil && !r.cfg.Disabled && r.send != nil && !r.closed.Load()
+}
+
 func (r *Recorder) active() bool {
 	if r == nil || r.cfg.Disabled || r.send == nil {
 		return false
@@ -437,6 +532,28 @@ func (r *Recorder) active() bool {
 		return false
 	}
 	return true
+}
+
+func (r *Recorder) consumeCapabilityResult(result any) *CapabilityReservation {
+	if r == nil {
+		return nil
+	}
+	toolResult, ok := result.(*mcp.CallToolResult)
+	if !ok || toolResult == nil {
+		return nil
+	}
+	if toolResult.Meta == nil {
+		return nil
+	}
+	reservation, ok := toolResult.Meta.AdditionalFields[requestCapabilityResultMarker].(*CapabilityReservation)
+	if !ok || reservation == nil {
+		return nil
+	}
+	delete(toolResult.Meta.AdditionalFields, requestCapabilityResultMarker)
+	if len(toolResult.Meta.AdditionalFields) == 0 && toolResult.Meta.ProgressToken == nil {
+		toolResult.Meta = nil
+	}
+	return reservation
 }
 
 // ResolveActorSeed applies the configured resolver, then mirrors the
@@ -541,6 +658,27 @@ func (r *Recorder) emit(_ context.Context, events []Event) {
 		defer r.inflight.Done()
 		run()
 	}()
+}
+
+func (r *Recorder) emitReserved(events []Event) {
+	if len(events) == 0 || r.send == nil {
+		r.inflight.Done()
+		return
+	}
+	batch := Batch{SchemaVersion: SchemaVersion, Events: events}
+	run := func() {
+		defer r.inflight.Done()
+		emitCtx, cancel := context.WithTimeout(context.Background(), r.timeout())
+		defer cancel()
+		if err := r.send(emitCtx, batch); err != nil && r.cfg.OnError != nil {
+			r.cfg.OnError(err, batch)
+		}
+	}
+	if r.cfg.Delivery == DeliveryAwait {
+		run()
+		return
+	}
+	go run()
 }
 
 func (r *Recorder) timeout() time.Duration {
