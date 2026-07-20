@@ -15,6 +15,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Default-on secret redaction and queued privacy processing.** Inputs,
+  outputs, errors, and telemetry text now pass through bounded sanitization and
+  13 high-confidence secret rules. `Config.RedactEvent` provides a context-aware
+  whole-event mutate/drop hook, and a bounded FIFO queue batches delivery while
+  `Flush` and `Close` drain the full pipeline.
+
 - **Rich actor identification.** `ActorIdentifier` supplies any caller-provided
   string for both the hashed `actor_id` and verbatim identity value.
   `actor_identity` events emit only when the value changes; `ActorSeed` remains

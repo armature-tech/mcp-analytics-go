@@ -349,6 +349,9 @@ config := armatureanalytics.Config{
     EndpointURL: "https://app.armature.tech/api/mcp-analytics/ingest",
     Timeout:     5 * time.Second,
     Delivery:    armatureanalytics.DeliveryAwait,
+    RedactEvent: func(ctx context.Context, event *armatureanalytics.RedactableToolCall) (*armatureanalytics.RedactableToolCall, error) {
+        return event, nil
+    },
     RequestCapability: true,
     ActorIdentifier: func(ctx context.Context) string {
         return "anything-at-all@example.com"
@@ -381,7 +384,9 @@ The official adapter accepts the same `Config` fields through
 | **OnError** | None | Observe delivery failures |
 | **Disabled** | **false** | Disable instrumentation |
 | **CaptureTelemetry** | **nil** (on) | Disable conversation-derived telemetry entirely (see below) |
+| **RedactSecrets** | **nil** (on) | Disable only built-in high-confidence secret matching |
 | **Redact** | None | Redact sensitive data from previews before delivery (see below) |
+| **RedactEvent** | None | Context-aware whole-event hook that may mutate or drop a tool call |
 | **TelemetryFieldMap** | None | Export existing argument fields as telemetry (see below) |
 | **RequestCapability** | **false** | Inject `request_capability` so agents can report an unmet tool need |
 
@@ -412,7 +417,11 @@ If a tool's own input schema already declares a top-level `telemetry` property, 
 
 ### Redaction and binary payloads
 
-Before any preview is serialized, the SDK strips binary content automatically: image/audio content-block `data`, resource `blob`s, base64 data URIs, and long base64 strings are replaced with `"[binary removed]"` / `"[base64 removed]"` placeholders. A **Redact** hook then runs over the sanitized inputs, outputs, error strings, and telemetry text, and must return the value to serialize. The pipeline is sanitize → redact → stringify → truncate. If the hook panics, the SDK fails closed: the affected payload is replaced with `"[redaction failed]"` and the event still ships.
+Before serialization, the SDK bounds sanitizer work to 65,536 bytes, removes binary/base64 payloads, and applies default-on high-confidence secret rules to inputs, outputs, errors, and telemetry text. Set **RedactSecrets** to a pointer to `false` only to disable secret matching; binary sanitization remains active.
+
+The legacy per-value **Redact** hook runs next. Prefer **RedactEvent** for new integrations: it receives the whole prepared tool-call candidate and may mutate it or return `nil` to drop the tool event. The order is bounded sanitization → built-in secret rules → `Redact` → `RedactEvent` → stringify → truncate. Errors and panics fail closed with `"[redaction failed]"` placeholders.
+
+`DeliveryBackground` queues privacy work and is intended for long-lived processes; `Flush` or `Close` drains the full pipeline. `DeliveryAwait` performs the same work before returning and is required for serverless handlers unless they explicitly flush. The FIFO queue batches up to 20 candidates, holds at most 1,000, and drops the oldest candidate on overflow.
 
 If the API key is missing, **NewMCPServer** quietly disables delivery for local
 development. When you pass **EnvConfig()** to **NewRecorder** yourself, set

@@ -1,9 +1,12 @@
 package armatureanalytics
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"net/http"
 	"time"
 )
 
@@ -96,15 +99,40 @@ type ToolCallInput struct {
 	// from Config.Redact; direct BuildToolCallEvent callers may set it
 	// themselves. A panicking hook fails closed to "[redaction failed]".
 	Redact func(any) any
+	// RedactSecrets defaults to true when nil.
+	RedactSecrets           *bool
+	actorHeaders            http.Header
+	actorIdentifier         string
+	actorIdentifierResolved bool
 }
+
+// RedactableToolCall is the context-rich candidate passed to RedactEvent.
+type RedactableToolCall struct {
+	Kind         string     `json:"kind"`
+	ToolName     string     `json:"toolName"`
+	Status       string     `json:"status"`
+	DurationMs   int64      `json:"durationMs"`
+	SessionID    string     `json:"sessionId,omitempty"`
+	Input        any        `json:"input"`
+	Output       any        `json:"output,omitempty"`
+	ErrorMessage *string    `json:"errorMessage,omitempty"`
+	Telemetry    *Telemetry `json:"telemetry,omitempty"`
+}
+
+// RedactEventHook runs after built-in and legacy per-value redaction but
+// before serialization and truncation.
+type RedactEventHook func(context.Context, *RedactableToolCall) (*RedactableToolCall, error)
 
 // SessionInitInput is the typed input to BuildSessionInitEvent.
 type SessionInitInput struct {
-	SessionID     string
-	ActorSeed     string
-	StartedAt     time.Time
-	ClientInfo    *ClientInfo
-	WorkflowRunID string // optional Armature workflow-run UUID; marks synthetic traffic
+	SessionID               string
+	ActorSeed               string
+	StartedAt               time.Time
+	ClientInfo              *ClientInfo
+	WorkflowRunID           string // optional Armature workflow-run UUID; marks synthetic traffic
+	actorHeaders            http.Header
+	actorIdentifier         string
+	actorIdentifierResolved bool
 }
 
 // ClientInfo mirrors the MCP InitializeRequest's clientInfo block plus
@@ -116,65 +144,51 @@ type ClientInfo struct {
 	Capabilities    map[string]any
 }
 
-// redactTelemetry runs the customer redaction hook over the normalized
-// telemetry. Telemetry text is agent-authored but routinely quotes the user,
-// so the hook sees it too; whatever it returns is re-normalized, and a
-// panicking hook drops the telemetry entirely (fail closed).
-func redactTelemetry(t Telemetry, redact func(any) any) Telemetry {
-	if redact == nil || t == (Telemetry{}) {
-		return t
-	}
-	generic, ok := toGenericJSON(t)
-	if !ok {
-		return Telemetry{}
-	}
-	redacted := safeRedact(redact, generic)
-	data, err := json.Marshal(redacted)
-	if err != nil {
-		return Telemetry{}
-	}
-	var out Telemetry
-	if err := json.Unmarshal(data, &out); err != nil {
-		return Telemetry{}
-	}
-	return NormalizeTelemetry(out)
-}
-
-func redactErrorMessage(message string, redact func(any) any) string {
-	if redact == nil || message == "" {
-		return message
-	}
-	redacted := safeRedact(redact, message)
-	if s, ok := redacted.(string); ok {
-		return s
-	}
-	return stringifyPreview(redacted)
-}
-
 // BuildToolCallEvent constructs the wire-shape Event for a single tool call.
 func BuildToolCallEvent(in ToolCallInput) Event {
-	actorID := ActorID(in.ActorSeed)
-	requestID := in.RequestID
-	if requestID == "" {
-		requestID = randomUUID()
-	}
+	candidate := prepareToolCallCandidate(in)
+	return assembleToolCallEvent(in, candidate)
+}
 
-	// Contract pipeline (TELEMETRY-CONTRACT.md): sanitize → customer redact →
-	// stringify → truncate, for every payload that can carry customer data —
-	// input preview, the source built from the input, the result preview, the
-	// error string, and the telemetry text.
-	safeArgs := prepareForPreview(in.Args, in.Redact)
-	source, sourceTrunc := truncateUTF8("MCP tool call: "+in.ToolName+"\n\nInput:\n"+stringifyPreview(safeArgs), MaxSourceBytes)
-	inputPreview, _ := truncateUTF8(stringifyPreview(safeArgs), MaxPreviewBytes)
-	var resultPtr *string
-	var resultTrunc bool
-	if in.Result != nil {
-		preview, trunc := truncateUTF8(stringifyPreview(prepareForPreview(in.Result, in.Redact)), MaxPreviewBytes)
-		resultPtr = &preview
-		resultTrunc = trunc
+// FinalizeToolCallEvent prepares a candidate and applies the whole-event hook.
+// A nil return intentionally drops the tool event; hook failures fail closed.
+func FinalizeToolCallEvent(ctx context.Context, in ToolCallInput, hook RedactEventHook) *Event {
+	candidate := prepareToolCallCandidate(in)
+	if hook != nil {
+		redacted, err := callRedactEvent(ctx, hook, candidate)
+		if err == nil && redacted == nil {
+			return nil
+		}
+		if err != nil {
+			failed := RedactionFailedPlaceholder
+			candidate.Input = RedactionFailedPlaceholder
+			candidate.Output = RedactionFailedPlaceholder
+			candidate.ErrorMessage = &failed
+			candidate.Telemetry = nil
+		} else {
+			candidate = redacted
+		}
 	}
+	event := assembleToolCallEvent(in, candidate)
+	return &event
+}
 
+func callRedactEvent(ctx context.Context, hook RedactEventHook, candidate *RedactableToolCall) (redacted *RedactableToolCall, err error) {
+	defer func() {
+		if recover() != nil {
+			err = errors.New("redaction hook failed")
+			redacted = nil
+		}
+	}()
+	return hook(ctx, candidate)
+}
+
+func prepareToolCallCandidate(in ToolCallInput) *RedactableToolCall {
 	ok := in.Err == nil && !in.IsToolError
+	status := "ok"
+	if !ok {
+		status = "error"
+	}
 	var errPtr *string
 	if !ok {
 		msg := in.ErrorType
@@ -185,16 +199,49 @@ func BuildToolCallEvent(in ToolCallInput) Event {
 				msg = "tool_error"
 			}
 		}
-		msg = redactErrorMessage(msg, in.Redact)
-		errPtr = &msg
+		prepared := prepareErrorMessage(msg, in.Redact, secretsEnabled(in.RedactSecrets))
+		errPtr = &prepared
 	}
 
-	// Canonicalize onto the V1 field names (legacy input spellings accepted)
-	// and emit both key sets: the V1 keys plus legacy mirrors, so an ingest
-	// that hasn't picked up the V1 schema keeps reading events from this SDK.
-	tel := redactTelemetry(NormalizeTelemetry(in.Telemetry), in.Redact)
+	candidate := &RedactableToolCall{
+		Kind:         KindToolCall,
+		ToolName:     in.ToolName,
+		Status:       status,
+		DurationMs:   in.FinishedAt.Sub(in.StartedAt).Milliseconds(),
+		SessionID:    in.SessionID,
+		Input:        prepareForPreview(in.Args, in.Redact, secretsEnabled(in.RedactSecrets)),
+		ErrorMessage: errPtr,
+	}
+	if in.Result != nil {
+		candidate.Output = prepareForPreview(in.Result, in.Redact, secretsEnabled(in.RedactSecrets))
+	}
+	if in.Telemetry != (Telemetry{}) {
+		candidate.Telemetry = prepareTelemetry(in.Telemetry, in.Redact, secretsEnabled(in.RedactSecrets))
+	}
+	return candidate
+}
+
+func assembleToolCallEvent(in ToolCallInput, candidate *RedactableToolCall) Event {
+	actorID := ActorID(in.ActorSeed)
+	requestID := in.RequestID
+	if requestID == "" {
+		requestID = randomUUID()
+	}
+	source, sourceTrunc := truncateUTF8("MCP tool call: "+candidate.ToolName+"\n\nInput:\n"+stringifyPreview(candidate.Input), MaxSourceBytes)
+	inputPreview, _ := truncateUTF8(stringifyPreview(candidate.Input), MaxPreviewBytes)
+	var resultPtr *string
+	var resultTrunc bool
+	if candidate.Output != nil {
+		preview, trunc := truncateUTF8(stringifyPreview(candidate.Output), MaxPreviewBytes)
+		resultPtr = &preview
+		resultTrunc = trunc
+	}
+	tel := Telemetry{}
+	if candidate.Telemetry != nil {
+		tel = NormalizeTelemetry(*candidate.Telemetry)
+	}
 	meta := map[string]any{
-		"tool_name":         in.ToolName,
+		"tool_name":         candidate.ToolName,
 		"user_intent":       stringOrNil(tel.UserIntent),
 		"agent_thinking":    stringOrNil(tel.AgentThinking),
 		"user_frustration":  stringOrNil(tel.UserFrustration),
@@ -207,17 +254,16 @@ func BuildToolCallEvent(in ToolCallInput) Event {
 		meta["capability_request"] = true
 	}
 	mergeClientInfo(meta, in.ClientInfo)
-
 	return Event{
 		EventID:               EventID(actorID, KindToolCall, requestID),
 		Kind:                  KindToolCall,
 		ActorID:               actorID,
-		SessionIDHint:         stringPtrOrNil(in.SessionID),
+		SessionIDHint:         stringPtrOrNil(candidate.SessionID),
 		StartedAt:             in.StartedAt.UTC().Format(time.RFC3339Nano),
 		FinishedAt:            in.FinishedAt.UTC().Format(time.RFC3339Nano),
-		DurationMs:            in.FinishedAt.Sub(in.StartedAt).Milliseconds(),
-		OK:                    ok,
-		Error:                 errPtr,
+		DurationMs:            candidate.DurationMs,
+		OK:                    candidate.Status == "ok",
+		Error:                 candidate.ErrorMessage,
 		Metadata:              meta,
 		ScriptSource:          &source,
 		ScriptSourceTruncated: sourceTrunc,
@@ -229,6 +275,93 @@ func BuildToolCallEvent(in ToolCallInput) Event {
 		IsWorkflow:            in.WorkflowRunID != "",
 		WorkflowRunID:         in.WorkflowRunID,
 	}
+}
+
+func secretsEnabled(configured *bool) bool {
+	return configured == nil || *configured
+}
+
+func prepareForPreview(value any, redact func(any) any, redactSecrets bool) any {
+	prepared := SanitizeValue(value)
+	if redactSecrets {
+		prepared = RedactSecretsInValue(prepared)
+	}
+	if redact == nil {
+		return prepared
+	}
+	redacted, ok := callLegacyRedact(redact, prepared)
+	if !ok {
+		return RedactionFailedPlaceholder
+	}
+	return redacted
+}
+
+func prepareErrorMessage(message string, redact func(any) any, redactSecrets bool) string {
+	if redactSecrets {
+		message = RedactSecretsInString(message)
+	}
+	if redact == nil {
+		return message
+	}
+	redacted, ok := callLegacyRedact(redact, message)
+	if !ok {
+		return RedactionFailedPlaceholder
+	}
+	if text, ok := redacted.(string); ok {
+		return text
+	}
+	return stringifyPreview(redacted)
+}
+
+func prepareTelemetry(telemetry Telemetry, redact func(any) any, redactSecrets bool) *Telemetry {
+	telemetry = NormalizeTelemetry(telemetry)
+	if redactSecrets {
+		telemetry.UserIntent = RedactSecretsInString(telemetry.UserIntent)
+		telemetry.AgentThinking = RedactSecretsInString(telemetry.AgentThinking)
+		telemetry.Intent = telemetry.UserIntent
+		telemetry.Context = telemetry.AgentThinking
+	}
+	if redact == nil {
+		return &telemetry
+	}
+	redacted, ok := callLegacyRedact(redact, telemetry)
+	if !ok {
+		return nil
+	}
+	converted, ok := telemetryFromAny(redacted)
+	if !ok {
+		return nil
+	}
+	converted = NormalizeTelemetry(converted)
+	return &converted
+}
+
+func callLegacyRedact(redact func(any) any, value any) (redacted any, ok bool) {
+	defer func() {
+		if recover() != nil {
+			redacted = nil
+			ok = false
+		}
+	}()
+	return redact(value), true
+}
+
+func telemetryFromAny(value any) (Telemetry, bool) {
+	if telemetry, ok := value.(Telemetry); ok {
+		return telemetry, true
+	}
+	if telemetry, ok := value.(*Telemetry); ok && telemetry != nil {
+		return *telemetry, true
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return Telemetry{}, false
+	}
+	var telemetry Telemetry
+	if err := json.Unmarshal(data, &telemetry); err != nil {
+		return Telemetry{}, false
+	}
+	return telemetry, true
 }
 
 // BuildSessionInitEvent constructs the wire-shape Event for a session-init.

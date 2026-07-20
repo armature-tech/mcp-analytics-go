@@ -1,156 +1,264 @@
 package armatureanalytics
 
 import (
-	"encoding/json"
 	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 )
 
-// Placeholder strings are part of the cross-SDK contract
-// (packages/TELEMETRY-CONTRACT.md in the Armature monorepo) — golden tests in
-// all three SDKs assert them byte-for-byte.
 const (
 	BinaryRemovedPlaceholder   = "[binary removed]"
 	Base64RemovedPlaceholder   = "[base64 removed]"
 	RedactionFailedPlaceholder = "[redaction failed]"
+	SanitizationBudget         = 65_536
 )
 
-// A data: URI with a base64 payload is binary at any plausible size; plain
-// strings need the higher bar (length + strict charset) so prose, ids, and
-// hashes below half a KB pass through untouched. Both thresholds are contract
-// values — keep in sync with the TypeScript and Python SDKs.
-const (
-	dataURIMinChars = 64
-	base64MinChars  = 512
-)
+var base64PayloadPattern = regexp.MustCompile(`^[A-Za-z0-9+/_-]+={0,2}$`)
 
-// Strict charset on purpose: no whitespace, so long prose (letters + spaces)
-// never matches. Covers standard base64 and base64url, with optional padding.
-var base64Re = regexp.MustCompile(`^[A-Za-z0-9+/_-]+={0,2}$`)
+type sanitizationState struct {
+	remaining int
+	seen      map[visit]bool
+}
+
+type visit struct {
+	typ reflect.Type
+	ptr uintptr
+}
+
+// SanitizeValue removes binary payloads and bounds the copied string content
+// to SanitizationBudget bytes. Composite values are copied so customer-owned
+// arguments and results are never mutated.
+func SanitizeValue(value any) any {
+	state := &sanitizationState{
+		remaining: SanitizationBudget,
+		seen:      make(map[visit]bool),
+	}
+	return state.sanitize(reflect.ValueOf(value))
+}
+
+func (s *sanitizationState) charge(units int) bool {
+	if s.remaining < units {
+		s.remaining = 0
+		return false
+	}
+	s.remaining -= units
+	return true
+}
+
+func (s *sanitizationState) sanitizeString(value string) string {
+	if isBase64Payload(value) {
+		value = Base64RemovedPlaceholder
+	}
+	if len(value) <= s.remaining {
+		s.remaining -= len(value)
+		return value
+	}
+	value, _ = truncateUTF8(value, s.remaining)
+	s.remaining = 0
+	return value
+}
 
 func isBase64Payload(value string) bool {
-	if len(value) >= dataURIMinChars && strings.HasPrefix(value, "data:") && strings.Contains(value, ";base64,") {
+	if len(value) >= 64 && strings.HasPrefix(value, "data:") && strings.Contains(value, ";base64,") {
 		return true
 	}
-	return len(value) >= base64MinChars && base64Re.MatchString(value)
+	return len(value) >= 512 && base64PayloadPattern.MatchString(value)
 }
 
-// SanitizeValue recursively strips binary and base64 payloads from a decoded
-// JSON value (map[string]any / []any / string) before it is serialized into
-// previews (gap #1). MCP image/audio content blocks lose their `data`,
-// resource blobs lose their `blob`, and long base64 strings are replaced
-// wholesale. The input is never mutated; a sanitized copy is returned.
-// Cycle-safe: a self-referential container sanitizes to "[circular]" instead
-// of overflowing the stack, matching the TS and Python SDKs.
-func SanitizeValue(value any) any {
-	return sanitizeValueSeen(value, make(map[uintptr]struct{}))
-}
+func (s *sanitizationState) sanitize(value reflect.Value) any {
+	if !value.IsValid() {
+		return nil
+	}
+	if value.Kind() == reflect.Interface {
+		if value.IsNil() {
+			return nil
+		}
+		return s.sanitize(value.Elem())
+	}
 
-// sanitizeValueSeen tracks the container pointers on the CURRENT descent path
-// (entries are removed on the way back up), so shared-but-acyclic values are
-// each sanitized while true cycles are cut. Empty containers are not tracked:
-// zero-length allocations can share the runtime's zerobase pointer, and an
-// empty container cannot participate in a cycle anyway.
-func sanitizeValueSeen(value any, seen map[uintptr]struct{}) any {
-	switch v := value.(type) {
-	case string:
-		if isBase64Payload(v) {
-			return Base64RemovedPlaceholder
+	switch value.Kind() {
+	case reflect.String:
+		return s.sanitizeString(value.String())
+	case reflect.Pointer:
+		if value.IsNil() {
+			return nil
 		}
-		return v
-	case []any:
-		if len(v) > 0 {
-			ptr := reflect.ValueOf(v).Pointer()
-			if _, cycling := seen[ptr]; cycling {
-				return "[circular]"
+		key := visit{typ: value.Type(), ptr: value.Pointer()}
+		if s.seen[key] {
+			return s.sanitizeString("[circular]")
+		}
+		s.seen[key] = true
+		defer delete(s.seen, key)
+		return s.sanitize(value.Elem())
+	case reflect.Map:
+		if value.IsNil() {
+			return nil
+		}
+		if value.Type().Key().Kind() != reflect.String {
+			return value.Interface()
+		}
+		key := visit{typ: value.Type(), ptr: value.Pointer()}
+		if s.seen[key] {
+			return s.sanitizeString("[circular]")
+		}
+		s.seen[key] = true
+		defer delete(s.seen, key)
+		return s.sanitizeMap(value)
+	case reflect.Slice:
+		if value.IsNil() {
+			return nil
+		}
+		key := visit{typ: value.Type(), ptr: value.Pointer()}
+		if key.ptr != 0 {
+			if s.seen[key] {
+				return s.sanitizeString("[circular]")
 			}
-			seen[ptr] = struct{}{}
-			defer delete(seen, ptr)
+			s.seen[key] = true
+			defer delete(s.seen, key)
 		}
-		out := make([]any, len(v))
-		for i, item := range v {
-			out[i] = sanitizeValueSeen(item, seen)
-		}
-		return out
-	case map[string]any:
-		if len(v) > 0 {
-			ptr := reflect.ValueOf(v).Pointer()
-			if _, cycling := seen[ptr]; cycling {
-				return "[circular]"
-			}
-			seen[ptr] = struct{}{}
-			defer delete(seen, ptr)
-		}
-		blockType, _ := v["type"].(string)
-		out := make(map[string]any, len(v))
-		for key, entry := range v {
-			if key == "data" && (blockType == "image" || blockType == "audio") {
-				if _, isString := entry.(string); isString {
-					out[key] = BinaryRemovedPlaceholder
-					continue
-				}
-			}
-			if key == "blob" {
-				if _, isString := entry.(string); isString {
-					out[key] = BinaryRemovedPlaceholder
-					continue
-				}
-			}
-			out[key] = sanitizeValueSeen(entry, seen)
-		}
-		return out
+		return s.sanitizeList(value)
+	case reflect.Array:
+		return s.sanitizeList(value)
+	case reflect.Struct:
+		return s.sanitizeStruct(value)
+	case reflect.Bool:
+		return value.Bool()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return value.Interface()
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return value.Interface()
+	case reflect.Float32, reflect.Float64:
+		return value.Interface()
 	default:
-		return value
+		return value.Interface()
 	}
 }
 
-// toGenericJSON round-trips value through JSON so the sanitizer sees plain
-// maps/slices/strings regardless of the concrete Go type the integration
-// handed us (mcp.CallToolResult structs, json.RawMessage, typed inputs).
-func toGenericJSON(value any) (any, bool) {
-	if value == nil {
-		return nil, true
-	}
-	switch value.(type) {
-	case map[string]any, []any, string, bool, float64, int, int64:
-		// Already generic enough for SanitizeValue; strings/numbers pass
-		// through it unchanged anyway.
-	}
-	data, err := json.Marshal(value)
-	if err != nil {
-		return nil, false
-	}
-	var generic any
-	if err := json.Unmarshal(data, &generic); err != nil {
-		return nil, false
-	}
-	return generic, true
-}
-
-// prepareForPreview implements the contract pipeline (TELEMETRY-CONTRACT.md):
-// sanitize → customer redact, failing closed. A redact hook that panics
-// replaces the whole payload with the placeholder rather than shipping
-// unredacted data; the event itself still ships.
-func prepareForPreview(value any, redact func(any) any) any {
-	generic, ok := toGenericJSON(value)
-	if !ok {
-		// Unserializable values produce no preview content anyway; hand the
-		// original through so stringifyPreview reports it consistently.
-		return value
-	}
-	sanitized := SanitizeValue(generic)
-	if redact == nil {
-		return sanitized
-	}
-	return safeRedact(redact, sanitized)
-}
-
-func safeRedact(redact func(any) any, value any) (out any) {
-	defer func() {
-		if recover() != nil {
-			out = RedactionFailedPlaceholder
+func (s *sanitizationState) sanitizeMap(value reflect.Value) map[string]any {
+	keys := value.MapKeys()
+	sort.Slice(keys, func(i, j int) bool { return keys[i].String() < keys[j].String() })
+	out := make(map[string]any, len(keys))
+	objectType := mapStringValue(value, "type")
+	for _, mapKey := range keys {
+		key := mapKey.String()
+		if !s.charge(len(key) + 2) {
+			break
 		}
-	}()
-	return redact(value)
+		entry := value.MapIndex(mapKey)
+		if isBinaryField(key, objectType, entry) {
+			out[key] = s.sanitizeString(BinaryRemovedPlaceholder)
+		} else {
+			out[key] = s.sanitize(entry)
+		}
+		if s.remaining == 0 {
+			break
+		}
+	}
+	return out
+}
+
+func (s *sanitizationState) sanitizeList(value reflect.Value) []any {
+	out := make([]any, 0, value.Len())
+	for i := 0; i < value.Len(); i++ {
+		if !s.charge(2) {
+			break
+		}
+		out = append(out, s.sanitize(value.Index(i)))
+		if s.remaining == 0 {
+			break
+		}
+	}
+	return out
+}
+
+func (s *sanitizationState) sanitizeStruct(value reflect.Value) map[string]any {
+	typeOf := value.Type()
+	objectType := structStringValue(value, "type")
+	type field struct {
+		name  string
+		value reflect.Value
+	}
+	fields := make([]field, 0, value.NumField())
+	for i := 0; i < value.NumField(); i++ {
+		definition := typeOf.Field(i)
+		if definition.PkgPath != "" { // unexported
+			continue
+		}
+		name, omitEmpty, skip := jsonFieldName(definition)
+		if skip || (omitEmpty && value.Field(i).IsZero()) {
+			continue
+		}
+		fields = append(fields, field{name: name, value: value.Field(i)})
+	}
+	sort.Slice(fields, func(i, j int) bool { return fields[i].name < fields[j].name })
+	out := make(map[string]any, len(fields))
+	for _, item := range fields {
+		if !s.charge(len(item.name) + 2) {
+			break
+		}
+		if isBinaryField(item.name, objectType, item.value) {
+			out[item.name] = s.sanitizeString(BinaryRemovedPlaceholder)
+		} else {
+			out[item.name] = s.sanitize(item.value)
+		}
+		if s.remaining == 0 {
+			break
+		}
+	}
+	return out
+}
+
+func mapStringValue(value reflect.Value, key string) string {
+	entry := value.MapIndex(reflect.ValueOf(key).Convert(value.Type().Key()))
+	return reflectedString(entry)
+}
+
+func structStringValue(value reflect.Value, jsonName string) string {
+	typeOf := value.Type()
+	for i := 0; i < value.NumField(); i++ {
+		name, _, skip := jsonFieldName(typeOf.Field(i))
+		if !skip && name == jsonName {
+			return reflectedString(value.Field(i))
+		}
+	}
+	return ""
+}
+
+func reflectedString(value reflect.Value) string {
+	for value.IsValid() && (value.Kind() == reflect.Interface || value.Kind() == reflect.Pointer) {
+		if value.IsNil() {
+			return ""
+		}
+		value = value.Elem()
+	}
+	if value.IsValid() && value.Kind() == reflect.String {
+		return value.String()
+	}
+	return ""
+}
+
+func isBinaryField(key, objectType string, value reflect.Value) bool {
+	if reflectedString(value) == "" {
+		return false
+	}
+	return key == "blob" || (key == "data" && (objectType == "image" || objectType == "audio"))
+}
+
+func jsonFieldName(field reflect.StructField) (name string, omitEmpty bool, skip bool) {
+	tag := field.Tag.Get("json")
+	parts := strings.Split(tag, ",")
+	if len(parts) > 0 && parts[0] == "-" {
+		return "", false, true
+	}
+	name = field.Name
+	if len(parts) > 0 && parts[0] != "" {
+		name = parts[0]
+	}
+	for _, option := range parts[1:] {
+		if option == "omitempty" {
+			omitEmpty = true
+		}
+	}
+	return name, omitEmpty, false
 }

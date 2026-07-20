@@ -1,11 +1,15 @@
 package armatureanalytics
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 	"time"
 )
+
+type redactionContextKey struct{}
 
 func TestBuildToolCallEvent_Success(t *testing.T) {
 	start := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
@@ -181,5 +185,64 @@ func TestStringifyPreview(t *testing.T) {
 	}
 	if got := stringifyPreview(make(chan int)); got != "[unserialisable]" {
 		t.Errorf("stringifyPreview(chan) = %q, want [unserialisable]", got)
+	}
+}
+
+func TestBuildToolCallEvent_DefaultSecretRedactionAndDisable(t *testing.T) {
+	start := time.Unix(0, 0)
+	secret := "AKIAIOSFODNN7EXAMPLE"
+	in := ToolCallInput{
+		ToolName: "private", Args: map[string]any{"password": "hunter2", "key": secret},
+		Result:    map[string]any{"authorization": "Bearer abcdef1234567890abcdef"},
+		Err:       errors.New("connect failed: password=hunter2"),
+		Telemetry: Telemetry{UserIntent: "deploy with " + secret, AgentThinking: "password=hunter2"},
+		StartedAt: start, FinishedAt: start,
+	}
+	event := BuildToolCallEvent(in)
+	encoded, _ := json.Marshal(event)
+	for _, raw := range []string{"hunter2", secret, "abcdef1234567890abcdef"} {
+		if strings.Contains(string(encoded), raw) {
+			t.Fatalf("raw secret %q leaked in event: %s", raw, encoded)
+		}
+	}
+	disabled := false
+	in.RedactSecrets = &disabled
+	unredacted, _ := json.Marshal(BuildToolCallEvent(in))
+	if !strings.Contains(string(unredacted), secret) {
+		t.Fatalf("RedactSecrets=false did not preserve input: %s", unredacted)
+	}
+}
+
+func TestFinalizeToolCallEventMutateDropAndFailClosed(t *testing.T) {
+	start := time.Unix(0, 0)
+	ctx := context.WithValue(context.Background(), redactionContextKey{}, "visible")
+	base := ToolCallInput{
+		ToolName: "original", Args: map[string]any{"password": "hunter2"},
+		Result: map[string]any{"secret": "value"}, Err: errors.New("secret=hunter2"),
+		Telemetry: Telemetry{UserIntent: "password=hunter2"},
+		StartedAt: start, FinishedAt: start.Add(time.Millisecond),
+	}
+	mutated := FinalizeToolCallEvent(ctx, base, func(hookCtx context.Context, candidate *RedactableToolCall) (*RedactableToolCall, error) {
+		if hookCtx.Value(redactionContextKey{}) != "visible" {
+			t.Fatal("hook did not receive recorder context")
+		}
+		candidate.ToolName = "mutated"
+		candidate.Input = map[string]any{"safe": true}
+		return candidate, nil
+	})
+	if mutated == nil || mutated.Metadata["tool_name"] != "mutated" || mutated.Metadata["input_preview"] != `{"safe":true}` {
+		t.Fatalf("mutated event = %#v", mutated)
+	}
+	if dropped := FinalizeToolCallEvent(ctx, base, func(context.Context, *RedactableToolCall) (*RedactableToolCall, error) {
+		return nil, nil
+	}); dropped != nil {
+		t.Fatalf("drop hook returned event: %#v", dropped)
+	}
+	failed := FinalizeToolCallEvent(ctx, base, func(context.Context, *RedactableToolCall) (*RedactableToolCall, error) {
+		return nil, errors.New("nope")
+	})
+	failedJSON, _ := json.Marshal(failed)
+	if strings.Contains(string(failedJSON), "hunter2") || strings.Contains(string(failedJSON), "value") {
+		t.Fatalf("hook failure leaked raw candidate: %s", failedJSON)
 	}
 }

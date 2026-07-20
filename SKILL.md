@@ -84,7 +84,7 @@ Optional verbatim identification uses `Config.ActorIdentifier`. It accepts any
 non-empty string up to 8 KiB, hashes it into `actor_id`, and emits the verbatim
 value only when it changes. `ActorSeed` remains the hashed-only fallback.
 
-## 4. Drain background delivery
+## 4. Choose delivery and privacy policy
 
 Wire exactly one bounded drain:
 
@@ -93,8 +93,14 @@ Wire exactly one bounded drain:
 | Long-lived process | `shutdown(ctx)` from the factory, or `rec.Close(ctx)` |
 | Short-lived/serverless process | `Config.Delivery = armatureanalytics.DeliveryAwait` |
 
-Use `context.WithTimeout`; do not flush inside every tool handler. Analytics
-POSTs run off the request path and are tracked until the drain completes.
+Use `context.WithTimeout`; do not flush inside every tool handler. The bounded
+privacy queue runs sanitization, redaction, and POSTs off the request path in
+background mode; `Flush` and `Close` drain the whole pipeline.
+
+Built-in high-confidence secret redaction is default-on. Prefer
+`Config.RedactEvent` for custom whole-event policy; it may mutate or drop a
+tool event. `Config.Redact` remains supported and runs first. Set
+`Config.RedactSecrets` to a false pointer only when replacing the built-ins.
 
 ### Stateless HTTP / serverless sessions
 

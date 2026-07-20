@@ -102,6 +102,14 @@ type Config struct {
 	// the event still ships.
 	Redact func(any) any
 
+	// RedactSecrets enables built-in high-confidence secret detection. nil
+	// means enabled; set to false to retain only binary/base64 sanitization.
+	RedactSecrets *bool
+
+	// RedactEvent receives the prepared whole tool-call candidate and may
+	// mutate it, drop it by returning nil, or fail closed by returning an error.
+	RedactEvent RedactEventHook
+
 	// TelemetryFieldMap opts specific customer-owned argument fields into
 	// export as Armature telemetry (TELEMETRY-CONTRACT.md). Keys are the V1
 	// telemetry field names (user_intent, agent_thinking, user_frustration);
@@ -128,6 +136,7 @@ type Recorder struct {
 	lazySessions     *boundedKeySet
 	identityMu       sync.Mutex
 	actorIdentifiers map[string]string
+	queue            *privacyQueue
 
 	inflight sync.WaitGroup
 	// closeMu serializes the closed transition against emit's inflight.Add
@@ -154,7 +163,7 @@ type callContext struct {
 	startedAt     time.Time
 	sessionID     string
 	clientInfo    *ClientInfo
-	actorSeed     string
+	actorHeaders  http.Header
 	workflowRunID string
 }
 
@@ -173,6 +182,7 @@ func NewRecorder(cfg Config) (*Recorder, error) {
 	}
 	if cfg.Emit != nil {
 		r.send = cfg.Emit
+		r.initPrivacyQueue()
 		return r, nil
 	}
 	client, err := NewClient(cfg.APIKey, cfg.EndpointURL, cfg.Timeout)
@@ -180,7 +190,21 @@ func NewRecorder(cfg Config) (*Recorder, error) {
 		return nil, err
 	}
 	r.send = client.Send
+	r.initPrivacyQueue()
 	return r, nil
+}
+
+func (r *Recorder) initPrivacyQueue() {
+	r.queue = newPrivacyQueue(
+		r.send,
+		func(events []Event) Batch { return Batch{SchemaVersion: SchemaVersion, Events: events} },
+		func() (context.Context, context.CancelFunc) {
+			return context.WithTimeout(context.Background(), r.timeout())
+		},
+		r.cfg.OnError,
+		nil,
+		func() { atomic.AddUint64(&r.dropped, 1) },
+	)
 }
 
 // Hooks returns a fresh *server.Hooks with the recorder's tool-call and
@@ -209,6 +233,9 @@ func (r *Recorder) Install(h *server.Hooks) {
 // Flush blocks until all in-flight ingest POSTs complete or ctx is cancelled.
 // Returns ctx.Err() on cancellation; nil otherwise.
 func (r *Recorder) Flush(ctx context.Context) error {
+	if err := r.queue.flush(ctx); err != nil {
+		return err
+	}
 	done := make(chan struct{})
 	go func() {
 		r.inflight.Wait()
@@ -229,7 +256,10 @@ func (r *Recorder) Close(ctx context.Context) error {
 	r.closeMu.Lock()
 	r.closed.Store(true)
 	r.closeMu.Unlock()
-	err := r.Flush(ctx)
+	err := r.queue.close(ctx)
+	if err == nil {
+		err = r.Flush(ctx)
+	}
 	r.pendingCalls.Range(func(key, _ any) bool {
 		r.pendingCalls.Delete(key)
 		return true
@@ -251,7 +281,12 @@ func (r *Recorder) RecordToolCall(ctx context.Context, in ToolCallInput) {
 	if !r.active() {
 		return
 	}
-	r.emit(ctx, r.buildToolCallEvents(ctx, in))
+	in.actorIdentifier = r.actorIdentifier(ctx)
+	in.actorIdentifierResolved = true
+	privacyCtx := context.WithoutCancel(ctx)
+	r.queue.enqueue(ctx, func() []Event {
+		return r.buildToolCallEvents(privacyCtx, in)
+	}, r.cfg.Delivery == DeliveryAwait)
 }
 
 // ReserveCapabilityRequest reserves delivery capacity before an SDK-owned
@@ -286,6 +321,8 @@ func (r *Recorder) RecordReservedCapability(ctx context.Context, in ToolCallInpu
 			r.inflight.Done()
 		}
 	}()
+	in.actorIdentifier = r.actorIdentifier(ctx)
+	in.actorIdentifierResolved = true
 	events := r.buildToolCallEvents(ctx, in)
 	handedOff = true
 	r.emitReserved(events)
@@ -304,7 +341,7 @@ func (r *CapabilityReservation) Release() {
 
 func (r *Recorder) buildToolCallEvents(ctx context.Context, in ToolCallInput) []Event {
 	if in.ActorSeed == "" {
-		in.ActorSeed = r.ResolveActorSeed(ctx, nil)
+		in.ActorSeed = r.ResolveActorSeed(ctx, in.actorHeaders)
 	}
 	// Single choke point for capture-off and field ownership
 	// (TELEMETRY-CONTRACT.md): telemetry handed in by any path — the hooks,
@@ -322,10 +359,14 @@ func (r *Recorder) buildToolCallEvents(ctx context.Context, in ToolCallInput) []
 		in.Telemetry = applyTelemetryFieldMap(in.Telemetry, in.Args, r.cfg.TelemetryFieldMap)
 	}
 	in.Redact = r.cfg.Redact
+	in.RedactSecrets = r.cfg.RedactSecrets
 	if in.ClientInfo == nil {
 		in.ClientInfo = ParseStatelessSessionClientInfo(in.SessionID)
 	}
-	identifier := r.actorIdentifier(ctx)
+	identifier := in.actorIdentifier
+	if !in.actorIdentifierResolved {
+		identifier = r.actorIdentifier(ctx)
+	}
 	if identifier != "" {
 		in.ActorSeed = identifier
 	}
@@ -343,7 +384,9 @@ func (r *Recorder) buildToolCallEvents(ctx context.Context, in ToolCallInput) []
 			WorkflowRunID: in.WorkflowRunID,
 		}))
 	}
-	events = append(events, BuildToolCallEvent(in))
+	if event := FinalizeToolCallEvent(ctx, in, r.cfg.RedactEvent); event != nil {
+		events = append(events, *event)
+	}
 	return events
 }
 
@@ -354,30 +397,35 @@ func (r *Recorder) RecordSessionInit(ctx context.Context, in SessionInitInput) {
 	if !r.active() {
 		return
 	}
-	if in.ActorSeed == "" {
-		in.ActorSeed = r.ResolveActorSeed(ctx, nil)
-	}
-	if in.ClientInfo == nil {
-		in.ClientInfo = ParseStatelessSessionClientInfo(in.SessionID)
-	}
-	identifier := r.actorIdentifier(ctx)
-	if identifier != "" {
-		in.ActorSeed = identifier
-	}
-	actorID := ActorID(in.ActorSeed)
-	identity := r.identityEventFor(actorID, identifier, in.StartedAt)
-	if in.SessionID != "" && !r.lazySessions.Add(actorID+":"+in.SessionID) {
-		if identity != nil {
-			r.emit(ctx, []Event{*identity})
+	in.actorIdentifier = r.actorIdentifier(ctx)
+	in.actorIdentifierResolved = true
+	privacyCtx := context.WithoutCancel(ctx)
+	r.queue.enqueue(ctx, func() []Event {
+		if in.ActorSeed == "" {
+			in.ActorSeed = r.ResolveActorSeed(privacyCtx, in.actorHeaders)
 		}
-		return
-	}
-	events := make([]Event, 0, 2)
-	if identity != nil {
-		events = append(events, *identity)
-	}
-	events = append(events, BuildSessionInitEvent(in))
-	r.emit(ctx, events)
+		if in.ClientInfo == nil {
+			in.ClientInfo = ParseStatelessSessionClientInfo(in.SessionID)
+		}
+		identifier := in.actorIdentifier
+		if identifier != "" {
+			in.ActorSeed = identifier
+		}
+		actorID := ActorID(in.ActorSeed)
+		identity := r.identityEventFor(actorID, identifier, in.StartedAt)
+		if in.SessionID != "" && !r.lazySessions.Add(actorID+":"+in.SessionID) {
+			if identity != nil {
+				return []Event{*identity}
+			}
+			return nil
+		}
+		events := make([]Event, 0, 2)
+		if identity != nil {
+			events = append(events, *identity)
+		}
+		events = append(events, BuildSessionInitEvent(in))
+		return events
+	}, r.cfg.Delivery == DeliveryAwait)
 }
 
 // ---------- hooks ----------
@@ -413,7 +461,7 @@ func (r *Recorder) onBeforeAny(ctx context.Context, id any, method mcp.MCPMethod
 		startedAt:     time.Now(),
 		sessionID:     sessionIDFromContext(ctx),
 		clientInfo:    r.clientInfoFor(sessionKey),
-		actorSeed:     r.ResolveActorSeed(ctx, req.Header),
+		actorHeaders:  req.Header.Clone(),
 		workflowRunID: WorkflowRunIDFromHeaders(req.Header),
 	})
 	if !registered {
@@ -444,10 +492,10 @@ func (r *Recorder) onSuccess(ctx context.Context, id any, method mcp.MCPMethod, 
 			Result:            result,
 			IsToolError:       isErr,
 			SessionID:         cc.sessionID,
-			ActorSeed:         cc.actorSeed,
 			StartedAt:         cc.startedAt,
 			FinishedAt:        time.Now(),
 			ClientInfo:        cc.clientInfo,
+			actorHeaders:      cc.actorHeaders,
 			Telemetry:         firstTelemetry(cc.telemetry, TelemetryFromContext(ctx)),
 			WorkflowRunID:     cc.workflowRunID,
 			CapabilityRequest: true,
@@ -465,10 +513,10 @@ func (r *Recorder) onSuccess(ctx context.Context, id any, method mcp.MCPMethod, 
 		Result:        result,
 		IsToolError:   isErr,
 		SessionID:     cc.sessionID,
-		ActorSeed:     cc.actorSeed,
 		StartedAt:     cc.startedAt,
 		FinishedAt:    time.Now(),
 		ClientInfo:    cc.clientInfo,
+		actorHeaders:  cc.actorHeaders,
 		Telemetry:     firstTelemetry(cc.telemetry, TelemetryFromContext(ctx)),
 		WorkflowRunID: cc.workflowRunID,
 	})
@@ -491,10 +539,10 @@ func (r *Recorder) onError(ctx context.Context, id any, method mcp.MCPMethod, _ 
 		Args:          cc.args,
 		Err:           callErr,
 		SessionID:     cc.sessionID,
-		ActorSeed:     cc.actorSeed,
 		StartedAt:     cc.startedAt,
 		FinishedAt:    time.Now(),
 		ClientInfo:    cc.clientInfo,
+		actorHeaders:  cc.actorHeaders,
 		Telemetry:     firstTelemetry(cc.telemetry, TelemetryFromContext(ctx)),
 		WorkflowRunID: cc.workflowRunID,
 	})
@@ -530,9 +578,9 @@ func (r *Recorder) onAfterInitialize(ctx context.Context, _ any, message *mcp.In
 
 	r.RecordSessionInit(ctx, SessionInitInput{
 		SessionID:     sessionIDFromContext(ctx),
-		ActorSeed:     r.ResolveActorSeed(ctx, message.Header),
 		StartedAt:     time.Now(),
 		ClientInfo:    info,
+		actorHeaders:  message.Header.Clone(),
 		WorkflowRunID: WorkflowRunIDFromHeaders(message.Header),
 	})
 }
@@ -674,10 +722,10 @@ func (r *Recorder) onAbandonedCall(ctx context.Context, key callKeyT) {
 		Args:          cc.args,
 		Err:           callErr,
 		SessionID:     cc.sessionID,
-		ActorSeed:     cc.actorSeed,
 		StartedAt:     cc.startedAt,
 		FinishedAt:    time.Now(),
 		ClientInfo:    cc.clientInfo,
+		actorHeaders:  cc.actorHeaders,
 		Telemetry:     cc.telemetry,
 		WorkflowRunID: cc.workflowRunID,
 	})
