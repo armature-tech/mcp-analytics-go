@@ -313,14 +313,30 @@ func prepareErrorMessage(message string, redact func(any) any, redactSecrets boo
 	return stringifyPreview(redacted)
 }
 
+// sanitizeTelemetryText applies the same base64/binary sanitization (always)
+// and built-in secret redaction (when enabled) to a telemetry text field as
+// tool inputs/outputs. Previously these fields only saw RedactSecretsInString,
+// so a whole-value or embedded >=512-char base64 blob reached the ingest body
+// verbatim (#1393).
+func sanitizeTelemetryText(value string, redactSecrets bool) string {
+	sanitized, ok := SanitizeValue(value).(string)
+	if !ok {
+		sanitized = value
+	}
+	if redactSecrets {
+		sanitized = RedactSecretsInString(sanitized)
+	}
+	return sanitized
+}
+
 func prepareTelemetry(telemetry Telemetry, redact func(any) any, redactSecrets bool) *Telemetry {
 	telemetry = NormalizeTelemetry(telemetry)
-	if redactSecrets {
-		telemetry.UserIntent = RedactSecretsInString(telemetry.UserIntent)
-		telemetry.AgentThinking = RedactSecretsInString(telemetry.AgentThinking)
-		telemetry.Intent = telemetry.UserIntent
-		telemetry.Context = telemetry.AgentThinking
-	}
+	telemetry.UserIntent = sanitizeTelemetryText(telemetry.UserIntent, redactSecrets)
+	telemetry.AgentThinking = sanitizeTelemetryText(telemetry.AgentThinking, redactSecrets)
+	// Re-sync the legacy mirrors: sanitization always rewrites the V1 fields,
+	// so an ingest that still reads intent/context must see the same values.
+	telemetry.Intent = telemetry.UserIntent
+	telemetry.Context = telemetry.AgentThinking
 	if redact == nil {
 		return &telemetry
 	}

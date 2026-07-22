@@ -26,6 +26,17 @@ type contractVectors struct {
 		Value  json.RawMessage `json:"value"`
 		Expect json.RawMessage `json:"expect"`
 	} `json:"sanitization"`
+	TelemetrySanitization []struct {
+		Name      string `json:"name"`
+		Telemetry struct {
+			UserIntent    []string `json:"user_intent"`
+			AgentThinking []string `json:"agent_thinking"`
+		} `json:"telemetry"`
+		Expect struct {
+			UserIntent    string `json:"user_intent"`
+			AgentThinking string `json:"agent_thinking"`
+		} `json:"expect"`
+	} `json:"telemetry_sanitization"`
 }
 
 func loadContractVectors(t *testing.T) contractVectors {
@@ -106,6 +117,33 @@ func TestContractSanitizationVectors(t *testing.T) {
 			}
 			if got := SanitizeValue(value); !reflect.DeepEqual(got, expect) {
 				t.Fatalf("got %#v want %#v", got, expect)
+			}
+		})
+	}
+}
+
+// TestContractTelemetrySanitizationVectors covers #1393: telemetry text values
+// run through the same base64/binary sanitization + secret redaction pass as
+// tool inputs/outputs, not just secret redaction.
+func TestContractTelemetrySanitizationVectors(t *testing.T) {
+	for _, vec := range loadContractVectors(t).TelemetrySanitization {
+		t.Run(vec.Name, func(t *testing.T) {
+			now := time.Now()
+			event := BuildToolCallEvent(ToolCallInput{
+				ToolName: "t",
+				Args:     map[string]any{},
+				Telemetry: Telemetry{
+					UserIntent:    strings.Join(vec.Telemetry.UserIntent, ""),
+					AgentThinking: strings.Join(vec.Telemetry.AgentThinking, ""),
+				},
+				StartedAt:  now,
+				FinishedAt: now.Add(time.Millisecond),
+			})
+			if got := event.Metadata["user_intent"]; got != vec.Expect.UserIntent {
+				t.Fatalf("user_intent = %v, want %q", got, vec.Expect.UserIntent)
+			}
+			if got := event.Metadata["agent_thinking"]; got != vec.Expect.AgentThinking {
+				t.Fatalf("agent_thinking = %v, want %q", got, vec.Expect.AgentThinking)
 			}
 		})
 	}
