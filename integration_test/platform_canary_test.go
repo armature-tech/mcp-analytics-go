@@ -97,6 +97,9 @@ func TestProductionPlatformSessionIsolation(t *testing.T) {
 		time.Sleep(2 * time.Second)
 	}
 	if len(matches) != 2 {
+		if len(matches) == 0 {
+			t.Fatal("expected two platform sessions, got 0 (ingest succeeded, so zero visible sessions usually means the canary organization is subject to a free-tier session-visibility cap; keep the canary org on a non-free plan)")
+		}
 		t.Fatalf("expected two platform sessions, got %d", len(matches))
 	}
 	if matches[0].SessionKey == matches[1].SessionKey || matches[0].ActorID != matches[1].ActorID {
