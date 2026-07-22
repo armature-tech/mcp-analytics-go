@@ -1,6 +1,7 @@
 package armatureanalytics
 
 import (
+	"encoding/json"
 	"reflect"
 	"regexp"
 	"sort"
@@ -15,6 +16,13 @@ const (
 )
 
 var base64PayloadPattern = regexp.MustCompile(`^[A-Za-z0-9+/_-]+={0,2}$`)
+
+// embeddedBase64Pattern finds base64-alphabet runs long enough to be payloads
+// inside larger strings, e.g. a blob echoed within a JSON-serialized tool
+// result's text content.
+var embeddedBase64Pattern = regexp.MustCompile(`[A-Za-z0-9+/_-]{512,}={0,2}`)
+
+var jsonMarshalerType = reflect.TypeOf((*json.Marshaler)(nil)).Elem()
 
 type sanitizationState struct {
 	remaining int
@@ -47,8 +55,17 @@ func (s *sanitizationState) charge(units int) bool {
 }
 
 func (s *sanitizationState) sanitizeString(value string) string {
+	// Bound all pattern work to the retainable window first: previews are
+	// truncated anyway, so scanning beyond the budget is pure waste on large
+	// payloads (see the redaction design: never copy an unlimited value to
+	// retain a bounded preview).
+	if len(value) > s.remaining {
+		value, _ = truncateUTF8(value, s.remaining)
+	}
 	if isBase64Payload(value) {
 		value = Base64RemovedPlaceholder
+	} else if len(value) >= 512 {
+		value = embeddedBase64Pattern.ReplaceAllString(value, Base64RemovedPlaceholder)
 	}
 	if len(value) <= s.remaining {
 		s.remaining -= len(value)
@@ -57,6 +74,95 @@ func (s *sanitizationState) sanitizeString(value string) string {
 	value, _ = truncateUTF8(value, s.remaining)
 	s.remaining = 0
 	return value
+}
+
+// marshalPreviewCap bounds how much wire JSON the preview path is willing to
+// materialize. Values estimated above the cap keep the bounded reflective
+// walk so a 20 MB tool result never costs a full marshal round-trip just to
+// produce a truncated preview.
+const marshalPreviewCap = 4 * SanitizationBudget
+
+// decodeJSONMarshaler renders a value that owns its JSON wire format (e.g.
+// framework result types like mcp.CallToolResult) through that format instead
+// of walking its raw struct fields, so previews match what actually crossed
+// the wire. Oversized values, marshal failures (cycles, unsupported members),
+// and non-marshaler types fall back to the reflective walk.
+func decodeJSONMarshaler(value reflect.Value) (any, bool) {
+	if !value.CanInterface() || !value.Type().Implements(jsonMarshalerType) {
+		return nil, false
+	}
+	if approxSizeExceeds(value, marshalPreviewCap) {
+		return nil, false
+	}
+	raw, err := json.Marshal(value.Interface())
+	if err != nil {
+		return nil, false
+	}
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return nil, false
+	}
+	return decoded, true
+}
+
+// approxSizeExceeds cheaply estimates whether a value's serialized size
+// exceeds the cap, without copying anything and with early exit. Depth is
+// capped so cyclic values report as oversized and take the reflective walk,
+// which owns cycle detection.
+func approxSizeExceeds(value reflect.Value, cap int) bool {
+	remaining := cap
+	var walk func(v reflect.Value, depth int) bool
+	walk = func(v reflect.Value, depth int) bool {
+		if remaining <= 0 || depth > 64 {
+			remaining = 0
+			return true
+		}
+		if !v.IsValid() {
+			return false
+		}
+		switch v.Kind() {
+		case reflect.Interface, reflect.Pointer:
+			if v.IsNil() {
+				return false
+			}
+			return walk(v.Elem(), depth+1)
+		case reflect.String:
+			remaining -= v.Len() + 8
+		case reflect.Slice, reflect.Array:
+			if v.Kind() == reflect.Slice && v.IsNil() {
+				return false
+			}
+			if v.Type().Elem().Kind() == reflect.Uint8 {
+				remaining -= v.Len() + 8
+				break
+			}
+			for i := 0; i < v.Len(); i++ {
+				if walk(v.Index(i), depth+1) {
+					return true
+				}
+			}
+		case reflect.Map:
+			if v.IsNil() {
+				return false
+			}
+			iter := v.MapRange()
+			for iter.Next() {
+				if walk(iter.Key(), depth+1) || walk(iter.Value(), depth+1) {
+					return true
+				}
+			}
+		case reflect.Struct:
+			for i := 0; i < v.NumField(); i++ {
+				if walk(v.Field(i), depth+1) {
+					return true
+				}
+			}
+		default:
+			remaining -= 8
+		}
+		return remaining <= 0
+	}
+	return walk(value, 0)
 }
 
 func isBase64Payload(value string) bool {
@@ -83,6 +189,9 @@ func (s *sanitizationState) sanitize(value reflect.Value) any {
 	case reflect.Pointer:
 		if value.IsNil() {
 			return nil
+		}
+		if decoded, ok := decodeJSONMarshaler(value); ok {
+			return s.sanitize(reflect.ValueOf(decoded))
 		}
 		key := visit{typ: value.Type(), ptr: value.Pointer()}
 		if s.seen[key] {
@@ -121,6 +230,9 @@ func (s *sanitizationState) sanitize(value reflect.Value) any {
 	case reflect.Array:
 		return s.sanitizeList(value)
 	case reflect.Struct:
+		if decoded, ok := decodeJSONMarshaler(value); ok {
+			return s.sanitize(reflect.ValueOf(decoded))
+		}
 		return s.sanitizeStruct(value)
 	case reflect.Bool:
 		return value.Bool()

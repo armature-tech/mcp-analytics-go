@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Fixed
+
+- Tool-call previews now render values that own their JSON wire format (such
+  as `*mcp.CallToolResult`) through that format instead of walking raw struct
+  fields, removing framework noise like `"Result":{}` and `"Annotated":{}`
+  from result previews.
+- Base64 payload runs are removed from previews even when embedded inside a
+  larger string, closing the gap where a result's serialized text content
+  retained a payload that sanitization had already removed from
+  `structuredContent`.
+- Sanitization work stays bounded on oversized values: string pattern rules
+  scan only the budget-retainable window, and the wire-format preview path
+  applies only to values estimated under 4× the sanitization budget (larger
+  values keep the bounded reflective walk), so multi-megabyte tool results
+  add low single-digit milliseconds rather than hundreds.
+
 ### Changed
 
 - Removed `user_turn` from advertised schemas and newly emitted events. Cached
