@@ -75,6 +75,12 @@ func redactSecrets(value reflect.Value, seen map[visit]bool) any {
 	}
 	switch value.Kind() {
 	case reflect.String:
+		if value.Type() == jsonNumberType {
+			// Preserve json.Number's unquoted numeric rendering; secret
+			// scanning over a numeric literal is meaningless, and treating it
+			// as a string would re-introduce the quoting bug (mcp-tester#1397).
+			return value.Interface()
+		}
 		return RedactSecretsInString(value.String())
 	case reflect.Pointer:
 		if value.IsNil() {

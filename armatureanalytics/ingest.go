@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 )
@@ -14,10 +15,11 @@ import (
 // Config.EndpointURL or the ANALYTICS_INGEST_URL env var.
 const DefaultEndpointURL = "https://app.armature.tech/api/mcp-analytics/ingest"
 
-// DefaultTimeout caps each ingest POST. The TS SDK ships with 500ms; this Go
-// SDK uses a slightly more generous default because per-call POSTs run on
-// background goroutines off the request path.
+// DefaultTimeout caps each ingest POST consistently across all Armature SDKs.
 const DefaultTimeout = 5 * time.Second
+
+const DefaultIngestMaxAttempts = 2
+const DefaultIngestRetryDelay = 100 * time.Millisecond
 
 // userAgent identifies this SDK in the User-Agent header so the Armature
 // backend can attribute traffic by language.
@@ -25,6 +27,25 @@ const userAgent = "mcp-analytics-go/0.1"
 
 // ErrMissingAPIKey is returned by Send when no API key is configured.
 var ErrMissingAPIKey = errors.New("armatureanalytics: APIKey is required")
+
+// DeliveryError classifies a failed ingest delivery without including the API
+// key or event payload. Callers can inspect it from Config.OnError.
+type DeliveryError struct {
+	Code      string
+	Status    int
+	Attempts  int
+	Retryable bool
+	Err       error
+}
+
+func (e *DeliveryError) Error() string {
+	if e.Status > 0 {
+		return fmt.Sprintf("armature ingest failed with HTTP %d (%s) after %d attempt(s)", e.Status, e.Code, e.Attempts)
+	}
+	return fmt.Sprintf("armature ingest failed (%s) after %d attempt(s)", e.Code, e.Attempts)
+}
+
+func (e *DeliveryError) Unwrap() error { return e.Err }
 
 // Client posts batches of analytics events to the Armature ingest endpoint.
 // One client is safe for concurrent use.
@@ -61,24 +82,105 @@ func (c *Client) Send(ctx context.Context, batch Batch) error {
 		return fmt.Errorf("marshal batch: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("build request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	req.Header.Set("User-Agent", userAgent)
+	for attempt := 1; attempt <= DefaultIngestMaxAttempts; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("build request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+		req.Header.Set("User-Agent", userAgent)
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("post: %w", err)
-	}
-	defer resp.Body.Close()
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				code := "ingest_cancelled"
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					code = "ingest_timeout"
+				}
+				return &DeliveryError{Code: code, Attempts: attempt, Retryable: code == "ingest_timeout", Err: ctx.Err()}
+			}
+			if attempt < DefaultIngestMaxAttempts {
+				if err := waitForRetry(ctx); err != nil {
+					return &DeliveryError{Code: "ingest_timeout", Attempts: attempt, Retryable: true, Err: err}
+				}
+				continue
+			}
+			code := "ingest_connection_failed"
+			if timeout, ok := err.(interface{ Timeout() bool }); ok && timeout.Timeout() {
+				code = "ingest_timeout"
+			}
+			return &DeliveryError{Code: code, Attempts: attempt, Retryable: true, Err: err}
+		}
 
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 4_096))
+		resp.Body.Close()
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return nil
+		}
+		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
+		if retryable && attempt < DefaultIngestMaxAttempts {
+			if err := waitForRetry(ctx); err != nil {
+				return &DeliveryError{Code: "ingest_timeout", Status: resp.StatusCode, Attempts: attempt, Retryable: true, Err: err}
+			}
+			continue
+		}
+		return &DeliveryError{
+			Code:      ingestResponseCode(detail, resp.StatusCode),
+			Status:    resp.StatusCode,
+			Attempts:  attempt,
+			Retryable: retryable,
+		}
+	}
+	return &DeliveryError{Code: "ingest_delivery_failed", Attempts: DefaultIngestMaxAttempts}
+}
+
+func waitForRetry(ctx context.Context) error {
+	timer := time.NewTimer(DefaultIngestRetryDelay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
 		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	return fmt.Errorf("armature ingest returned %d", resp.StatusCode)
+}
+
+func ingestResponseCode(body []byte, status int) string {
+	fallback := fmt.Sprintf("ingest_http_%d", status)
+	var payload struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+		ErrorCode string `json:"errorCode"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return fallback
+	}
+	code := payload.Error.Code
+	if code == "" {
+		code = payload.ErrorCode
+	}
+	if !validDiagnosticCode(code) {
+		return fallback
+	}
+	return code
+}
+
+func validDiagnosticCode(code string) bool {
+	if len(code) == 0 || len(code) > 100 {
+		return false
+	}
+	for index, char := range code {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') {
+			continue
+		}
+		if index > 0 && (char == '_' || char == ':' || char == '-') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // SendEvent is a convenience wrapper around Send that wraps a single event

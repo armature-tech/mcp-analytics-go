@@ -199,7 +199,7 @@ func (r *Recorder) initPrivacyQueue() {
 		r.send,
 		func(events []Event) Batch { return Batch{SchemaVersion: SchemaVersion, Events: events} },
 		func() (context.Context, context.CancelFunc) {
-			return context.WithTimeout(context.Background(), r.timeout())
+			return context.WithTimeout(context.Background(), r.deliveryBudget())
 		},
 		r.cfg.OnError,
 		nil,
@@ -739,7 +739,7 @@ func (r *Recorder) emit(_ context.Context, events []Event) {
 	}
 	batch := Batch{SchemaVersion: SchemaVersion, Events: events}
 	run := func() {
-		emitCtx, cancel := context.WithTimeout(context.Background(), r.timeout())
+		emitCtx, cancel := context.WithTimeout(context.Background(), r.deliveryBudget())
 		defer cancel()
 		if err := r.send(emitCtx, batch); err != nil && r.cfg.OnError != nil {
 			r.cfg.OnError(err, batch)
@@ -776,7 +776,7 @@ func (r *Recorder) emitReserved(events []Event) {
 	batch := Batch{SchemaVersion: SchemaVersion, Events: events}
 	run := func() {
 		defer r.inflight.Done()
-		emitCtx, cancel := context.WithTimeout(context.Background(), r.timeout())
+		emitCtx, cancel := context.WithTimeout(context.Background(), r.deliveryBudget())
 		defer cancel()
 		if err := r.send(emitCtx, batch); err != nil && r.cfg.OnError != nil {
 			r.cfg.OnError(err, batch)
@@ -794,6 +794,10 @@ func (r *Recorder) timeout() time.Duration {
 		return r.cfg.Timeout
 	}
 	return DefaultTimeout
+}
+
+func (r *Recorder) deliveryBudget() time.Duration {
+	return time.Duration(DefaultIngestMaxAttempts)*r.timeout() + DefaultIngestRetryDelay
 }
 
 func sessionIDFromContext(ctx context.Context) string {

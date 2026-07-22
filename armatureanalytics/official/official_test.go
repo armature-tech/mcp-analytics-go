@@ -517,6 +517,155 @@ func TestOfficialSDKToolErrorEvent(t *testing.T) {
 	t.Fatal("no tool_call event")
 }
 
+// TestOfficialSDKNumericArgumentsRenderUnquoted covers mcp-tester#1397: the
+// official adapter decodes arguments with UseNumber, so numeric arguments must
+// still preview unquoted (50, not "50") to match the mark3labs adapter.
+func TestOfficialSDKNumericArgumentsRenderUnquoted(t *testing.T) {
+	sink := newRecordingSink(t)
+	s, shutdown := NewMCPServerWithConfig(
+		&mcp.Implementation{Name: "official-number-test", Version: "1.0.0"},
+		nil,
+		Config{APIKey: "test-key", EndpointURL: sink.server.URL},
+	)
+	InstrumentTool(s, &mcp.Tool{Name: "search"},
+		func(context.Context, *mcp.CallToolRequest, map[string]any) (*mcp.CallToolResult, map[string]any, error) {
+			return nil, map[string]any{"ok": true}, nil
+		},
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	go func() { _ = s.Run(ctx, serverTransport) }()
+	client := mcp.NewClient(&mcp.Implementation{Name: "number-client", Version: "1.0.0"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("connect client: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+	if _, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "search",
+		Arguments: map[string]any{"limit": 50, "ratio": 3.5, "query": "widgets"},
+	}); err != nil {
+		t.Fatalf("call tool: %v", err)
+	}
+
+	flushCtx, flushCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer flushCancel()
+	if err := shutdown(flushCtx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	preview := toolCallInputPreview(t, sink.snapshot())
+	if got := preview["limit"]; !isJSONNumberEqual(got, "50") {
+		t.Fatalf("limit rendered as %T %v, want unquoted number 50", got, got)
+	}
+	if got := preview["ratio"]; !isJSONNumberEqual(got, "3.5") {
+		t.Fatalf("ratio rendered as %T %v, want unquoted number 3.5", got, got)
+	}
+	if got, ok := preview["query"].(string); !ok || got != "widgets" {
+		t.Fatalf("query rendered as %T %v, want string widgets", preview["query"], preview["query"])
+	}
+}
+
+// TestOfficialSDKNullStructuredContentRendersAsNull covers mcp-tester#1398: an
+// error result whose StructuredContent is a json.RawMessage("null") must
+// preview as JSON null rather than the byte array of the literal "null" bytes.
+func TestOfficialSDKNullStructuredContentRendersAsNull(t *testing.T) {
+	sink := newRecordingSink(t)
+	s, shutdown := NewMCPServerWithConfig(
+		&mcp.Implementation{Name: "official-null-test", Version: "1.0.0"},
+		nil,
+		Config{APIKey: "test-key", EndpointURL: sink.server.URL},
+	)
+	InstrumentTool(s, &mcp.Tool{Name: "fail"},
+		func(context.Context, *mcp.CallToolRequest, map[string]any) (*mcp.CallToolResult, any, error) {
+			return &mcp.CallToolResult{
+				IsError:           true,
+				Content:           []mcp.Content{&mcp.TextContent{Text: "boom"}},
+				StructuredContent: json.RawMessage("null"),
+			}, nil, nil
+		},
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	go func() { _ = s.Run(ctx, serverTransport) }()
+	client := mcp.NewClient(&mcp.Implementation{Name: "null-client", Version: "1.0.0"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("connect client: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "fail", Arguments: map[string]any{}})
+	if err != nil {
+		t.Fatalf("call tool: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("tool result IsError = false, want true: %#v", result)
+	}
+
+	flushCtx, flushCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer flushCancel()
+	if err := shutdown(flushCtx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	preview := toolCallResultPreview(t, sink.snapshot())
+	if strings.Contains(preview, "110,117,108,108") || strings.Contains(preview, "[110") {
+		t.Fatalf("structuredContent rendered as a byte array: %s", preview)
+	}
+	if !strings.Contains(preview, `"structuredContent":null`) {
+		t.Fatalf("structuredContent should render as JSON null: %s", preview)
+	}
+}
+
+func toolCallInputPreview(t *testing.T, events []armatureanalytics.Event) map[string]any {
+	t.Helper()
+	for _, event := range events {
+		if event.Kind != armatureanalytics.KindToolCall {
+			continue
+		}
+		raw, ok := event.Metadata["input_preview"].(string)
+		if !ok {
+			t.Fatalf("input_preview missing or not a string: %#v", event.Metadata["input_preview"])
+		}
+		decoder := json.NewDecoder(strings.NewReader(raw))
+		decoder.UseNumber()
+		var decoded map[string]any
+		if err := decoder.Decode(&decoded); err != nil {
+			t.Fatalf("input_preview is not JSON: %v\n%s", err, raw)
+		}
+		return decoded
+	}
+	t.Fatal("no tool_call event")
+	return nil
+}
+
+func toolCallResultPreview(t *testing.T, events []armatureanalytics.Event) string {
+	t.Helper()
+	for _, event := range events {
+		if event.Kind != armatureanalytics.KindToolCall {
+			continue
+		}
+		if event.ResultPreview == nil {
+			t.Fatal("tool_call event has no result preview")
+		}
+		return *event.ResultPreview
+	}
+	t.Fatal("no tool_call event")
+	return ""
+}
+
+// isJSONNumberEqual reports whether a preview value decoded with UseNumber is a
+// JSON number equal to want. A string here means the numeric argument was
+// quoted, which is the mcp-tester#1397 regression.
+func isJSONNumberEqual(value any, want string) bool {
+	number, ok := value.(json.Number)
+	return ok && number.String() == want
+}
+
 func TestExistingTelemetryInputIsUntouched(t *testing.T) {
 	type input struct {
 		Telemetry map[string]any `json:"telemetry"`

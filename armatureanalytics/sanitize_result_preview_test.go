@@ -85,6 +85,56 @@ func TestResultPreviewRemovesBase64FromTextContent(t *testing.T) {
 	}
 }
 
+// mcp-tester#1397: numeric arguments captured as json.Number (the official
+// adapter decodes arguments with UseNumber to preserve integer precision) must
+// preview unquoted, matching the mark3labs adapter's float64 rendering.
+func TestSanitizeValuePreservesJSONNumber(t *testing.T) {
+	args := map[string]any{
+		"limit": json.Number("50"),
+		"ratio": json.Number("3.14"),
+		"name":  "widget",
+	}
+	preview := stringifyPreview(SanitizeValue(args))
+	for _, want := range []string{`"limit":50`, `"ratio":3.14`, `"name":"widget"`} {
+		if !strings.Contains(preview, want) {
+			t.Fatalf("preview %s missing %s", preview, want)
+		}
+	}
+	for _, bad := range []string{`"limit":"50"`, `"ratio":"3.14"`} {
+		if strings.Contains(preview, bad) {
+			t.Fatalf("numeric argument rendered as a string: %s", preview)
+		}
+	}
+}
+
+// mcp-tester#1398: an error result whose structuredContent is a json.RawMessage
+// (the official SDK stores typed output as raw JSON in an `any` field) must
+// preview as JSON, not the byte array [110,117,108,108] the reflective slice
+// walk produced for the literal bytes of "null".
+func TestSanitizeValueDecodesRawMessageStructuredContent(t *testing.T) {
+	result := map[string]any{
+		"isError":           true,
+		"structuredContent": json.RawMessage("null"),
+		"content":           []any{map[string]any{"type": "text", "text": "boom"}},
+	}
+	sanitized := SanitizeValue(result)
+	preview := stringifyPreview(sanitized)
+	if strings.Contains(preview, "110,117,108,108") || strings.Contains(preview, "[110") {
+		t.Fatalf("structuredContent rendered as a byte array: %s", preview)
+	}
+	if !strings.Contains(preview, `"structuredContent":null`) {
+		t.Fatalf("structuredContent should render as JSON null: %s", preview)
+	}
+
+	object := map[string]any{
+		"structuredContent": json.RawMessage(`{"count":7,"label":"ok"}`),
+	}
+	objectPreview := stringifyPreview(SanitizeValue(object))
+	if !strings.Contains(objectPreview, `"count":7`) || !strings.Contains(objectPreview, `"label":"ok"`) {
+		t.Fatalf("raw JSON object not decoded into the preview: %s", objectPreview)
+	}
+}
+
 func TestSanitizeValueRemovesEmbeddedBase64Runs(t *testing.T) {
 	blob := strings.Repeat("YWJj", 180) // 720 chars
 	sentence := "attached payload " + blob + " ends here"

@@ -46,7 +46,8 @@ npx @armature-tech/mcp-analytics doctor --url http://localhost:3000/mcp
 It performs an MCP handshake, verifies every served tool exposes Armature's
 telemetry contract, and authenticates the configured ingest key with an empty
 batch containing no sessions or customer content. Use `--skip-ingest` for an
-offline-only check and `--json` for a machine-readable report.
+offline-only check and `--json` for a machine-readable report. Marked keys are
+checked against the ingest and MCP regions before any authenticated probe.
 
 ### 3. Instrument your MCP server
 
@@ -375,7 +376,7 @@ The official adapter accepts the same `Config` fields through
 | Option | Default | Purpose |
 | --- | --- | --- |
 | **APIKey** | **ANALYTICS_INGEST_API_KEY** with **EnvConfig** | Authenticate events and identify the MCP server |
-| **EndpointURL** | Armature cloud | Override the ingestion endpoint |
+| **EndpointURL** | US Armature cloud | Override the ingestion endpoint; use `https://eu.armature.tech/api/mcp-analytics/ingest` for EU |
 | **Timeout** | 5 seconds | Set the timeout for each ingest request |
 | **Delivery** | `DeliveryBackground` | Use `DeliveryAwait` for serverless and short-lived handlers |
 | **Emit** | Network emitter | Replace delivery for tests or custom pipelines; makes APIKey optional |
@@ -429,6 +430,11 @@ development. When you pass **EnvConfig()** to **NewRecorder** yourself, set
 
 For production and external pilots, set `OnError`; otherwise an invalid key or
 ingest failure is intentionally silent.
+
+Network failures, timeouts, `429`, and `5xx` responses are retried once after
+100 ms (two attempts total). Other `4xx` responses are not retried. `OnError`
+receives a payload-free `*DeliveryError` with `Code`, `Status`, `Retryable`, and
+`Attempts`; application execution remains fail-open.
 
 ### Actor identification
 

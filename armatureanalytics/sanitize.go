@@ -1,6 +1,7 @@
 package armatureanalytics
 
 import (
+	"bytes"
 	"encoding/json"
 	"reflect"
 	"regexp"
@@ -23,6 +24,15 @@ var base64PayloadPattern = regexp.MustCompile(`^[A-Za-z0-9+/_-]+={0,2}$`)
 var embeddedBase64Pattern = regexp.MustCompile(`[A-Za-z0-9+/_-]{512,}={0,2}`)
 
 var jsonMarshalerType = reflect.TypeOf((*json.Marshaler)(nil)).Elem()
+
+// json.Number and json.RawMessage carry JSON wire semantics the reflective
+// walk would otherwise corrupt: Number has Kind String and would be quoted
+// like text, RawMessage is []byte and would be emitted as a byte array. They
+// are matched by concrete type so the preview renders their JSON meaning.
+var (
+	jsonNumberType     = reflect.TypeOf(json.Number(""))
+	jsonRawMessageType = reflect.TypeOf(json.RawMessage(nil))
+)
 
 type sanitizationState struct {
 	remaining int
@@ -185,6 +195,13 @@ func (s *sanitizationState) sanitize(value reflect.Value) any {
 
 	switch value.Kind() {
 	case reflect.String:
+		if value.Type() == jsonNumberType {
+			// json.Number has Kind String but a numeric wire meaning.
+			// Returning it verbatim keeps numeric arguments rendering
+			// unquoted (50, not "50") once the preview is re-marshaled
+			// (mcp-tester#1397).
+			return value.Interface()
+		}
 		return s.sanitizeString(value.String())
 	case reflect.Pointer:
 		if value.IsNil() {
@@ -217,6 +234,13 @@ func (s *sanitizationState) sanitize(value reflect.Value) any {
 	case reflect.Slice:
 		if value.IsNil() {
 			return nil
+		}
+		if value.Type() == jsonRawMessageType {
+			// json.RawMessage is []byte holding raw JSON; the generic slice
+			// walk would emit it as a byte array (e.g. [110,117,108,108] for
+			// "null"). Decode it so previews match the JSON wire format
+			// (mcp-tester#1398).
+			return s.sanitizeRawJSON(value.Bytes())
 		}
 		key := visit{typ: value.Type(), ptr: value.Pointer()}
 		if key.ptr != 0 {
@@ -282,6 +306,27 @@ func (s *sanitizationState) sanitizeList(value reflect.Value) []any {
 		}
 	}
 	return out
+}
+
+// sanitizeRawJSON renders embedded raw JSON (json.RawMessage) through its JSON
+// meaning rather than the reflective []byte walk, then sanitizes the decoded
+// value. UseNumber preserves integer precision, and the resulting json.Number
+// values render unquoted via the String case. Oversized or malformed payloads
+// fall back to the bounded string path.
+func (s *sanitizationState) sanitizeRawJSON(raw []byte) any {
+	if len(raw) == 0 {
+		return nil
+	}
+	if len(raw) > marshalPreviewCap {
+		return s.sanitizeString(string(raw))
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var decoded any
+	if err := decoder.Decode(&decoded); err != nil {
+		return s.sanitizeString(string(raw))
+	}
+	return s.sanitize(reflect.ValueOf(decoded))
 }
 
 func (s *sanitizationState) sanitizeStruct(value reflect.Value) map[string]any {
