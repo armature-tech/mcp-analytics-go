@@ -246,3 +246,37 @@ func TestFinalizeToolCallEventMutateDropAndFailClosed(t *testing.T) {
 		t.Fatalf("hook failure leaked raw candidate: %s", failedJSON)
 	}
 }
+
+func TestBuildToolCallEvent_RequestIDScopedBySession(t *testing.T) {
+	// Shape-C hazard (#1402): a caller-supplied RequestID (e.g. a per-connection
+	// JSON-RPC counter reused across concurrent conversations) must not collide
+	// on event_id across sessions, but a genuine within-session retry must.
+	start := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	end := start.Add(10 * time.Millisecond)
+	build := func(session string) Event {
+		return BuildToolCallEvent(ToolCallInput{
+			ToolName: "ping", RequestID: "5", SessionID: session,
+			ActorSeed: "anonymous", StartedAt: start, FinishedAt: end,
+		})
+	}
+	a1 := build("sess-A")
+	b := build("sess-B")
+	a2 := build("sess-A")
+	if a1.EventID == b.EventID {
+		t.Errorf("same RequestID across sessions collided: %s", a1.EventID)
+	}
+	if a1.EventID != a2.EventID {
+		t.Errorf("same RequestID within a session must de-dup: %s vs %s", a1.EventID, a2.EventID)
+	}
+
+	// Unscoped when no session is known; minted (unique) when RequestID absent.
+	noSess := BuildToolCallEvent(ToolCallInput{ToolName: "ping", RequestID: "5", ActorSeed: "anonymous", StartedAt: start, FinishedAt: end})
+	if noSess.EventID != EventID(ActorID("anonymous"), KindToolCall, "5") {
+		t.Errorf("caller RequestID must pass through verbatim when no session is known")
+	}
+	m1 := BuildToolCallEvent(ToolCallInput{ToolName: "ping", ActorSeed: "anonymous", StartedAt: start, FinishedAt: end})
+	m2 := BuildToolCallEvent(ToolCallInput{ToolName: "ping", ActorSeed: "anonymous", StartedAt: start, FinishedAt: end})
+	if m1.EventID == m2.EventID {
+		t.Errorf("absent RequestID must mint distinct ids")
+	}
+}

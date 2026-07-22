@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- A caller-supplied `ToolCallInput.RequestID` is now scoped by `SessionID` when
+  both are set (`"{sessionId}#{requestID}"`) so a transport JSON-RPC counter
+  reused across concurrent conversations can no longer collide on `event_id` and
+  have ingest silently drop the duplicates. Minted uuids (the default) are
+  unchanged. See the "Event identity and idempotency" section of
+  `packages/TELEMETRY-CONTRACT.md`.
+- `Client.Send` parses the ingest 200 response body and returns an
+  `*IngestRejectionError` when ingest refused events (any `rejected` entry, or
+  nothing accepted from a non-empty batch), so `Config.OnError` fires instead of
+  the refusal reading as success. Server-side dedup counts as accepted.
+
 ### Fixed
 
 - Tool-call previews now render values that own their JSON wire format (such

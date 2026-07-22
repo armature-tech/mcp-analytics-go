@@ -78,7 +78,7 @@ func BuildActorIdentityEvent(actorID string, identifier string, startedAt time.T
 // integration needs to surface for a single MCP tool call.
 type ToolCallInput struct {
 	ToolName      string
-	RequestID     string // optional explicit idempotency key; defaults to a fresh UUID
+	RequestID     string // optional explicit idempotency key, scoped by SessionID when set; defaults to a fresh UUID
 	Args          any
 	Result        any
 	Err           error
@@ -223,9 +223,17 @@ func prepareToolCallCandidate(in ToolCallInput) *RedactableToolCall {
 
 func assembleToolCallEvent(in ToolCallInput, candidate *RedactableToolCall) Event {
 	actorID := ActorID(in.ActorSeed)
+	// The request id seeds event_id, so it must be unique per invocation. A
+	// minted uuid is globally unique. A caller-supplied id is a deliberate
+	// idempotency key, but is scoped by the session id when one is known so a
+	// hazardous transport counter (a per-connection JSON-RPC id reused across
+	// concurrent conversations) can't collide on event_id across sessions. See
+	// the "Event identity and idempotency" section of TELEMETRY-CONTRACT.md.
 	requestID := in.RequestID
 	if requestID == "" {
 		requestID = randomUUID()
+	} else if in.SessionID != "" {
+		requestID = in.SessionID + "#" + in.RequestID
 	}
 	source, sourceTrunc := truncateUTF8("MCP tool call: "+candidate.ToolName+"\n\nInput:\n"+stringifyPreview(candidate.Input), MaxSourceBytes)
 	inputPreview, _ := truncateUTF8(stringifyPreview(candidate.Input), MaxPreviewBytes)

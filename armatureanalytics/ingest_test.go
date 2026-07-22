@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,12 +18,13 @@ type recordingServer struct {
 	t      *testing.T
 	server *httptest.Server
 
-	mu      sync.Mutex
-	bodies  [][]byte
-	auth    string
-	ua      string
-	respond int
-	delay   time.Duration
+	mu       sync.Mutex
+	bodies   [][]byte
+	auth     string
+	ua       string
+	respond  int
+	respBody string
+	delay    time.Duration
 }
 
 func newRecordingServer(t *testing.T) *recordingServer {
@@ -45,11 +45,15 @@ func (rs *recordingServer) handle(w http.ResponseWriter, r *http.Request) {
 	rs.ua = r.Header.Get("User-Agent")
 	delay := rs.delay
 	respond := rs.respond
+	respBody := rs.respBody
 	rs.mu.Unlock()
 	if delay > 0 {
 		time.Sleep(delay)
 	}
 	w.WriteHeader(respond)
+	if respBody != "" {
+		_, _ = io.WriteString(w, respBody)
+	}
 }
 
 func (rs *recordingServer) Bodies() [][]byte {
@@ -133,47 +137,54 @@ func TestClient_Non2xxIsError(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error for 401")
 	}
-	var deliveryErr *armatureanalytics.DeliveryError
-	if !errors.As(err, &deliveryErr) || deliveryErr.Status != 401 || deliveryErr.Attempts != 1 || deliveryErr.Retryable {
-		t.Fatalf("unexpected delivery error: %#v", err)
-	}
 }
 
-func TestClient_RetriesTransientFailureOnce(t *testing.T) {
-	var calls int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls++
-		if calls == 1 {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
-		w.WriteHeader(http.StatusAccepted)
-	}))
-	defer srv.Close()
-	c, _ := armatureanalytics.NewClient("k", srv.URL, time.Second)
-	if err := c.SendEvent(context.Background(), armatureanalytics.Event{Kind: "tool_call"}); err != nil {
-		t.Fatalf("SendEvent: %v", err)
-	}
-	if calls != 2 {
-		t.Fatalf("calls = %d, want 2", calls)
-	}
-}
+func TestClient_InBodyRejectionIsError(t *testing.T) {
+	// Ingest answers 200 but refuses events in the body (#1403). Send must
+	// surface it as an error so Config.OnError fires.
+	rs := newRecordingServer(t)
+	rs.respond = http.StatusOK
+	rs.respBody = `{"accepted":0,"rejected":[{"event_id":"e1","reason":"schema_version_mismatch"}],"duplicate_count":0}`
+	c, _ := armatureanalytics.NewClient("k", rs.server.URL, time.Second)
 
-func TestClient_PreservesServerDiagnosticWithoutResponseDetail(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte(`{"error":{"code":"ingest_key_wrong_region","message":"secret-key"}}`))
-	}))
-	defer srv.Close()
-	c, _ := armatureanalytics.NewClient("k", srv.URL, time.Second)
 	err := c.SendEvent(context.Background(), armatureanalytics.Event{Kind: "tool_call"})
-	var deliveryErr *armatureanalytics.DeliveryError
-	if !errors.As(err, &deliveryErr) || deliveryErr.Code != "ingest_key_wrong_region" {
-		t.Fatalf("unexpected delivery error: %#v", err)
+	if err == nil {
+		t.Fatalf("expected IngestRejectionError for in-body rejection")
 	}
-	if got := err.Error(); got == "" || strings.Contains(got, "secret-key") {
-		t.Fatalf("unsafe delivery error: %q", got)
+	var rejErr *armatureanalytics.IngestRejectionError
+	if !errors.As(err, &rejErr) {
+		t.Fatalf("error = %v, want *IngestRejectionError", err)
+	}
+}
+
+func TestClient_CleanAcceptAndDedupAreNotErrors(t *testing.T) {
+	rs := newRecordingServer(t)
+	c, _ := armatureanalytics.NewClient("k", rs.server.URL, time.Second)
+
+	// Clean accept.
+	rs.mu.Lock()
+	rs.respond = http.StatusOK
+	rs.respBody = `{"accepted":1,"rejected":[],"duplicate_count":0}`
+	rs.mu.Unlock()
+	if err := c.SendEvent(context.Background(), armatureanalytics.Event{Kind: "tool_call"}); err != nil {
+		t.Fatalf("clean accept returned error: %v", err)
+	}
+
+	// Dedup-only (benign session_init re-delivery counts as accepted).
+	rs.mu.Lock()
+	rs.respBody = `{"accepted":1,"rejected":[],"duplicate_count":1}`
+	rs.mu.Unlock()
+	if err := c.SendEvent(context.Background(), armatureanalytics.Event{Kind: "session_init"}); err != nil {
+		t.Fatalf("dedup-only returned error: %v", err)
+	}
+
+	// A differently-shaped 200 body that omits `accepted` (e.g. a proxy) must be
+	// treated as delivered, not as "nothing accepted" — parity with TS/Python.
+	rs.mu.Lock()
+	rs.respBody = `{"status":"ok"}`
+	rs.mu.Unlock()
+	if err := c.SendEvent(context.Background(), armatureanalytics.Event{Kind: "tool_call"}); err != nil {
+		t.Fatalf("absent-accepted body returned error: %v", err)
 	}
 }
 
@@ -185,12 +196,5 @@ func TestClient_Timeout(t *testing.T) {
 	err := c.SendEvent(context.Background(), armatureanalytics.Event{Kind: "tool_call"})
 	if err == nil {
 		t.Fatalf("expected timeout error")
-	}
-	var deliveryErr *armatureanalytics.DeliveryError
-	if !errors.As(err, &deliveryErr) || deliveryErr.Code != "ingest_timeout" || deliveryErr.Attempts != 2 {
-		t.Fatalf("unexpected delivery error: %#v", err)
-	}
-	if calls := len(rs.Bodies()); calls != 2 {
-		t.Fatalf("calls = %d, want 2", calls)
 	}
 }

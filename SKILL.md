@@ -60,7 +60,7 @@ mechanisms. Never commit a real value.
 | Variable | Purpose |
 | --- | --- |
 | `ANALYTICS_INGEST_API_KEY` | Required ingest credential and server identity |
-| `ANALYTICS_INGEST_URL` | Optional endpoint override. US defaults to `https://app.armature.tech/api/mcp-analytics/ingest`; EU uses `https://eu.armature.tech/api/mcp-analytics/ingest` |
+| `ANALYTICS_INGEST_URL` | Optional endpoint override; defaults to Armature cloud |
 
 Factory helpers quietly disable analytics when the API key is absent. Direct
 `NewRecorder` calls return `ErrMissingAPIKey` unless `Config.Disabled` is true
@@ -79,11 +79,6 @@ For production or an external pilot, set `Config.OnError`; otherwise delivery
 failures are intentionally silent. If the server authenticates users, set
 `Config.ActorSeed` from a stable principal in the request context. Never put
 the API key in client-side code.
-
-The network client uses a 5-second timeout per attempt and at most two
-attempts, separated by 100 ms. It retries only network failures, timeouts,
-`429`, and `5xx`; other `4xx` responses reach `Config.OnError` once as a
-structured `*DeliveryError` without breaking the host application.
 
 Optional verbatim identification uses `Config.ActorIdentifier`. It accepts any
 non-empty string up to 8 KiB, hashes it into `actor_id`, and emits the verbatim
@@ -148,7 +143,6 @@ npx @armature-tech/mcp-analytics doctor --url http://localhost:3000/mcp
 Use the same `ANALYTICS_INGEST_API_KEY` and `ANALYTICS_INGEST_URL` as
 the Go server. The doctor verifies the MCP handshake, all served tool schemas,
 and ingest authentication with an empty batch containing no customer content.
-It refuses to probe when marked key, ingest, and MCP regions conflict.
 Include its result in the handoff.
 
 ## 6. Report the integration
