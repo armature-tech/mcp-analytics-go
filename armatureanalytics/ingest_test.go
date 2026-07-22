@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -137,6 +138,48 @@ func TestClient_Non2xxIsError(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error for 401")
 	}
+	var deliveryErr *armatureanalytics.DeliveryError
+	if !errors.As(err, &deliveryErr) || deliveryErr.Status != 401 || deliveryErr.Attempts != 1 || deliveryErr.Retryable {
+		t.Fatalf("unexpected delivery error: %#v", err)
+	}
+}
+
+func TestClient_RetriesTransientFailureOnce(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+	c, _ := armatureanalytics.NewClient("k", srv.URL, time.Second)
+	if err := c.SendEvent(context.Background(), armatureanalytics.Event{Kind: "tool_call"}); err != nil {
+		t.Fatalf("SendEvent: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
+	}
+}
+
+func TestClient_PreservesServerDiagnosticWithoutResponseDetail(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"code":"ingest_key_wrong_region","message":"secret-key"}}`))
+	}))
+	defer srv.Close()
+	c, _ := armatureanalytics.NewClient("k", srv.URL, time.Second)
+	err := c.SendEvent(context.Background(), armatureanalytics.Event{Kind: "tool_call"})
+	var deliveryErr *armatureanalytics.DeliveryError
+	if !errors.As(err, &deliveryErr) || deliveryErr.Code != "ingest_key_wrong_region" {
+		t.Fatalf("unexpected delivery error: %#v", err)
+	}
+	if got := err.Error(); got == "" || strings.Contains(got, "secret-key") {
+		t.Fatalf("unsafe delivery error: %q", got)
+	}
 }
 
 func TestClient_InBodyRejectionIsError(t *testing.T) {
@@ -196,5 +239,12 @@ func TestClient_Timeout(t *testing.T) {
 	err := c.SendEvent(context.Background(), armatureanalytics.Event{Kind: "tool_call"})
 	if err == nil {
 		t.Fatalf("expected timeout error")
+	}
+	var deliveryErr *armatureanalytics.DeliveryError
+	if !errors.As(err, &deliveryErr) || deliveryErr.Code != "ingest_timeout" || deliveryErr.Attempts != 2 {
+		t.Fatalf("unexpected delivery error: %#v", err)
+	}
+	if calls := len(rs.Bodies()); calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
 	}
 }
