@@ -18,8 +18,9 @@ func TestOfficialAdapterExternalConsumer(t *testing.T) {
 		&mcp.Implementation{Name: "official-canary", Version: "1"},
 		nil,
 		official.Config{
-			Delivery:  armatureanalytics.DeliveryAwait,
-			ActorSeed: func(context.Context) string { return "sdk-canary-shared-actor" },
+			Delivery:          armatureanalytics.DeliveryAwait,
+			RequestCapability: boolPtr(false),
+			ActorSeed:         func(context.Context) string { return "sdk-canary-shared-actor" },
 			Emit: func(_ context.Context, batch armatureanalytics.Batch) error {
 				mu.Lock()
 				defer mu.Unlock()

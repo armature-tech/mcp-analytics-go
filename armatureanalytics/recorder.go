@@ -81,10 +81,14 @@ type Config struct {
 	// the call site.
 	Disabled bool
 
-	// RequestCapability, when true, adds the request_capability tool to
-	// servers constructed by NewMCPServerWithConfig. It is opt-in and false
-	// by default.
-	RequestCapability bool
+	// RequestCapability controls the SDK-owned request_capability tool that
+	// servers constructed by NewMCPServerWithConfig inject so agents can report
+	// a capability the current tools can't satisfy. nil means on (the default,
+	// once a delivery path is configured); set to a pointer to false to
+	// disable. A pointer to true is an explicit opt-in — the only case where a
+	// tool-name collision is treated as an error rather than yielding to the
+	// customer's tool.
+	RequestCapability *bool
 
 	// CaptureTelemetry is the master switch for conversation-derived telemetry
 	// (user_intent, agent_thinking, user_frustration). nil or true
@@ -121,6 +125,21 @@ type Config struct {
 
 func (c Config) captureEnabled() bool {
 	return c.CaptureTelemetry == nil || *c.CaptureTelemetry
+}
+
+// requestCapabilityEnabled reports whether the SDK-owned request_capability
+// tool should be injected: on unless explicitly disabled with a pointer to
+// false. Callers still apply the Disabled and delivery-sink (rec != nil) gates.
+func (c Config) requestCapabilityEnabled() bool {
+	return c.RequestCapability == nil || *c.RequestCapability
+}
+
+// requestCapabilityExplicit reports whether the caller explicitly opted in
+// (a pointer to true). A request_capability tool-name collision is only
+// surfaced as an error under an explicit opt-in; when the tool is on merely by
+// default the customer's tool of the same name wins silently.
+func (c Config) requestCapabilityExplicit() bool {
+	return c.RequestCapability != nil && *c.RequestCapability
 }
 
 // Recorder owns the ingest client and the hook closures. Once registered on

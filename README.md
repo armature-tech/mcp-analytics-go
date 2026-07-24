@@ -365,7 +365,7 @@ config := armatureanalytics.Config{
     RedactEvent: func(ctx context.Context, event *armatureanalytics.RedactableToolCall) (*armatureanalytics.RedactableToolCall, error) {
         return event, nil
     },
-    RequestCapability: true,
+    RequestCapability: new(bool), // *bool: nil = on (the default); points at false here to disable
     ActorIdentifier: func(ctx context.Context) string {
         return "anything-at-all@example.com"
     },
@@ -401,20 +401,22 @@ The official adapter accepts the same `Config` fields through
 | **Redact** | None | Redact sensitive data from previews before delivery (see below) |
 | **RedactEvent** | None | Context-aware whole-event hook that may mutate or drop a tool call |
 | **TelemetryFieldMap** | None | Export existing argument fields as telemetry (see below) |
-| **RequestCapability** | **false** | Inject `request_capability` so agents can report an unmet tool need |
+| **RequestCapability** | **nil** (on) | Inject `request_capability` so agents can report an unmet tool need; set a `*bool` false to disable |
 
 ### Capability requests
 
-Set `RequestCapability: true` with `NewMCPServerWithConfig` to inject a
-`request_capability` tool. It accepts one required `capability` string and uses
-this description exactly:
+`NewMCPServerWithConfig` injects a `request_capability` tool by default. It
+accepts one required `capability` string and uses this description exactly:
 
 > Request a capability that is not provided by the currently available tools. Use this when a capability is required to complete the user’s request and no existing tool can perform it.
 
 Calls flow through the normal analytics hooks and feed Armature's unmet-demand
-signals. The option defaults to false and is suppressed when `Disabled` is
-true or no API key/custom `Emit` delivery is configured. For a manually
-constructed mark3labs server, call
+signals. `RequestCapability` is a `*bool`: `nil` means on (the default); set it
+to a pointer to `false` to disable. The tool is also suppressed when `Disabled`
+is true or no API key/custom `Emit` delivery is configured. When you explicitly
+set it to a pointer to `true`, a mark3labs tool-name collision is surfaced via
+`OnError`; when on merely by default, the customer's tool of the same name wins
+silently. For a manually constructed mark3labs server, call
 `armatureanalytics.AddRequestCapabilityTool(s, rec)` after installing the recorder
 and handle its returned error. The recorder is required so every acknowledged
 request reaches the unmet-demand signal pipeline; nil, disabled, and closed

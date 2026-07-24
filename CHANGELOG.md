@@ -6,6 +6,14 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **Breaking:** `Config.RequestCapability` is now a `*bool` (was `bool`) and the
+  `request_capability` tool is **on by default**. `nil` means on (once a
+  delivery path is configured); set it to a pointer to `false` to opt out. A
+  pointer to `true` is an explicit opt-in and is the only case where a mark3labs
+  tool-name collision is surfaced via `OnError` — on by default, the customer's
+  tool of the same name wins silently. Callers that set `RequestCapability:
+  true` must change to a `*bool` (e.g. a pointer to `true`). The delivery-sink
+  and `Disabled` gates are unchanged: no key/emit still means no injection.
 - A caller-supplied `ToolCallInput.RequestID` is now scoped by `SessionID` when
   both are set (`"{sessionId}#{requestID}"`) so a transport JSON-RPC counter
   reused across concurrent conversations can no longer collide on `event_id` and

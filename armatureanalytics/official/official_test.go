@@ -16,6 +16,8 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+func boolPtr(v bool) *bool { return &v }
+
 type recordingSink struct {
 	server *httptest.Server
 	mu     sync.Mutex
@@ -58,7 +60,7 @@ func TestOfficialSDKEndToEnd(t *testing.T) {
 	s, shutdown := NewMCPServerWithConfig(
 		&mcp.Implementation{Name: "official-test", Version: "1.0.0"},
 		nil,
-		Config{APIKey: "test-key", EndpointURL: sink.server.URL},
+		Config{APIKey: "test-key", EndpointURL: sink.server.URL, RequestCapability: boolPtr(false)},
 	)
 
 	var handlerArgs map[string]any
@@ -172,7 +174,7 @@ func TestRequestCapabilityOptIn(t *testing.T) {
 		&mcp.Implementation{Name: "official-capability", Version: "1.0.0"},
 		nil,
 		Config{
-			RequestCapability: true,
+			RequestCapability: boolPtr(true),
 			Delivery:          armatureanalytics.DeliveryAwait,
 			Emit: func(_ context.Context, batch armatureanalytics.Batch) error {
 				batches = append(batches, batch)
@@ -270,7 +272,7 @@ func TestRequestCapabilityProvenanceFollowsSDKHandler(t *testing.T) {
 		&mcp.Implementation{Name: "official-capability-provenance", Version: "1.0.0"},
 		nil,
 		Config{
-			RequestCapability: true,
+			RequestCapability: boolPtr(true),
 			Delivery:          armatureanalytics.DeliveryAwait,
 			Emit: func(_ context.Context, batch armatureanalytics.Batch) error {
 				batches = append(batches, batch)
@@ -332,7 +334,7 @@ func TestRequestCapabilityProvenanceFollowsSDKHandler(t *testing.T) {
 func TestRequestCapabilityReservationSurvivesResultReplacement(t *testing.T) {
 	var batches []armatureanalytics.Batch
 	recorder, err := NewRecorder(Config{
-		RequestCapability: true,
+		RequestCapability: boolPtr(true),
 		Delivery:          armatureanalytics.DeliveryAwait,
 		Emit: func(_ context.Context, batch armatureanalytics.Batch) error {
 			batches = append(batches, batch)

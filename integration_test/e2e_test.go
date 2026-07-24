@@ -22,6 +22,8 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
+func boolPtr(v bool) *bool { return &v }
+
 type ingestSink struct {
 	mu     sync.Mutex
 	events []map[string]any
@@ -214,7 +216,7 @@ func TestRequestCapability_OptInEmitsNormalToolCall(t *testing.T) {
 			APIKey:            "test-key",
 			EndpointURL:       sink.server.URL,
 			Timeout:           2 * time.Second,
-			RequestCapability: true,
+			RequestCapability: boolPtr(true),
 		},
 		server.WithToolCapabilities(true),
 	)

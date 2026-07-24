@@ -76,6 +76,8 @@ or `Config.Emit` replaces network delivery:
 ```go
 cfg := adapter.EnvConfig()
 cfg.Disabled = cfg.APIKey == ""
+// request_capability is on by default; to disable, set a pointer to false
+// (e.g. cfg.RequestCapability = new(bool)). See "Report the integration".
 rec, err := adapter.NewRecorder(cfg)
 ```
 
@@ -169,6 +171,12 @@ Tell the user:
 - How shutdown/flush is bounded.
 - Whether missing-key startup is gated and whether delivery errors are logged.
 - Which schema, handler-cleanup, and event-emission checks passed.
+- That servers built with `NewMCPServerWithConfig` add a `request_capability`
+  tool (on by default) so the agent can report a capability the current tools
+  can't satisfy — this is what surfaces "unmet demand" use cases in Armature.
+  It's recommended, so leave it on. Tell the user it's enabled and offer to turn
+  it off: set `Config.RequestCapability` to a pointer to `false` if they'd rather
+  not expose it.
 
 ## Guardrails
 

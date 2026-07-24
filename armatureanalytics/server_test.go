@@ -84,22 +84,26 @@ func TestNewMCPServerWithConfig_NegativeTimeout_Normalized(t *testing.T) {
 	}
 }
 
-func TestNewMCPServerWithConfig_RequestCapabilityOptIn(t *testing.T) {
-	off, shutdownOff := NewMCPServerWithConfig("test", "0", Config{})
+func TestNewMCPServerWithConfig_RequestCapabilityDefaultsOn(t *testing.T) {
+	// Explicit opt-out removes the tool even with a delivery path.
+	off, shutdownOff := NewMCPServerWithConfig("test", "0", Config{
+		RequestCapability: boolPtr(false),
+		Emit:              func(context.Context, Batch) error { return nil },
+	})
 	if tool := off.GetTool(requestCapabilityToolName); tool != nil {
-		t.Fatal("request_capability should be disabled by default")
+		t.Fatal("request_capability should be absent when explicitly disabled")
 	}
 	if err := shutdownOff(context.Background()); err != nil {
-		t.Fatalf("shutdown default server: %v", err)
+		t.Fatalf("shutdown opted-out server: %v", err)
 	}
 
+	// On by default once a delivery path is configured, with no opt-in.
 	on, shutdownOn := NewMCPServerWithConfig("test", "0", Config{
-		RequestCapability: true,
-		Emit:              func(context.Context, Batch) error { return nil },
+		Emit: func(context.Context, Batch) error { return nil },
 	})
 	registered := on.GetTool(requestCapabilityToolName)
 	if registered == nil {
-		t.Fatal("request_capability should be registered when enabled")
+		t.Fatal("request_capability should be on by default with a delivery path")
 	}
 	if got := registered.Tool.Description; got != requestCapabilityToolDescription {
 		t.Fatalf("description = %q, want %q", got, requestCapabilityToolDescription)
@@ -120,7 +124,7 @@ func TestNewMCPServerWithConfig_RequestCapabilityOptIn(t *testing.T) {
 }
 
 func TestNewMCPServerWithConfig_RequestCapabilityRequiresDelivery(t *testing.T) {
-	s, shutdown := NewMCPServerWithConfig("test", "0", Config{RequestCapability: true})
+	s, shutdown := NewMCPServerWithConfig("test", "0", Config{RequestCapability: boolPtr(true)})
 	t.Cleanup(func() { _ = shutdown(context.Background()) })
 	if tool := s.GetTool(requestCapabilityToolName); tool != nil {
 		t.Fatal("request_capability should not be registered without a delivery path")
@@ -260,7 +264,7 @@ func TestRequestCapabilityReservationCompletesDuringConcurrentClose(t *testing.T
 func TestRequestCapabilityProvenanceFollowsSDKHandler(t *testing.T) {
 	var batches []Batch
 	rec, err := NewRecorder(Config{
-		RequestCapability: true,
+		RequestCapability: boolPtr(true),
 		Delivery:          DeliveryAwait,
 		Emit: func(_ context.Context, batch Batch) error {
 			batches = append(batches, batch)
@@ -324,7 +328,7 @@ func TestRequestCapabilityProvenanceFollowsSDKHandler(t *testing.T) {
 func TestNewMCPServerWithConfig_DisabledSuppressesRequestCapability(t *testing.T) {
 	s, shutdown := NewMCPServerWithConfig("test", "0", Config{
 		Disabled:          true,
-		RequestCapability: true,
+		RequestCapability: boolPtr(true),
 	})
 	t.Cleanup(func() { _ = shutdown(context.Background()) })
 

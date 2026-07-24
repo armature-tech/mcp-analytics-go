@@ -135,7 +135,10 @@ func NewMCPServerWithConfig(impl *mcp.Implementation, opts *mcp.ServerOptions, c
 		}
 		return s, shutdown(func(context.Context) error { return nil })
 	}
-	if cfg.RequestCapability && !cfg.Disabled && rec != nil {
+	// On by default (nil) unless explicitly disabled with a pointer to false.
+	// The official SDK's registration is last-write-wins, so a customer tool of
+	// the same name simply replaces this one — no collision guard needed.
+	if (cfg.RequestCapability == nil || *cfg.RequestCapability) && !cfg.Disabled && rec != nil {
 		addRequestCapabilityTool(s, rec)
 	}
 	rec.Install(s)
