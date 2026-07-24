@@ -102,6 +102,14 @@ func TestResolveStatelessHTTPSessionSeedSurvivesProxyReconnect(t *testing.T) {
 	}
 }
 
+func TestStatelessSessionSeedAcceptsTimeOrderedUUIDV7(t *testing.T) {
+	seed := "019f942a-5d64-7322-8e50-5d17333768d9"
+	got := buildStatelessSessionID(&ClientInfo{Name: "client"}, seed)
+	if want := "mcp_client_v__" + seed; got != want {
+		t.Fatalf("seeded session id = %q, want %q", got, want)
+	}
+}
+
 func TestResolveStatelessHTTPSessionRejectsInvalidSeed(t *testing.T) {
 	session := ResolveStatelessHTTPSession(StatelessHTTPInput{
 		Body: map[string]any{
