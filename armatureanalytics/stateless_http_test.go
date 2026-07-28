@@ -123,16 +123,30 @@ func TestResolveStatelessHTTPSessionRejectsInvalidSeed(t *testing.T) {
 	}
 }
 
-func TestResolveStatelessHTTPSessionMissingEchoUsesOneOffUUID(t *testing.T) {
+// A request with neither an initialize message nor an echoed Mcp-Session-Id
+// is 2026-07-28 traffic (which removed both) or a client that lost the echo.
+// The session resolves empty so ingest buckets it server-side — a minted
+// per-request UUID would fabricate one session per POST.
+func TestResolveStatelessHTTPSessionMissingEchoResolvesEmpty(t *testing.T) {
 	headers := make(http.Header)
 	session := ResolveStatelessHTTPSession(StatelessHTTPInput{
 		Body:    map[string]any{"method": "tools/call"},
 		Headers: headers,
 	})
-	if !regexp.MustCompile(`^[0-9a-f-]{36}$`).MatchString(session.SessionID) || session.ClientInfo != nil {
-		t.Fatalf("fallback session = %#v", session)
+	if session.SessionID != "" || session.ClientInfo != nil || session.IsInitialize {
+		t.Fatalf("fallback session = %#v, want empty", session)
 	}
-	if got := headers.Get("Mcp-Session-Id"); got != session.SessionID {
-		t.Fatalf("request fallback header = %q, want %q", got, session.SessionID)
+	if got := headers.Get("Mcp-Session-Id"); got != "" {
+		t.Fatalf("no-echo request grew a fabricated session header %q", got)
+	}
+	if session.SessionIDGenerator() != nil {
+		t.Fatal("sessionless request should not mint transport session ids")
+	}
+	manager := session.Mark3labsSessionIDManager()
+	if terminated, err := manager.Validate(""); err != nil || terminated {
+		t.Fatalf("sessionless mark3labs request rejected: terminated=%v err=%v", terminated, err)
+	}
+	if _, err := manager.Validate("mismatched"); err == nil {
+		t.Fatal("non-empty header against an empty resolution should be rejected")
 	}
 }

@@ -18,6 +18,17 @@ import (
 
 func boolPtr(v bool) *bool { return &v }
 
+// assertNoArmatureResultMeta allows the SDK's own modern-era result _meta
+// (e.g. io.modelcontextprotocol/serverInfo) but fails on any Armature key.
+func assertNoArmatureResultMeta(t *testing.T, meta mcp.Meta) {
+	t.Helper()
+	for key := range meta {
+		if strings.Contains(key, "armature") {
+			t.Fatalf("Armature provenance leaked into result metadata: %#v", meta)
+		}
+	}
+}
+
 type recordingSink struct {
 	server *httptest.Server
 	mu     sync.Mutex
@@ -224,9 +235,9 @@ func TestRequestCapabilityOptIn(t *testing.T) {
 	if err != nil || result.IsError {
 		t.Fatalf("call result = %#v, err = %v", result, err)
 	}
-	if result.Meta != nil {
-		t.Fatalf("SDK provenance marker leaked into result metadata: %#v", result.Meta)
-	}
+	// v1.7.0 legitimately stamps serverInfo into modern-era result _meta, so
+	// only assert that no Armature provenance leaked.
+	assertNoArmatureResultMeta(t, result.Meta)
 	invalid, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name:      "request_capability",
 		Arguments: map[string]any{"capability": "   "},
@@ -250,9 +261,7 @@ func TestRequestCapabilityOptIn(t *testing.T) {
 	if !afterShutdown.IsError {
 		t.Fatalf("post-shutdown call should return unavailable: %#v", afterShutdown)
 	}
-	if afterShutdown.Meta != nil {
-		t.Fatalf("inactive call should not carry capability provenance: %#v", afterShutdown.Meta)
-	}
+	assertNoArmatureResultMeta(t, afterShutdown.Meta)
 	for _, batch := range batches {
 		for _, event := range batch.Events {
 			if event.Kind == armatureanalytics.KindToolCall && event.OK {

@@ -208,7 +208,46 @@ All telemetry fields are optional. Send **agent_thinking** on every call; send *
 | Custom tool registration | Framework adapter's `DecorateInputSchemaWithTelemetry(...)` and `WrapHandler(...)` |
 | Stateless HTTP / serverless | `ResolveStatelessHTTPSession(...)` per request |
 
-### Stateless HTTP and serverless
+### MCP 2026-07-28 (stateless protocol)
+
+The official adapter supports MCP protocol version 2026-07-28 end to end on
+go-sdk v1.7.0. Nothing changes at the call sites: `official.NewMCPServer` plus
+`mcp.StreamableHTTPOptions{Stateless: true}` serves modern and legacy clients
+from the same handler. Under the hood the adapter now handles both eras:
+
+- **Client identity per request.** 2026-07-28 removed the initialize
+  handshake; `clientInfo`, `protocolVersion`, and `clientCapabilities` travel
+  in each request's `_meta`. The adapter captures them per request (typed
+  accessor first, raw `_meta` fallback) and still supports initialize-time
+  capture for legacy clients. `clientInfo` is optional per request; requests
+  without it record an unknown client.
+- **session_init on first sight.** With no handshake, `session_init` is
+  emitted the first time a new session identity appears on any method
+  (`server/discover` included), deduplicated locally and by deterministic
+  event ID at ingest.
+- **Session identity ladder.** `session_id_hint` resolves in priority order:
+  1. `gen_ai.conversation.id` parsed from the `_meta` `baggage` trace slot,
+  2. the `X-Armature-Session-Seed` header,
+  3. the legacy transport session (`session.ID()` / echoed `Mcp-Session-Id`),
+  4. the process-scoped stdio ID when the request has no headers at all,
+  5. empty — ingest buckets sessionless events server-side. The SDK never
+     fabricates a per-request session.
+- **Raw `_meta` capture.** Each tool_call event carries the request's `_meta`
+  verbatim as `metadata.request_meta` (JSON-capped at 4 KB with a
+  `request_meta_truncated` marker), preserving trace context
+  (`traceparent`/`tracestate`/`baggage`) for correlation.
+
+The mark3labs adapter is unchanged: mark3labs/mcp-go has no 2026-07-28
+support, and its legacy flows (including stateless minting below) work as
+before.
+
+### Stateless HTTP and serverless (pre-2026-07-28 hosts)
+
+The mint-on-initialize helper below applies to legacy-protocol hosts:
+mark3labs servers, and official-SDK hosts still on go-sdk <= v1.6. On go-sdk
+v1.7.0 stateless servers it is inert — the modern protocol has no initialize
+and the server ignores `Mcp-Session-Id` entirely (`GetSessionID` is never
+consulted) — and session identity comes from the ladder above instead.
 
 Initialization and tool calls can land on different instances. Resolve every
 request before constructing its per-request MCP server/transport:
@@ -253,9 +292,11 @@ handler.ServeHTTP(w, r)
 
 The helper mints `mcp_<client>_v_<version>_<uuid>` at `initialize`; compliant
 clients echo it in `Mcp-Session-Id`, so later cold invocations recover the same
-session and client identity without shared storage. If a later request omits
-the echo, the helper injects a one-off fallback into the supplied request
-headers so the framework adapter still records a distinct request boundary.
+session and client identity without shared storage. A request that carries
+neither an initialize message nor an echoed session ID resolves to an empty
+session — it is either 2026-07-28 traffic (which has no session header) or a
+lost echo, and in both cases ingest buckets the events server-side rather than
+splitting each request into its own fabricated session.
 Treat the ID as
 observability, never authentication. Set `Config.Delivery` to
 `armatureanalytics.DeliveryAwait` in serverless handlers.
@@ -475,10 +516,12 @@ Each **tool_call** event includes:
 - Hashed actor identifier
 - Optional user intent, agent reasoning, and frustration
 
-Each successful MCP initialization emits one deduplicated **session_init** event.
-On a cold stateless tool-call instance, the recorder lazily re-emits the same
-stable session event; ingest coalesces it by event ID. Stdio servers receive a
-process-scoped session ID so separate CLI conversations never merge.
+Each session emits one deduplicated **session_init** event: at the initialize
+handshake for pre-2026-07-28 clients, or on first sight of a new session
+identity for 2026-07-28 clients (which have no handshake). On a cold stateless
+tool-call instance, the recorder lazily re-emits the same stable session
+event; ingest coalesces it by event ID. Stdio servers receive a process-scoped
+session ID so separate CLI conversations never merge.
 
 Prompts, resources, and OAuth hooks are not currently captured.
 
@@ -486,7 +529,8 @@ Prompts, resources, and OAuth hooks are not currently captured.
 
 - Go 1.25.12+
 - **github.com/mark3labs/mcp-go** v0.49.0 through v0.56.0
-- **github.com/modelcontextprotocol/go-sdk** v1.6.1
+- **github.com/modelcontextprotocol/go-sdk** v1.7.0 (MCP protocol 2026-07-28
+  and earlier)
 
 The CI suite tests the declared minimum mark3labs version; a compatibility leg
 also tests the current v0.56 line.

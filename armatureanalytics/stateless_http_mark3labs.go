@@ -20,6 +20,17 @@ func (s StatelessHTTPSession) Mark3labsSessionIDManager() server.SessionIdManage
 func (m *statelessSessionIDManager) Generate() string { return m.sessionID }
 
 func (m *statelessSessionIDManager) Validate(sessionID string) (bool, error) {
+	if m.sessionID == "" {
+		// The request resolved without a session (no initialize message and no
+		// echoed Mcp-Session-Id — see ResolveStatelessHTTPSession). Accept the
+		// equally session-less transport request; analytics buckets it
+		// server-side. A non-empty header against an empty resolution is still
+		// a mismatch.
+		if strings.TrimSpace(sessionID) == "" {
+			return false, nil
+		}
+		return false, fmt.Errorf("invalid session id")
+	}
 	if strings.TrimSpace(sessionID) == "" || sessionID != m.sessionID {
 		return false, fmt.Errorf("invalid session id")
 	}

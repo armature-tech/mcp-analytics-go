@@ -4,7 +4,52 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Added
+
+- **MCP 2026-07-28 (stateless protocol) support in the official adapter**,
+  against github.com/modelcontextprotocol/go-sdk v1.7.0 (bumped from v1.6.1):
+  - Per-request client identity: `clientInfo` / `protocolVersion` /
+    `clientCapabilities` are captured from each request's `_meta` (typed
+    `ServerRequest` accessors where available, raw `mcp.MetaKey*` slots
+    otherwise). The initialize-time capture remains as the legacy-era path;
+    both eras are served by one `StreamableHTTPHandler{Stateless: true}`.
+    Requests without the optional `clientInfo` record an unknown client.
+  - `session_init` now emits on first sight of a new session identity on any
+    method (the modern era has no initialize handshake), deduplicated locally
+    and by deterministic event ID at ingest.
+  - Session identity ladder for `session_id_hint`: baggage
+    `gen_ai.conversation.id` (from the `_meta` trace slot, W3C-decoded) →
+    `X-Armature-Session-Seed` header → legacy `session.ID()` / echoed
+    `Mcp-Session-Id` → process-scoped stdio ID (only when the request has no
+    headers at all) → empty for server-side bucketing.
+  - Tool-call events carry the request's raw `_meta` verbatim as
+    `metadata.request_meta`, JSON-capped at 4 KB with a
+    `request_meta_truncated` marker (`ToolCallInput.RequestMeta`,
+    `MaxRequestMetaBytes`). This preserves the fixed trace-context slots
+    (`traceparent`, `tracestate`, `baggage`) the Go SDK has no helpers for.
+  - Telemetry schema decoration verified against v1.7.0's SEP-2106 tool
+    schema validation in real `StreamableHTTPHandler` round-trips.
+
 ### Changed
+
+- `ResolveStatelessHTTPSession` no longer mints a one-off UUID (nor injects a
+  fallback `Mcp-Session-Id` header) for requests that carry neither an
+  initialize message nor an echoed session ID: such requests are 2026-07-28
+  traffic or a lost echo, and now resolve to an empty session that ingest
+  buckets server-side instead of fabricating one session per request. The
+  mint-on-initialize + echo scheme itself is retained for legacy-protocol
+  hosts (mark3labs, official SDK <= v1.6); on v1.7.0 stateless servers it is
+  inert because the server ignores `Mcp-Session-Id` and never consults
+  `GetSessionID`.
+- The official adapter snapshots tool results before handing them to the
+  background privacy queue: go-sdk v1.7.0 mutates a modern-era result's
+  `_meta` (server info annotation) after receiving middleware returns, which
+  would otherwise race the queue's traversal.
+- When a per-request or cached client capture exists but is name-less, the
+  recorder now merges in the identity parsed from an identity-bearing
+  stateless session ID instead of discarding it.
+- The mark3labs adapter is unchanged: mark3labs/mcp-go has no 2026-07-28
+  support.
 
 - **Breaking:** `Config.RequestCapability` is now a `*bool` (was `bool`) and the
   `request_capability` tool is **on by default**. `nil` means on (once a

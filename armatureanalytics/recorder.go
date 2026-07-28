@@ -379,9 +379,7 @@ func (r *Recorder) buildToolCallEvents(ctx context.Context, in ToolCallInput) []
 	}
 	in.Redact = r.cfg.Redact
 	in.RedactSecrets = r.cfg.RedactSecrets
-	if in.ClientInfo == nil {
-		in.ClientInfo = ParseStatelessSessionClientInfo(in.SessionID)
-	}
+	in.ClientInfo = fillClientInfoFromSessionID(in.ClientInfo, in.SessionID)
 	identifier := in.actorIdentifier
 	if !in.actorIdentifierResolved {
 		identifier = r.actorIdentifier(ctx)
@@ -423,9 +421,7 @@ func (r *Recorder) RecordSessionInit(ctx context.Context, in SessionInitInput) {
 		if in.ActorSeed == "" {
 			in.ActorSeed = r.ResolveActorSeed(privacyCtx, in.actorHeaders)
 		}
-		if in.ClientInfo == nil {
-			in.ClientInfo = ParseStatelessSessionClientInfo(in.SessionID)
-		}
+		in.ClientInfo = fillClientInfoFromSessionID(in.ClientInfo, in.SessionID)
 		identifier := in.actorIdentifier
 		if identifier != "" {
 			in.ActorSeed = identifier
@@ -565,6 +561,31 @@ func (r *Recorder) onError(ctx context.Context, id any, method mcp.MCPMethod, _ 
 		Telemetry:     firstTelemetry(cc.telemetry, TelemetryFromContext(ctx)),
 		WorkflowRunID: cc.workflowRunID,
 	})
+}
+
+// fillClientInfoFromSessionID resolves the ClientInfo for an event. A
+// per-request capture (MCP 2026-07-28 `_meta`, or a legacy initialize cache)
+// wins when it names the client; when the capture is absent or name-less
+// (modern-era clientInfo is OPTIONAL per request, and legacy synthesized
+// session state may carry only a protocol version), the identity-bearing
+// stateless session ID recovers the client name best-effort.
+func fillClientInfoFromSessionID(info *ClientInfo, sessionID string) *ClientInfo {
+	if info == nil {
+		return ParseStatelessSessionClientInfo(sessionID)
+	}
+	if info.Name != "" {
+		return info
+	}
+	parsed := ParseStatelessSessionClientInfo(sessionID)
+	if parsed == nil {
+		return info
+	}
+	merged := *info
+	merged.Name = parsed.Name
+	if merged.Version == "" {
+		merged.Version = parsed.Version
+	}
+	return &merged
 }
 
 // firstTelemetry returns a if any field is set, else b. Used to prefer the

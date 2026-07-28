@@ -189,12 +189,21 @@ func (r *Recorder) Dropped() uint64 {
 
 func (r *Recorder) middleware(next mcp.MethodHandler) mcp.MethodHandler {
 	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+		meta := requestMeta(req)
 		// Session cleanup may run while a tool handler is active. Capture the
 		// immutable client metadata before entering the handler so the resulting
-		// event remains complete even if the connection ends concurrently.
+		// event remains complete even if the connection ends concurrently. The
+		// per-request accessors serve both eras (2026-07-28 `_meta` first, then
+		// the session's InitializeParams); the initialize-time cache stays as
+		// the legacy-era fallback.
 		var clientInfo *armatureanalytics.ClientInfo
+		var callRequestMeta map[string]any
 		if method == methodToolsCall {
-			clientInfo = r.clientInfo(sessionKey(req))
+			clientInfo = perRequestClientInfo(req)
+			if clientInfo == nil {
+				clientInfo = r.clientInfo(sessionKey(req))
+			}
+			callRequestMeta = copyRequestMeta(meta)
 		}
 		var capabilityState *capabilityCallState
 		if method == methodToolsCall {
@@ -207,11 +216,19 @@ func (r *Recorder) middleware(next mcp.MethodHandler) mcp.MethodHandler {
 			}()
 		}
 		startedAt := time.Now()
+		// The modern era has no initialize handshake, so session_init keys on
+		// the first sight of a session identity (any method, server/discover
+		// included) instead of method == "initialize".
+		if isModernRequest(meta) {
+			r.recordModernSessionInit(ctx, req, startedAt)
+		}
 		result, err := next(ctx, method, req)
 		finishedAt := time.Now()
 
 		switch method {
 		case methodInitialize:
+			// Legacy era (pre-2026-07-28): the handshake is still the
+			// session_init signal for those clients.
 			if err == nil {
 				r.recordInitialize(ctx, req, startedAt)
 			}
@@ -224,11 +241,39 @@ func (r *Recorder) middleware(next mcp.MethodHandler) mcp.MethodHandler {
 				startedAt,
 				finishedAt,
 				clientInfo,
+				callRequestMeta,
 				capabilityState.take(),
 			)
 		}
 		return result, err
 	}
+}
+
+// recordModernSessionInit emits session_init for 2026-07-28 requests on first
+// sight of a new session identity. The identity ladder lives in
+// analyticsSessionID; requests that resolve to no identity emit nothing and
+// are bucketed server-side by ingest. Dedup is two-layered: rememberSession
+// gates connection-scoped repeats locally, and the core recorder's lazy
+// session set (actor+session keyed) plus ingest's deterministic session_init
+// event_id absorb re-emits from per-request stateless sessions and serverless
+// cold starts.
+func (r *Recorder) recordModernSessionInit(ctx context.Context, req mcp.Request, startedAt time.Time) {
+	analyticsSessionID := r.analyticsSessionID(req)
+	if analyticsSessionID == "" {
+		return
+	}
+	info := perRequestClientInfo(req)
+	session, _ := req.GetSession().(*mcp.ServerSession)
+	if !r.rememberSession(analyticsSessionID, session, analyticsSessionID, info) {
+		return
+	}
+	r.core.RecordSessionInit(ctx, armatureanalytics.SessionInitInput{
+		SessionID:     analyticsSessionID,
+		ActorSeed:     r.core.ResolveActorSeed(ctx, requestHeaders(req)),
+		StartedAt:     startedAt,
+		ClientInfo:    info,
+		WorkflowRunID: armatureanalytics.WorkflowRunIDFromHeaders(requestHeaders(req)),
+	})
 }
 
 func (r *Recorder) recordInitialize(ctx context.Context, req mcp.Request, startedAt time.Time) {
@@ -271,6 +316,7 @@ func (r *Recorder) recordToolCall(
 	startedAt time.Time,
 	finishedAt time.Time,
 	clientInfo *armatureanalytics.ClientInfo,
+	callRequestMeta map[string]any,
 	capabilityReservation *armatureanalytics.CapabilityReservation,
 ) {
 	params, ok := req.GetParams().(*mcp.CallToolParamsRaw)
@@ -280,6 +326,12 @@ func (r *Recorder) recordToolCall(
 		}
 		return
 	}
+	// v1.7.0 annotates modern-era results AFTER middleware returns (it stamps
+	// io.modelcontextprotocol/serverInfo into result._meta on the request
+	// goroutine), which would race the background privacy queue's traversal of
+	// the same value. Snapshot the result envelope and its Meta map now; the
+	// content slices are not touched post-middleware.
+	result = snapshotToolResult(result)
 
 	// Tools that own their telemetry field (TELEMETRY-CONTRACT.md, mode
 	// "owned") are exempt from extraction: their arguments pass through to
@@ -309,6 +361,7 @@ func (r *Recorder) recordToolCall(
 		ClientInfo:        clientInfo,
 		Telemetry:         telemetry,
 		WorkflowRunID:     armatureanalytics.WorkflowRunIDFromHeaders(requestHeaders(req)),
+		RequestMeta:       callRequestMeta,
 		CapabilityRequest: capabilityReservation != nil,
 	}
 	if capabilityReservation != nil {
@@ -398,9 +451,29 @@ func sessionKey(req mcp.Request) any {
 	return req
 }
 
+// analyticsSessionID resolves the SessionIDHint identity ladder, in order:
+//
+//  1. `gen_ai.conversation.id` parsed from the `_meta` "baggage" trace slot
+//     (2026-07-28): the client's own conversation identity.
+//  2. The X-Armature-Session-Seed header, when HTTP headers are reachable.
+//  3. The legacy transport session: a non-empty session.ID(), a remembered
+//     initialize-time ID, or the echoed Mcp-Session-Id header. Pre-2026-07-28
+//     traffic only — v1.7.0 stateless servers ignore the header entirely.
+//  4. The process-scoped stdio ID, only when the request has no headers at
+//     all (stdio and in-memory transports serve one conversation per process).
+//  5. Empty. Ingest buckets sessionless events server-side; fabricating a
+//     per-request identity would split every request into its own session,
+//     which is strictly worse than empty.
 func (r *Recorder) analyticsSessionID(req mcp.Request) string {
 	if req == nil {
 		return ""
+	}
+	if id := conversationIDFromMeta(requestMeta(req)); id != "" {
+		return id
+	}
+	headers := requestHeaders(req)
+	if seed := strings.TrimSpace(headers.Get("X-Armature-Session-Seed")); seed != "" {
+		return seed
 	}
 	if session := requestSession(req); session != nil {
 		if id := session.ID(); id != "" {
@@ -414,13 +487,13 @@ func (r *Recorder) analyticsSessionID(req mcp.Request) string {
 		}
 		r.sessionsMu.Unlock()
 	}
-	if id := strings.TrimSpace(requestHeaders(req).Get("Mcp-Session-Id")); id != "" {
+	if id := strings.TrimSpace(headers.Get("Mcp-Session-Id")); id != "" {
 		return id
 	}
-	if req.GetExtra() != nil && req.GetExtra().Header != nil {
-		return ""
+	if headers == nil {
+		return armatureanalytics.ProcessScopedSessionID()
 	}
-	return armatureanalytics.ProcessScopedSessionID()
+	return ""
 }
 
 // InstrumentTool registers a typed official-SDK tool with analytics schema

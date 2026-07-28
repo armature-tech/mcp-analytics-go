@@ -73,9 +73,23 @@ func ParseStatelessSessionClientInfo(sessionID string) *ClientInfo {
 
 // ResolveStatelessHTTPSession mints a session on initialize and otherwise
 // recovers the ID and client identity from the echoed Mcp-Session-Id header.
-// A missing echo receives a one-off UUID so unrelated requests never merge;
-// when Headers is non-nil, that fallback is injected into the current request
-// for framework adapters and transports to observe.
+//
+// This mint-on-initialize + echo scheme belongs to the pre-2026-07-28 MCP
+// protocol and remains supported for hosts on go-sdk <= v1.6 (and for
+// mark3labs/mcp-go, which has no 2026-07-28 support). It is dead on go-sdk
+// >= v1.7.0 stateless servers: the modern protocol removed initialize and the
+// Mcp-Session-Id header entirely (clientInfo travels per-request in `_meta`,
+// and v1.7.0 stateless mode ignores the session header even for
+// legacy-protocol requests, so ServerOptions.GetSessionID is never consulted).
+// The official adapter's receiving middleware recovers session identity for
+// that world instead (baggage `gen_ai.conversation.id`, then the
+// X-Armature-Session-Seed header).
+//
+// A request that carries neither an initialize message nor an echoed
+// Mcp-Session-Id resolves to an empty SessionID: it is either modern-protocol
+// traffic (identified elsewhere) or a client that dropped the echo, and in
+// both cases ingest bucketing an empty hint server-side beats fabricating a
+// one-request session per POST.
 func ResolveStatelessHTTPSession(input StatelessHTTPInput) StatelessHTTPSession {
 	body := decodeStatelessBody(input.Body)
 	if initialize := findInitializeMessage(body); initialize != nil {
@@ -85,10 +99,10 @@ func ResolveStatelessHTTPSession(input StatelessHTTPInput) StatelessHTTPSession 
 	}
 	sessionID := strings.TrimSpace(input.Headers.Get("Mcp-Session-Id"))
 	if sessionID == "" {
-		sessionID = randomUUID()
-		if input.Headers != nil {
-			input.Headers.Set("Mcp-Session-Id", sessionID)
-		}
+		// No initialize and no echo: modern-protocol traffic or a lost echo.
+		// Leave the session empty for server-side bucketing instead of minting
+		// a fresh UUID that would fragment analytics into one-request sessions.
+		return StatelessHTTPSession{}
 	}
 	return StatelessHTTPSession{
 		SessionID:  sessionID,

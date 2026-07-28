@@ -23,6 +23,7 @@ const (
 	MaxPreviewBytes      = 8 * 1024
 	MaxSourceBytes       = 32 * 1024
 	MaxCapabilitiesBytes = 4 * 1024
+	MaxRequestMetaBytes  = 4 * 1024
 
 	anonymousActor = "anonymous"
 )
@@ -99,6 +100,13 @@ type ToolCallInput struct {
 	ClientInfo    *ClientInfo
 	Telemetry     Telemetry // optional LLM-supplied telemetry (V1 or pre-V1 spellings; normalized on emit)
 	WorkflowRunID string    // optional Armature workflow-run UUID; marks synthetic traffic
+	// RequestMeta is the raw MCP `_meta` map of the request, captured verbatim.
+	// MCP 2026-07-28 moved per-request identity (protocolVersion, clientInfo,
+	// clientCapabilities) and trace context (traceparent, tracestate, baggage)
+	// into `_meta`, so it carries diagnostic value beyond the parsed fields.
+	// Serialized into event metadata as "request_meta", JSON-capped at
+	// MaxRequestMetaBytes with a "request_meta_truncated" marker.
+	RequestMeta map[string]any
 	// CapabilityRequest marks SDK-owned request_capability calls so ingest can
 	// distinguish them from a customer tool that happens to use the same name.
 	CapabilityRequest bool
@@ -269,6 +277,13 @@ func assembleToolCallEvent(in ToolCallInput, candidate *RedactableToolCall) Even
 	if in.CapabilityRequest {
 		meta["capability_request"] = true
 	}
+	if len(in.RequestMeta) > 0 {
+		value, truncated := capRequestMeta(in.RequestMeta)
+		meta["request_meta"] = value
+		if truncated {
+			meta["request_meta_truncated"] = true
+		}
+	}
 	mergeClientInfo(meta, in.ClientInfo)
 	return Event{
 		EventID:               EventID(actorID, KindToolCall, requestID),
@@ -438,6 +453,22 @@ func BuildSessionInitEvent(in SessionInitInput) Event {
 		IsWorkflow:    in.WorkflowRunID != "",
 		WorkflowRunID: in.WorkflowRunID,
 	}
+}
+
+// capRequestMeta returns the raw request `_meta` map when its JSON form fits
+// MaxRequestMetaBytes, or the JSON string cut at that budget plus a truncation
+// flag. Values that do not marshal fall back to a fixed placeholder so the
+// event still ships.
+func capRequestMeta(requestMeta map[string]any) (any, bool) {
+	data, err := json.Marshal(requestMeta)
+	if err != nil {
+		return "[unserialisable]", false
+	}
+	if len(data) <= MaxRequestMetaBytes {
+		return requestMeta, false
+	}
+	preview, _ := truncateUTF8(string(data), MaxRequestMetaBytes)
+	return preview, true
 }
 
 // mergeClientInfo populates the common client_name / client_version /
