@@ -29,8 +29,16 @@ const (
 
 // Batch is the JSON envelope POSTed to the Armature ingest endpoint.
 type Batch struct {
-	SchemaVersion int     `json:"schema_version"`
-	Events        []Event `json:"events"`
+	SchemaVersion int       `json:"schema_version"`
+	Events        []Event   `json:"events"`
+	SDK           *BatchSDK `json:"sdk,omitempty"`
+}
+
+// BatchSDK identifies the SDK that produced a batch. Client.Send stamps it
+// when absent; ingest persists the last-seen value per MCP server.
+type BatchSDK struct {
+	Language string `json:"language"`
+	Version  string `json:"version"`
 }
 
 // Event is one entry in a Batch. Kind is "tool_call", "session_init", or "actor_identity".

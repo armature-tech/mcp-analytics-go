@@ -23,10 +23,6 @@ const DefaultTimeout = 5 * time.Second
 const DefaultIngestMaxAttempts = 2
 const DefaultIngestRetryDelay = 100 * time.Millisecond
 
-// userAgent identifies this SDK in the User-Agent header so the Armature
-// backend can attribute traffic by language.
-const userAgent = "mcp-analytics-go/0.1"
-
 // ErrMissingAPIKey is returned by Send when no API key is configured.
 var ErrMissingAPIKey = errors.New("armatureanalytics: APIKey is required")
 
@@ -127,6 +123,12 @@ func NewClient(apiKey, endpoint string, timeout time.Duration) (*Client, error) 
 // Send POSTs a single batch to the Armature ingest endpoint. Returns nil on
 // 2xx, an error otherwise.
 func (c *Client) Send(ctx context.Context, batch Batch) error {
+	// Stamp the SDK identity at the delivery boundary so every batch that
+	// reaches Armature ingest carries it. The version comes from the consuming
+	// binary's Go build info (see SDKVersion), never a hardcoded constant.
+	if batch.SDK == nil {
+		batch.SDK = batchSDKIdentity()
+	}
 	body, err := json.Marshal(batch)
 	if err != nil {
 		return fmt.Errorf("marshal batch: %w", err)
@@ -139,7 +141,7 @@ func (c *Client) Send(ctx context.Context, batch Batch) error {
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-		req.Header.Set("User-Agent", userAgent)
+		req.Header.Set("User-Agent", sdkUserAgent())
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {

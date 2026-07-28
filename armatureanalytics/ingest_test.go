@@ -108,8 +108,8 @@ func TestClient_SendsBatch(t *testing.T) {
 	if got := rs.Auth(); got != "Bearer test-key" {
 		t.Errorf("Authorization = %q", got)
 	}
-	if got := rs.UA(); got == "" {
-		t.Errorf("User-Agent missing")
+	if got, want := rs.UA(), "armature-mcp-analytics-go/"+armatureanalytics.SDKVersion(); got != want {
+		t.Errorf("User-Agent = %q, want %q", got, want)
 	}
 
 	var decoded map[string]any
@@ -118,6 +118,16 @@ func TestClient_SendsBatch(t *testing.T) {
 	}
 	if decoded["schema_version"].(float64) != 1 {
 		t.Errorf("schema_version = %v, want 1", decoded["schema_version"])
+	}
+	sdk, ok := decoded["sdk"].(map[string]any)
+	if !ok {
+		t.Fatalf("sdk envelope missing: %v", decoded["sdk"])
+	}
+	if sdk["language"] != "go" {
+		t.Errorf("sdk.language = %v, want go", sdk["language"])
+	}
+	if version, _ := sdk["version"].(string); version == "" || version == "0.1" {
+		t.Errorf("sdk.version = %q, want a build-info version, never a hardcoded one", version)
 	}
 	events := decoded["events"].([]any)
 	if len(events) != 1 {
