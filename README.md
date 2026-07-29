@@ -206,7 +206,8 @@ All telemetry fields are optional. Send **agent_thinking** on every call; send *
 | Official SDK, new server | `official.NewMCPServer(...)` and `official.InstrumentTool(...)` |
 | Official SDK, existing server | `official.NewRecorder(config)`, then `rec.Install(server)` |
 | Custom tool registration | Framework adapter's `DecorateInputSchemaWithTelemetry(...)` and `WrapHandler(...)` |
-| Stateless HTTP / serverless | `ResolveStatelessHTTPSession(...)` per request |
+| Official SDK v1.7.0 stateless HTTP | `rec.WrapStatelessHTTPHandler(handler)` — **required** for legacy-client attribution |
+| Stateless HTTP / serverless (pre-2026-07-28 hosts) | `ResolveStatelessHTTPSession(...)` per request |
 
 ### MCP 2026-07-28 (stateless protocol)
 
@@ -227,10 +228,15 @@ from the same handler. Under the hood the adapter now handles both eras:
   event ID at ingest.
 - **Session identity ladder.** `session_id_hint` resolves in priority order:
   1. `gen_ai.conversation.id` parsed from the `_meta` `baggage` trace slot,
-  2. the `X-Armature-Session-Seed` header,
-  3. the legacy transport session (`session.ID()` / echoed `Mcp-Session-Id`),
-  4. the process-scoped stdio ID when the request has no headers at all,
-  5. empty — ingest buckets sessionless events server-side. The SDK never
+  2. the `X-Armature-Stateless-Session-Id` repair header, set only by
+     `WrapStatelessHTTPHandler` (legacy-session repair below),
+  3. the `X-Armature-Session-Seed` header — unless the request also echoes an
+     `Mcp-Session-Id` minted from that seed, in which case the richer
+     identity-bearing id wins so one legacy conversation cannot split into
+     two sessions,
+  4. the legacy transport session (`session.ID()` / echoed `Mcp-Session-Id`),
+  5. the process-scoped stdio ID when the request has no headers at all,
+  6. empty — ingest buckets sessionless events server-side. The SDK never
      fabricates a per-request session.
 - **Raw `_meta` capture.** Each tool_call event carries the request's `_meta`
   verbatim as `metadata.request_meta` (JSON-capped at 4 KB with a
@@ -241,13 +247,58 @@ The mark3labs adapter is unchanged: mark3labs/mcp-go has no 2026-07-28
 support, and its legacy flows (including stateless minting below) work as
 before.
 
+### go-sdk v1.7.0 stateless: legacy-client session repair (required)
+
+`StreamableHTTPHandler{Stateless: true}` on go-sdk v1.7.0 serves
+pre-2026-07-28 clients (for example Claude Code 2.1.x today) but mints **no**
+`Mcp-Session-Id` for them: `ServerOptions.GetSessionID` is never consulted
+and the request header is ignored. Without repair, a legacy client through
+such a server silently loses session attribution — its `tool_call` events
+land in a server-side fallback bucket with a `null` client, split from the
+`initialize`'s `session_init` (which carries the client name and therefore a
+different fingerprint bucket).
+
+Wrap the HTTP handler with the analytics middleware — this is **required**
+for legacy-client attribution on v1.7.0 stateless servers:
+
+~~~go
+rec, err := official.NewRecorder(config) // or armatureanalytics.NewRecorder
+if err != nil {
+    return err
+}
+http.Handle("/mcp", rec.WrapStatelessHTTPHandler(mcpHandler))
+~~~
+
+On a legacy `initialize` POST the middleware mints the identity-bearing
+session id (`mcp_<name>_v_<version>_<uuid>`, honoring
+`X-Armature-Session-Seed` as the uuid seed — the `ResolveStatelessHTTPSession`
+scheme), attaches it as the response's `Mcp-Session-Id`, records the
+`session_init`, and hands the identity to the instrumented server behind it
+via the request context (`StatelessHTTPSessionFromRequest`) and the internal
+`X-Armature-Stateless-Session-Id` header — so the initialize POST's own
+events are attributed too. Conforming legacy clients echo the header on every
+later request, where the session-id ladder above picks it up. 2026-07-28
+requests carry no `initialize` and no session header and pass through
+untouched.
+
+Handlers that construct a per-request server should read the middleware's
+resolution from the request context instead of calling
+`ResolveStatelessHTTPSession` again (a second resolve of an initialize body
+mints a different id). The go-sdk's `MCPGODEBUG=allowsessionsinstateless=1`
+compatibility parameter restores the old header behavior instead, but it is
+documented as temporary; the middleware does not depend on it. The Go canary's
+`/mcp-official` endpoint (`canary/vercel/api/mcp-official`) exercises exactly
+this wiring. Wrap stateless handlers only — pre-v1.7.0 stateful transports
+mint their own session ids and need no repair.
+
 ### Stateless HTTP and serverless (pre-2026-07-28 hosts)
 
 The mint-on-initialize helper below applies to legacy-protocol hosts:
 mark3labs servers, and official-SDK hosts still on go-sdk <= v1.6. On go-sdk
-v1.7.0 stateless servers it is inert — the modern protocol has no initialize
-and the server ignores `Mcp-Session-Id` entirely (`GetSessionID` is never
-consulted) — and session identity comes from the ladder above instead.
+v1.7.0 stateless servers the transport-level wiring below is inert — the
+server ignores `Mcp-Session-Id` entirely and `GetSessionID` is never
+consulted — so use `WrapStatelessHTTPHandler` (previous section) there
+instead; the same mint-and-echo scheme then runs at the HTTP layer.
 
 Initialization and tool calls can land on different instances. Resolve every
 request before constructing its per-request MCP server/transport:
@@ -263,8 +314,8 @@ session := armatureanalytics.ResolveStatelessHTTPSession(
 )
 ~~~
 
-For the official SDK, set the initialize-only generator on the per-request
-server and keep the transport stateless:
+For the official SDK on go-sdk <= v1.6, set the initialize-only generator on
+the per-request server and keep the transport stateless:
 
 ~~~go
 s, shutdown := official.NewMCPServer(

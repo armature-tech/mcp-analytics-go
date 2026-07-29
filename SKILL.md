@@ -118,19 +118,24 @@ tool event. `Config.Redact` remains supported and runs first. Set
 
 ### Stateless HTTP / serverless sessions
 
-When initialize and tool calls can land on different instances, call
-`ResolveStatelessHTTPSession` for every parsed request. Use
-`session.SessionIDGenerator()` with the official SDK's per-request
-`mcp.ServerOptions.GetSessionID`, or `session.Mark3labsSessionIDManager()` with
-mark3labs `server.WithSessionIdManager`. Never use mark3labs
-`WithStateLess(true)` here: it intentionally returns no session ID and splits
-one conversation into one analytics session per call.
+When initialize and tool calls can land on different instances, resolve the
+session per request. On official go-sdk >= v1.7.0
+`StreamableHTTPHandler{Stateless: true}`, wrap the HTTP handler with
+`rec.WrapStatelessHTTPHandler(...)` — required for legacy-client attribution
+there, since that transport mints no `Mcp-Session-Id` and never consults
+`GetSessionID`; read the resolved session inside the handler with
+`StatelessHTTPSessionFromRequest` instead of resolving again. On go-sdk <=
+v1.6 use `ResolveStatelessHTTPSession` with `session.SessionIDGenerator()` on
+the per-request `mcp.ServerOptions.GetSessionID`; on mark3labs use
+`session.Mark3labsSessionIDManager()` with `server.WithSessionIdManager`.
+Never use mark3labs `WithStateLess(true)` here: it intentionally returns no
+session ID and splits one conversation into one analytics session per call.
 
 The client must echo the issued `Mcp-Session-Id`. Use `DeliveryAwait` so the
-serverless invocation does not freeze before ingestion finishes.
-Pass the live `r.Header` map into `StatelessHTTPInput`; if the client omits its
-echo, the resolver injects a one-off fallback there so the adapter preserves a
-distinct request boundary. Treat these IDs as attribution, not authentication.
+serverless invocation does not freeze before ingestion finishes. Pass the live
+`r.Header` map into `StatelessHTTPInput`. A request with neither an initialize
+message nor an echo resolves to an empty session that ingest buckets
+server-side. Treat these IDs as attribution, not authentication.
 
 ## 5. Verify behavior
 

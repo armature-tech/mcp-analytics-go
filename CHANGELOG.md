@@ -6,6 +6,28 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`WrapStatelessHTTPHandler`: legacy-client session repair for go-sdk
+  v1.7.0 stateless servers** (the Go equivalent of the TypeScript adapter's
+  `wrapMcpHandler`). `StreamableHTTPHandler{Stateless: true}` on v1.7.0 mints
+  no `Mcp-Session-Id` for pre-2026-07-28 clients (`ServerOptions.GetSessionID`
+  is never consulted), so a legacy client — real Claude Code 2.1.x today —
+  loses session attribution: its tool calls land in a heuristic fallback
+  bucket with a null client, split from the initialize's `session_init`
+  (verified live 2026-07-29). The middleware (on both
+  `armatureanalytics.Recorder` and `official.Recorder`) detects legacy-era
+  initialize POSTs, mints the identity-bearing session id via the
+  `ResolveStatelessHTTPSession` scheme, attaches the `Mcp-Session-Id`
+  response header, records the `session_init`, and propagates the identity to
+  the wrapped per-request server through the request context
+  (`StatelessHTTPSessionFromRequest`) and the internal
+  `X-Armature-Stateless-Session-Id` header — a new top-of-headers rung in the
+  official adapter's session-id ladder. Modern-era (2026-07-28 `_meta`
+  envelope) requests pass through untouched. The official adapter's seed rung
+  now also prefers an echoed `Mcp-Session-Id` that was minted from the
+  request's `X-Armature-Session-Seed` (TypeScript-adapter parity), so seeded
+  legacy conversations no longer split across the two headers. The Go canary
+  gained an `/mcp-official` endpoint exercising this wiring end to end.
+
 - **MCP 2026-07-28 (stateless protocol) support in the official adapter**,
   against github.com/modelcontextprotocol/go-sdk v1.7.0 (bumped from v1.6.1):
   - Per-request client identity: `clientInfo` / `protocolVersion` /

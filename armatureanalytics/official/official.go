@@ -163,6 +163,20 @@ func (r *Recorder) Install(s *mcp.Server) {
 	s.AddReceivingMiddleware(r.middleware)
 }
 
+// WrapStatelessHTTPHandler wraps a StreamableHTTPHandler{Stateless: true}
+// (go-sdk >= v1.7.0) to repair legacy-client session attribution: those
+// transports mint no Mcp-Session-Id and never consult
+// ServerOptions.GetSessionID, so pre-2026-07-28 clients otherwise lose their
+// session and client identity. Delegates to the core middleware; see
+// (*armatureanalytics.Recorder).WrapStatelessHTTPHandler.
+func (r *Recorder) WrapStatelessHTTPHandler(next http.Handler) http.Handler {
+	var core *armatureanalytics.Recorder
+	if r != nil {
+		core = r.core
+	}
+	return core.WrapStatelessHTTPHandler(next)
+}
+
 // Flush waits for in-flight analytics deliveries.
 func (r *Recorder) Flush(ctx context.Context) error {
 	if r == nil || r.core == nil {
@@ -455,13 +469,26 @@ func sessionKey(req mcp.Request) any {
 //
 //  1. `gen_ai.conversation.id` parsed from the `_meta` "baggage" trace slot
 //     (2026-07-28): the client's own conversation identity.
-//  2. The X-Armature-Session-Seed header, when HTTP headers are reachable.
-//  3. The legacy transport session: a non-empty session.ID(), a remembered
+//  2. The X-Armature-Stateless-Session-Id repair header, set only by
+//     (*armatureanalytics.Recorder).WrapStatelessHTTPHandler: the legacy
+//     session identity that middleware minted (or recovered from the client's
+//     echo) for this exact request. v1.7.0 stateless transports never see the
+//     minted id any other way — GetSessionID is not consulted and
+//     Mcp-Session-Id is ignored — so without this rung the initialize's own
+//     events would land in an empty session.
+//  3. The X-Armature-Session-Seed header, when HTTP headers are reachable.
+//     When the request ALSO echoes an Mcp-Session-Id that was minted FROM
+//     that seed (the stateless mint embeds the seed uuid in
+//     `mcp_<name>_v_<version>_<uuid>`), the two name the same session and the
+//     richer identity-bearing id wins the rung — otherwise the two headers
+//     would split one legacy conversation into two sessions. Mirrors the
+//     TypeScript adapter's ladder.
+//  4. The legacy transport session: a non-empty session.ID(), a remembered
 //     initialize-time ID, or the echoed Mcp-Session-Id header. Pre-2026-07-28
 //     traffic only — v1.7.0 stateless servers ignore the header entirely.
-//  4. The process-scoped stdio ID, only when the request has no headers at
+//  5. The process-scoped stdio ID, only when the request has no headers at
 //     all (stdio and in-memory transports serve one conversation per process).
-//  5. Empty. Ingest buckets sessionless events server-side; fabricating a
+//  6. Empty. Ingest buckets sessionless events server-side; fabricating a
 //     per-request identity would split every request into its own session,
 //     which is strictly worse than empty.
 func (r *Recorder) analyticsSessionID(req mcp.Request) string {
@@ -472,7 +499,14 @@ func (r *Recorder) analyticsSessionID(req mcp.Request) string {
 		return id
 	}
 	headers := requestHeaders(req)
+	if id := strings.TrimSpace(headers.Get(armatureanalytics.StatelessSessionHeader)); id != "" {
+		return id
+	}
 	if seed := strings.TrimSpace(headers.Get("X-Armature-Session-Seed")); seed != "" {
+		if echoed := strings.TrimSpace(headers.Get("Mcp-Session-Id")); echoed != "" &&
+			strings.HasSuffix(strings.ToLower(echoed), "_"+strings.ToLower(seed)) {
+			return echoed
+		}
 		return seed
 	}
 	if session := requestSession(req); session != nil {

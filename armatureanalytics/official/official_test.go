@@ -450,6 +450,48 @@ func TestSessionlessRequestsDoNotShareCachedIdentity(t *testing.T) {
 	}
 }
 
+func TestAnalyticsSessionIDHeaderLadder(t *testing.T) {
+	recorder, err := NewRecorder(Config{
+		Delivery: armatureanalytics.DeliveryAwait,
+		Emit:     func(context.Context, armatureanalytics.Batch) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := &mcp.ServerRequest[*mcp.InitializeParams]{
+		Params: &mcp.InitializeParams{},
+		Extra:  &mcp.RequestExtra{Header: http.Header{}},
+	}
+	const seed = "0f1e2d3c-4b5a-4978-8695-a4b3c2d1e0f9"
+	minted := "mcp_claude-code_v_2.1.36_" + seed
+
+	// Bare seed: the seed itself is the identity.
+	req.Extra.Header.Set("X-Armature-Session-Seed", seed)
+	if got := recorder.analyticsSessionID(req); got != seed {
+		t.Fatalf("seed-only hint = %q, want %q", got, seed)
+	}
+
+	// An echoed id minted FROM the seed names the same session; the richer
+	// identity-bearing id must win or one conversation splits in two.
+	req.Extra.Header.Set("Mcp-Session-Id", minted)
+	if got := recorder.analyticsSessionID(req); got != minted {
+		t.Fatalf("seed+matching-echo hint = %q, want %q", got, minted)
+	}
+
+	// An echo unrelated to the seed does not outrank it.
+	req.Extra.Header.Set("Mcp-Session-Id", "mcp_other_v_1_9e107d9d-5a5b-4c39-9d1e-1a2b3c4d5e6f")
+	if got := recorder.analyticsSessionID(req); got != seed {
+		t.Fatalf("seed+foreign-echo hint = %q, want %q", got, seed)
+	}
+
+	// The WrapStatelessHTTPHandler repair header outranks both: it is the
+	// identity the middleware resolved for this exact request.
+	req.Extra.Header.Set(armatureanalytics.StatelessSessionHeader, minted)
+	if got := recorder.analyticsSessionID(req); got != minted {
+		t.Fatalf("repair-header hint = %q, want %q", got, minted)
+	}
+}
+
 func TestDecorateDerivedStructSchema(t *testing.T) {
 	type input struct {
 		Message string `json:"message" jsonschema:"message to echo"`

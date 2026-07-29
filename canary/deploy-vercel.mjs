@@ -59,6 +59,10 @@ try {
   const previewUrl = output.match(/https:\/\/[A-Za-z0-9.-]+\.vercel\.app/g)?.at(-1);
   assert.ok(previewUrl, "Vercel deploy did not return a deployment URL");
   run(process.execPath, [join(root, "canary", "mcp-http-smoke.mjs"), "--url", `${previewUrl}/mcp`, "--intent", `${marker}/protocol-preview`, "--deployment", marker]);
+  // The official-SDK endpoint (go-sdk v1.7.0 stateless + the legacy-session
+  // repair middleware) is smoked on the preview only: the stable URL env var
+  // points at the mark3labs /mcp path.
+  run(process.execPath, [join(root, "canary", "mcp-http-smoke.mjs"), "--url", `${previewUrl}/mcp-official`, "--intent", `${marker}/official-preview`, "--deployment", marker]);
   runVercel(["promote", previewUrl, "--yes", "--timeout", "5m", "--scope", scope, ...authArgs], { cwd: project });
   run(process.execPath, [join(root, "canary", "mcp-http-smoke.mjs"), "--url", stableUrl, "--intent", `${marker}/protocol-stable`, "--deployment", marker]);
   if (process.env.GITHUB_OUTPUT) await writeFile(process.env.GITHUB_OUTPUT, `deployment_url=${previewUrl}\nstable_url=${stableUrl}\n`, { flag: "a" });

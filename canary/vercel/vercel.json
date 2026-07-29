@@ -3,9 +3,13 @@
   "functions": {
     "api/mcp.go": {
       "maxDuration": 60
+    },
+    "api/mcp-official/index.go": {
+      "maxDuration": 60
     }
   },
   "rewrites": [
-    { "source": "/mcp", "destination": "/api/mcp" }
+    { "source": "/mcp", "destination": "/api/mcp" },
+    { "source": "/mcp-official", "destination": "/api/mcp-official" }
   ]
 }
