@@ -94,6 +94,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Built-in secret redaction now catches AWS secret access keys written after
+  their name (`AWS_SECRET_ACCESS_KEY=…`, `aws_secret_access_key = …`,
+  `SecretAccessKey: …`) and replaces them with
+  `[redacted:aws-secret-access-key]`, per the updated shared contract. Only
+  the access key ID was caught before.
 - Tool-call previews now render values that own their JSON wire format (such
   as `*mcp.CallToolResult`) through that format instead of walking raw struct
   fields, removing framework noise like `"Result":{}` and `"Annotated":{}`

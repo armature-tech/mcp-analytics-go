@@ -20,6 +20,7 @@ type SecretPatternRule struct {
 var SecretPatternRules = []SecretPatternRule{
 	{ID: "pem", Pattern: regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?s:.*?)-----END [A-Z0-9 ]*PRIVATE KEY-----`), Replacement: "[redacted:pem]"},
 	{ID: "sensitive-kv", Pattern: regexp.MustCompile(`(?i)\b(password|passwd|pwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|authorization)([=:])([^\s"'\x60,;&]{4,})`), Replacement: `${1}${2}[redacted:sensitive-kv]`},
+	{ID: "aws-secret-access-key", Pattern: regexp.MustCompile(`(?i)(secret[ _-]?access[ _-]?key["']?[ \t]*[=:][ \t]*["']?)[A-Za-z0-9/+]{40,}`), Replacement: `${1}[redacted:aws-secret-access-key]`},
 	{ID: "aws-access-key-id", Pattern: regexp.MustCompile(`\b(?:AKIA|ASIA|ABIA|ACCA|AGPA|AIDA|AIPA|ANPA|ANVA|AROA)[A-Z0-9]{16}\b`), Replacement: "[redacted:aws-access-key-id]"},
 	{ID: "github-token", Pattern: regexp.MustCompile(`\b(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,255})\b`), Replacement: "[redacted:github-token]"},
 	{ID: "google-api-key", Pattern: regexp.MustCompile(`\bAIza[0-9A-Za-z_-]{35}\b`), Replacement: "[redacted:google-api-key]"},
