@@ -1,11 +1,15 @@
 package armatureanalytics
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log"
+	"strings"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 )
 
 func TestExtractTelemetryFromArgs_AllFields(t *testing.T) {
@@ -128,6 +132,93 @@ func TestAppendTelemetryHint_Idempotent(t *testing.T) {
 	}
 	if AppendTelemetryHint("") == "" {
 		t.Errorf("empty description should become the hint")
+	}
+	// A description already carrying the request_capability-aware hint (e.g.
+	// from an earlier AppendTelemetryHintWithOptions call) is also recognized,
+	// even by the config-agnostic function.
+	withCapability := "Echoes." + telemetryDescriptionHintWithCapability
+	if AppendTelemetryHint(withCapability) != withCapability {
+		t.Errorf("request_capability-hinted description modified")
+	}
+}
+
+// TestAppendTelemetryHintWithOptions_RequestCapabilityEnabled covers (a) from
+// TELEMETRY-CONTRACT.md's hint-decoration matrix: request_capability enabled
+// (the nil-Config default, same as an explicit pointer to true) appends the
+// hint that also points agents at request_capability.
+func TestAppendTelemetryHintWithOptions_RequestCapabilityEnabled(t *testing.T) {
+	want := "Echoes." + telemetryDescriptionHintWithCapability
+	if got := AppendTelemetryHintWithOptions("Echoes.", HintOptions{RequestCapability: true}); got != want {
+		t.Fatalf("nil-RequestCapability hint = %q, want %q", got, want)
+	}
+	if got := AppendTelemetryHintWithOptions("Echoes.", HintOptions{RequestCapability: true}); got != want {
+		t.Fatalf("explicit-on hint = %q, want %q", got, want)
+	}
+}
+
+// The hint only names request_capability on a server that lists it. A config
+// with a delivery path is not enough: a standalone server never registered it.
+func TestInstrumentToolNamesRequestCapabilityOnlyWhereRegistered(t *testing.T) {
+	handler := func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return mcp.NewToolResultText("ok"), nil
+	}
+	standalone := server.NewMCPServer("standalone", "0.0.1")
+	InstrumentToolWithConfig(Config{APIKey: "k"}, standalone, mcp.NewTool("weather", mcp.WithDescription("Weather.")), handler)
+	if got := standalone.GetTool("weather").Tool.Description; got != "Weather."+telemetryDescriptionHint {
+		t.Fatalf("standalone server hint = %q, want the plain hint", got)
+	}
+
+	constructed, shutdown := NewMCPServerWithConfig("constructed", "0.0.1", Config{Emit: func(context.Context, Batch) error { return nil }})
+	defer func() { _ = shutdown(context.Background()) }()
+	InstrumentTool(constructed, mcp.NewTool("weather", mcp.WithDescription("Weather.")), handler)
+	if got := constructed.GetTool("weather").Tool.Description; got != "Weather."+telemetryDescriptionHintWithCapability {
+		t.Fatalf("constructor server hint = %q, want the request_capability hint", got)
+	}
+
+	disabled, shutdownDisabled := NewMCPServerWithConfig("disabled", "0.0.1", Config{Emit: func(context.Context, Batch) error { return nil }, RequestCapability: boolPtr(false)})
+	defer func() { _ = shutdownDisabled(context.Background()) }()
+	InstrumentTool(disabled, mcp.NewTool("weather", mcp.WithDescription("Weather.")), handler)
+	if got := disabled.GetTool("weather").Tool.Description; got != "Weather."+telemetryDescriptionHint {
+		t.Fatalf("request_capability-off server hint = %q, want the plain hint", got)
+	}
+}
+
+// TestAppendTelemetryHintWithOptions_RequestCapabilityDisabled covers (b):
+// request_capability explicitly disabled keeps today's hint, byte-identical.
+func TestAppendTelemetryHintWithOptions_RequestCapabilityDisabled(t *testing.T) {
+	got := AppendTelemetryHintWithOptions("Echoes.", HintOptions{})
+	want := AppendTelemetryHint("Echoes.")
+	if got != want {
+		t.Fatalf("request_capability-off hint = %q, want byte-identical current hint %q", got, want)
+	}
+	if got != "Echoes."+telemetryDescriptionHint {
+		t.Fatalf("hint text drifted from telemetryDescriptionHint: %q", got)
+	}
+}
+
+// TestAppendTelemetryHintWithOptions_Idempotent covers (c): a description
+// already carrying any recognized hint is returned unchanged, regardless of
+// which Config produced it or is passed on the next call.
+func TestAppendTelemetryHintWithOptions_Idempotent(t *testing.T) {
+	enabled := HintOptions{RequestCapability: true}
+	disabled := HintOptions{}
+
+	once := AppendTelemetryHintWithOptions("Echoes.", enabled)
+	if AppendTelemetryHintWithOptions(once, enabled) != once {
+		t.Errorf("request_capability hint appended twice")
+	}
+	// Flipping cfg after the hint is already present must not re-decorate.
+	if AppendTelemetryHintWithOptions(once, disabled) != once {
+		t.Errorf("hint re-appended after cfg changed from enabled to disabled")
+	}
+	plain := AppendTelemetryHintWithOptions("Echoes.", disabled)
+	if AppendTelemetryHintWithOptions(plain, enabled) != plain {
+		t.Errorf("hint re-appended after cfg changed from disabled to enabled")
+	}
+	// The config-agnostic AppendTelemetryHint's output is recognized too.
+	legacyPath := AppendTelemetryHint("Echoes.")
+	if AppendTelemetryHintWithOptions(legacyPath, enabled) != legacyPath {
+		t.Errorf("config-aware append re-decorated a plain-hinted description")
 	}
 }
 
@@ -283,5 +374,103 @@ func TestWrapHandler_StripsTelemetryAndPropagatesViaContext(t *testing.T) {
 	}
 	if sawArgs["text"] != "hi" {
 		t.Errorf("inner handler lost real args: %v", sawArgs)
+	}
+}
+
+func TestAppendTelemetryHintFallsBackToTheTelemetrySentenceThenNothing(t *testing.T) {
+	enabled := HintOptions{RequestCapability: true}
+	disabled := HintOptions{}
+	for _, tc := range []struct {
+		cfg  HintOptions
+		hint string
+	}{{enabled, telemetryDescriptionHintWithCapability}, {disabled, telemetryDescriptionHint}} {
+		fullFits := strings.Repeat("a", MaxToolDescriptionLength-len(tc.hint))
+		if got := AppendTelemetryHintWithOptions(fullFits, tc.cfg); got != fullFits+tc.hint {
+			t.Fatalf("full hint should fit, got %d bytes", len(got))
+		}
+		sentenceOnly := fullFits + "a"
+		if got := AppendTelemetryHintWithOptions(sentenceOnly, tc.cfg); got != sentenceOnly+telemetrySentenceHint {
+			t.Fatalf("expected the telemetry sentence only, got %q", got[len(sentenceOnly):])
+		}
+		sentenceFits := strings.Repeat("a", MaxToolDescriptionLength-len(telemetrySentenceHint))
+		if got := AppendTelemetryHintWithOptions(sentenceFits, tc.cfg); len(got) != MaxToolDescriptionLength {
+			t.Fatalf("telemetry sentence should fit exactly, got %d bytes", len(got))
+		}
+		nothingFits := sentenceFits + "a"
+		if got := AppendTelemetryHintWithOptions(nothingFits, tc.cfg); got != nothingFits {
+			t.Fatalf("description should be unchanged, got %d bytes", len(got))
+		}
+	}
+	// Length is counted in UTF-8 bytes: "é" is one character but two bytes.
+	accented := strings.Repeat("é", 440)
+	if got := AppendTelemetryHintWithOptions(accented, enabled); got != accented+telemetrySentenceHint {
+		t.Fatalf("880-byte description should get the telemetry sentence only")
+	}
+	// The exported config-less helper applies the same guard.
+	tooLong := strings.Repeat("a", MaxToolDescriptionLength)
+	if got := AppendTelemetryHint(tooLong); got != tooLong {
+		t.Fatalf("AppendTelemetryHint must not exceed the limit")
+	}
+}
+
+func TestAppendTelemetryHintIsIdempotentAfterFallback(t *testing.T) {
+	enabled := HintOptions{RequestCapability: true}
+	for _, n := range []int{10, 900, 950, 1000} {
+		once := AppendTelemetryHintWithOptions(strings.Repeat("a", n), enabled)
+		if AppendTelemetryHintWithOptions(once, enabled) != once {
+			t.Fatalf("second pass changed a %d-byte description", n)
+		}
+		if AppendTelemetryHintWithOptions(once, HintOptions{}) != once {
+			t.Fatalf("second pass under another config changed a %d-byte description", n)
+		}
+	}
+}
+
+func TestAppendTelemetryHintSkipsTheRequestCapabilitySentenceTheCustomerWrote(t *testing.T) {
+	description := "Look up a customer. " + requestCapabilitySentence
+	got := AppendTelemetryHintWithOptions(description, HintOptions{RequestCapability: true})
+	if got != description+telemetrySentenceHint {
+		t.Fatalf("expected only the telemetry sentence, got %q", got)
+	}
+}
+
+func TestAppendTelemetryHintWarnsOncePerToolWhenShortened(t *testing.T) {
+	var buf bytes.Buffer
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	}()
+	tooLong := strings.Repeat("x", MaxToolDescriptionLength-10)
+	shortened := strings.Repeat("y", MaxToolDescriptionLength-150)
+	for i := 0; i < 2; i++ {
+		AppendTelemetryHintWithOptions(tooLong, HintOptions{RequestCapability: true, ToolName: "go_long_description_tool"})
+		AppendTelemetryHintWithOptions(shortened, HintOptions{RequestCapability: true, ToolName: "go_shortened_hint_tool"})
+	}
+	want := `[mcp-analytics] Tool "go_long_description_tool" description is too long to append the Armature telemetry hint without exceeding 1024 characters; leaving it unchanged. Telemetry is still collected.` + "\n" +
+		`[mcp-analytics] Tool "go_shortened_hint_tool" description is too long for the full Armature telemetry hint within 1024 characters; appended only the telemetry sentence.` + "\n"
+	if buf.String() != want {
+		t.Fatalf("unexpected warnings:\n%s", buf.String())
+	}
+}
+
+func TestInstrumentToolKeepsTelemetrySchemaWhenTheHintIsDropped(t *testing.T) {
+	s := server.NewMCPServer("long", "0.0.1")
+	description := strings.Repeat("z", MaxToolDescriptionLength)
+	tool := mcp.NewTool("go_schema_kept_tool", mcp.WithDescription(description))
+	InstrumentToolWithConfig(Config{APIKey: "k"}, s, tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return mcp.NewToolResultText("ok"), nil
+	})
+	registered := s.GetTool("go_schema_kept_tool")
+	if registered == nil {
+		t.Fatal("tool not registered")
+	}
+	if registered.Tool.Description != description {
+		t.Fatalf("description changed: %d bytes", len(registered.Tool.Description))
+	}
+	if _, ok := registered.Tool.InputSchema.Properties["telemetry"]; !ok {
+		t.Fatal("telemetry property should still be advertised")
 	}
 }

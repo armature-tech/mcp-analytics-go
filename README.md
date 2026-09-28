@@ -512,7 +512,12 @@ silently. For a manually constructed mark3labs server, call
 `armatureanalytics.AddRequestCapabilityTool(s, rec)` after installing the recorder
 and handle its returned error. The recorder is required so every acknowledged
 request reaches the unmet-demand signal pipeline; nil, disabled, and closed
-recorders are rejected.
+recorders are rejected. When `request_capability` is enabled for the server,
+the per-tool telemetry hint (see below) also points agents at it, so they
+know to call `request_capability` when no other tool fits. The SDK never pushes
+a description past 1024 characters (UTF-8 bytes): if the full hint does not
+fit it appends only the telemetry sentence, and if that does not fit either it
+leaves the description unchanged and logs a warning.
 
 ### Telemetry capture and privacy
 

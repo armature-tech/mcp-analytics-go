@@ -6,6 +6,34 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Per-tool telemetry hint now points agents at `request_capability`.** On a
+  server that lists the SDK-owned `request_capability` tool (registered by
+  `NewMCPServerWithConfig` in either package, the default once an `APIKey` or
+  `Emit` is configured, or by `AddRequestCapabilityTool` on a standalone
+  mark3labs server), `InstrumentTool` / `InstrumentToolWithConfig` append a
+  hint that also tells agents to call `request_capability` when no other tool
+  fits the user's request. Everywhere else the hint is byte-identical to
+  before. Appending stays idempotent: a description already carrying any
+  recognized hint is left unchanged. Owned/scrub-mode tools and the
+  `request_capability` tool itself are never decorated. New exported API:
+  `HintOptions`, `AppendTelemetryHintWithOptions`,
+  `MarkRequestCapabilityRegistered`, `RequestCapabilityRegistered`,
+  `ForgetRequestCapabilityServer`, and (official package)
+  `DecorateInputSchemaWithTelemetryWithOptions`. `AppendTelemetryHint` and
+  `DecorateInputSchemaWithTelemetry` keep the plain hint.
+
+- **Tool descriptions never exceed 1024 characters because of the hint.** Some
+  providers (Azure OpenAI, some OpenAI-compatible gateways) reject the whole
+  request when one tool description is longer than 1024 characters. The hint
+  helpers now count
+  UTF-8 bytes first: when the full hint does not fit they append only its
+  telemetry sentence, and when that does not fit either they leave the
+  description unchanged and log a warning once per tool. Customer text is
+  never truncated and the `telemetry` field is still advertised and collected.
+  A description that already asks for `request_capability` gets only the
+  telemetry sentence. New exported constant `MaxToolDescriptionLength`;
+  `HintOptions.ToolName` names the tool in the warning.
+
 - **`WrapStatelessHTTPHandler`: legacy-client session repair for go-sdk
   v1.7.0 stateless servers** (the Go equivalent of the TypeScript adapter's
   `wrapMcpHandler`). `StreamableHTTPHandler{Stateless: true}` on v1.7.0 mints

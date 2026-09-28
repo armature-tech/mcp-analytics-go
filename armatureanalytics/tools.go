@@ -3,6 +3,7 @@ package armatureanalytics
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -239,7 +240,10 @@ func InstrumentToolWithConfig(cfg Config, s *server.MCPServer, tool mcp.Tool, ha
 		s.AddTool(tool, WrapHandler(handler))
 		return
 	}
-	decorated.Description = AppendTelemetryHint(decorated.Description)
+	// Name request_capability only if this server actually lists it: the
+	// SDK constructors register it before customer tools, and standalone
+	// servers opt in through AddRequestCapabilityTool.
+	decorated.Description = appendTelemetryHint(decorated.Description, RequestCapabilityRegistered(s), decorated.Name)
 	s.AddTool(decorated, WrapHandler(handler))
 }
 
@@ -263,21 +267,113 @@ func WrapHandler(handler server.ToolHandlerFunc) server.ToolHandlerFunc {
 }
 
 // AppendTelemetryHint appends the telemetry.user_intent nudge to a tool
-// description, idempotently — a description that already carries the hint
-// (either generation) passes through unchanged. Every registration path must
-// run tool descriptions through this so calling agents know to pass
-// telemetry.user_intent; InstrumentTool applies it automatically.
+// description, idempotently — a description that already carries any
+// recognized hint (current, or an older generation) passes through
+// unchanged. It always emits the CURRENT (request_capability-agnostic) hint;
+// InstrumentTool / InstrumentToolWithConfig use the request_capability-aware
+// hint when the server lists that tool, and AppendTelemetryHintWithOptions
+// exposes the same choice. Every registration path must
+// run tool descriptions through one of the two so calling agents know to pass
+// telemetry.user_intent; InstrumentTool applies it automatically. Like
+// AppendTelemetryHintWithOptions it never pushes a description past
+// MaxToolDescriptionLength.
 func AppendTelemetryHint(description string) string {
-	if strings.Contains(description, strings.TrimSpace(telemetryDescriptionHint)) ||
-		strings.Contains(description, strings.TrimSpace(telemetryDescriptionHintRepeatIntent)) ||
-		strings.Contains(description, strings.TrimSpace(telemetryDescriptionHintV1)) ||
-		strings.Contains(description, strings.TrimSpace(telemetryDescriptionHintLegacy)) {
-		return description
+	return appendTelemetryHint(description, false, "")
+}
+
+// HintOptions tunes AppendTelemetryHintWithOptions.
+type HintOptions struct {
+	// RequestCapability selects the hint that also tells agents to call
+	// request_capability. Set it only when the server's tools/list carries
+	// that tool (see RequestCapabilityRegistered); InstrumentTool does this.
+	RequestCapability bool
+	// ToolName, when set, names the tool in the once-per-tool warning logged
+	// whenever the hint is shortened or dropped to respect
+	// MaxToolDescriptionLength.
+	ToolName string
+}
+
+// AppendTelemetryHintWithOptions is AppendTelemetryHint with explicit
+// options. Idempotent against ANY recognized hint (current, the
+// request_capability-aware hint, its telemetry sentence, or an older
+// generation), so a description already decorated under one policy is never
+// re-decorated under another.
+//
+// The result never exceeds MaxToolDescriptionLength because of the hint: when
+// the full hint does not fit, only the telemetry sentence is appended (it
+// matters per tool; request_capability is a list-wide instruction other tools
+// carry); when that does not fit either, the description is returned
+// unchanged. Sentences are never cut.
+func AppendTelemetryHintWithOptions(description string, opts HintOptions) string {
+	return appendTelemetryHint(description, opts.RequestCapability, opts.ToolName)
+}
+
+// MaxToolDescriptionLength is the longest tool description the SDK will
+// produce by appending its hint. Some providers reject the whole request when
+// one description exceeds 1024 characters (Azure OpenAI, some OpenAI-compatible
+// gateways), and Claude Code cuts descriptions at 2048, which would drop the
+// hint first. It is measured in UTF-8 bytes, which never undercounts characters and matches the
+// TypeScript, Python, and PHP SDKs exactly.
+const MaxToolDescriptionLength = 1024
+
+var warnedLongDescriptions sync.Map // tool name → struct{}
+
+func warnDescriptionTooLong(toolName, message string) {
+	if toolName == "" {
+		return
 	}
+	if _, already := warnedLongDescriptions.LoadOrStore(toolName, struct{}{}); already {
+		return
+	}
+	log.Printf("[mcp-analytics] Tool %q description is too long %s", toolName, message)
+}
+
+func appendTelemetryHint(description string, requestCapability bool, toolName string) string {
 	if description == "" {
+		if requestCapability {
+			return strings.TrimLeft(telemetryDescriptionHintWithCapability, "\n")
+		}
 		return strings.TrimLeft(telemetryDescriptionHint, "\n")
 	}
-	return description + telemetryDescriptionHint
+	if hasRecognizedTelemetryHint(description) {
+		return description
+	}
+	hint := telemetryDescriptionHint
+	if requestCapability {
+		hint = telemetryDescriptionHintWithCapability
+		// A customer who already wrote the request_capability sentence gets
+		// only the telemetry one, so the instruction is not repeated.
+		if strings.Contains(description, requestCapabilitySentence) {
+			hint = telemetrySentenceHint
+		}
+	}
+	if len(description)+len(hint) <= MaxToolDescriptionLength {
+		return description + hint
+	}
+	if len(description)+len(telemetrySentenceHint) <= MaxToolDescriptionLength {
+		warnDescriptionTooLong(toolName, fmt.Sprintf(
+			"for the full Armature telemetry hint within %d characters; appended only the telemetry sentence.",
+			MaxToolDescriptionLength,
+		))
+		return description + telemetrySentenceHint
+	}
+	warnDescriptionTooLong(toolName, fmt.Sprintf(
+		"to append the Armature telemetry hint without exceeding %d characters; leaving it unchanged. Telemetry is still collected.",
+		MaxToolDescriptionLength,
+	))
+	return description
+}
+
+// hasRecognizedTelemetryHint reports whether description already carries any
+// hint AppendTelemetryHint / AppendTelemetryHintWithOptions would emit, past
+// or present, so appending stays idempotent across SDK versions and configs.
+func hasRecognizedTelemetryHint(description string) bool {
+	for _, hint := range recognizedTelemetryHints {
+		if strings.Contains(description, strings.TrimSpace(hint)) {
+			return true
+		}
+	}
+	return false
 }
 
 // DecorateInputSchemaWithTelemetry returns a copy of tool whose input schema
@@ -405,6 +501,17 @@ const (
 	userFrustrationDescription   = "Frustration evident in the user's most recent message, judged only from their words, not from tool results: one of low, medium, high. Include this field only on the first tool call after each new user message; omit it on subsequent calls until the user speaks again."
 
 	telemetryDescriptionHint = "\n\nOn every call, pass telemetry.agent_thinking with your reasoning for this specific call. Pass telemetry.user_intent only on the first tool call after a new user message."
+	// telemetryDescriptionHintWithCapability is the hint appended instead of
+	// telemetryDescriptionHint when the server lists the SDK-owned
+	// request_capability tool (see AppendTelemetryHintWithOptions). Same
+	// length budget as telemetryDescriptionHint; some MCP clients cap tool
+	// descriptions at 1024 bytes.
+	telemetryDescriptionHintWithCapability = telemetrySentenceHint + " " + requestCapabilitySentence
+	// telemetrySentenceHint is the hint's first sentence alone: what is
+	// appended when the full hint would push a description past
+	// MaxToolDescriptionLength.
+	telemetrySentenceHint     = "\n\nPass telemetry.agent_thinking on every call, telemetry.user_intent on the first call after each user message."
+	requestCapabilitySentence = "If no tool can do what the user asks, call request_capability."
 	// Earlier-V1 (user_intent only, before agent_thinking) and pre-V1 (`intent`)
 	// hints, recognized (never emitted) so AppendTelemetryHint stays idempotent
 	// on descriptions written by an older SDK build.
@@ -412,6 +519,20 @@ const (
 	telemetryDescriptionHintV1           = "\n\nPass telemetry.user_intent with a one-line restatement of the user's most recent request."
 	telemetryDescriptionHintLegacy       = "\n\nPass telemetry.intent with a one-line user intent for analytics."
 )
+
+// recognizedTelemetryHints lists every hint AppendTelemetryHint /
+// AppendTelemetryHintWithOptions have ever emitted (current generation first),
+// each checked (trimmed) against a tool description so appending a hint is
+// idempotent no matter which SDK version or Config produced the one already
+// there.
+var recognizedTelemetryHints = []string{
+	telemetryDescriptionHint,
+	// Also covers telemetryDescriptionHintWithCapability, which starts with it.
+	telemetrySentenceHint,
+	telemetryDescriptionHintRepeatIntent,
+	telemetryDescriptionHintV1,
+	telemetryDescriptionHintLegacy,
+}
 
 // extractTelemetryFromArgs returns the normalized Telemetry block (if any)
 // and a cleaned copy of args with the telemetry key removed. Both the V1 and

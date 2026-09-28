@@ -104,6 +104,7 @@ func NewMCPServerWithConfig(name, version string, cfg Config, opts ...server.Ser
 
 	shutdown := Shutdown(func(ctx context.Context) error {
 		defer serverTelemetryConfigs.Delete(s)
+		defer ForgetRequestCapabilityServer(s)
 		if rec == nil {
 			return nil
 		}

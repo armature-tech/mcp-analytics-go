@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -60,7 +61,34 @@ func AddRequestCapabilityTool(s *server.MCPServer, recorder *Recorder) error {
 			return result, nil
 		},
 	)
+	MarkRequestCapabilityRegistered(s)
 	return nil
+}
+
+// requestCapabilityServers records the servers the SDK-owned request_capability
+// tool is registered on, so the per-tool hint names it only where tools/list
+// actually carries it (a config with a delivery path does not prove that).
+var requestCapabilityServers sync.Map // server pointer → struct{}
+
+// MarkRequestCapabilityRegistered records that the SDK-owned request_capability
+// tool is registered on s. AddRequestCapabilityTool and the official adapter
+// call it; InstrumentTool then points each tool's hint at request_capability.
+func MarkRequestCapabilityRegistered(s any) {
+	if s != nil {
+		requestCapabilityServers.Store(s, struct{}{})
+	}
+}
+
+// ForgetRequestCapabilityServer drops s from that registry (server shutdown).
+func ForgetRequestCapabilityServer(s any) {
+	requestCapabilityServers.Delete(s)
+}
+
+// RequestCapabilityRegistered reports whether MarkRequestCapabilityRegistered
+// ran for s.
+func RequestCapabilityRegistered(s any) bool {
+	_, ok := requestCapabilityServers.Load(s)
+	return ok
 }
 
 func markCapabilityResult(reservation *CapabilityReservation, result *mcp.CallToolResult) {

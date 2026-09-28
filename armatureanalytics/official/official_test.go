@@ -179,6 +179,81 @@ func TestOfficialSDKEndToEnd(t *testing.T) {
 	}
 }
 
+// TestOfficialSDKAdvertisedDescriptionMentionsRequestCapability is the
+// adapter-level check (TELEMETRY-CONTRACT.md hint-decoration matrix, case
+// (d)): with request_capability enabled (the default), the description the
+// server actually advertises over the wire — as a real client sees it via
+// ListTools — is byte-identical to what
+// armatureanalytics.AppendTelemetryHintWithOptions produces, and mentions
+// request_capability.
+func TestOfficialSDKAdvertisedDescriptionMentionsRequestCapability(t *testing.T) {
+	sink := newRecordingSink(t)
+	s, shutdown := NewMCPServerWithConfig(
+		&mcp.Implementation{Name: "official-request-capability-hint-test", Version: "1.0.0"},
+		nil,
+		// RequestCapability left nil: on by default, same as every other
+		// unconfigured field here.
+		Config{APIKey: "test-key", EndpointURL: sink.server.URL},
+	)
+	t.Cleanup(func() { _ = shutdown(context.Background()) })
+
+	InstrumentTool(s, &mcp.Tool{Name: "echo", Description: "Echo a value"},
+		func(_ context.Context, _ *mcp.CallToolRequest, input map[string]any) (*mcp.CallToolResult, map[string]any, error) {
+			return nil, map[string]any{"echo": input["message"]}, nil
+		},
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- s.Run(ctx, serverTransport) }()
+	t.Cleanup(func() { cancel(); <-serverDone })
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "official-client", Version: "2.0.0"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("connect client: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+
+	tools, err := session.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	var echo *mcp.Tool
+	for _, tool := range tools.Tools {
+		if tool.Name == "echo" {
+			echo = tool
+		}
+	}
+	if echo == nil {
+		t.Fatalf("echo tool not advertised: %#v", tools.Tools)
+	}
+
+	want := armatureanalytics.AppendTelemetryHintWithOptions("Echo a value", armatureanalytics.HintOptions{RequestCapability: true})
+	if echo.Description != want {
+		t.Fatalf("advertised description = %q, want %q", echo.Description, want)
+	}
+	if !strings.Contains(echo.Description, "request_capability") {
+		t.Fatalf("advertised description does not mention request_capability: %q", echo.Description)
+	}
+	// The request_capability tool itself is exposed alongside echo, but its
+	// own description is never hint-decorated.
+	var requestCapability *mcp.Tool
+	for _, tool := range tools.Tools {
+		if tool.Name == "request_capability" {
+			requestCapability = tool
+		}
+	}
+	if requestCapability == nil {
+		t.Fatalf("request_capability tool not advertised: %#v", tools.Tools)
+	}
+	if requestCapability.Description != requestCapabilityDescription {
+		t.Fatalf("request_capability description decorated: %q", requestCapability.Description)
+	}
+}
+
 func TestRequestCapabilityOptIn(t *testing.T) {
 	var batches []armatureanalytics.Batch
 	s, shutdown := NewMCPServerWithConfig(
@@ -938,5 +1013,26 @@ func waitForSessionCount(t *testing.T, recorder *Recorder, want int) {
 			t.Fatalf("session metadata count = %d, want %d", got, want)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Only servers that list request_capability get the hint that names it: a
+// standalone official server never registered the SDK-owned tool.
+func TestRequestCapabilityHintFollowsRegistration(t *testing.T) {
+	standalone := mcp.NewServer(&mcp.Implementation{Name: "standalone", Version: "0.0.1"}, nil)
+	if armatureanalytics.RequestCapabilityRegistered(standalone) {
+		t.Fatal("standalone server reported as listing request_capability")
+	}
+	constructed, shutdown := NewMCPServerWithConfig(
+		&mcp.Implementation{Name: "constructed", Version: "0.0.1"},
+		nil,
+		Config{Emit: func(context.Context, armatureanalytics.Batch) error { return nil }},
+	)
+	if !armatureanalytics.RequestCapabilityRegistered(constructed) {
+		t.Fatal("constructor server did not record request_capability")
+	}
+	_ = shutdown(context.Background())
+	if armatureanalytics.RequestCapabilityRegistered(constructed) {
+		t.Fatal("shutdown did not forget the server")
 	}
 }

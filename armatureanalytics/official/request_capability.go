@@ -70,4 +70,5 @@ func addRequestCapabilityTool(s *mcp.Server, recorder *Recorder) {
 		}
 		return result, nil, nil
 	})
+	armatureanalytics.MarkRequestCapabilityRegistered(s)
 }
