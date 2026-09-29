@@ -69,7 +69,8 @@ func resetOwnedTelemetryToolsForTests() {
 // stripped from the request args and attached to the context for the
 // recorder's hooks to pick up.
 //
-// The V1 schema fields are canonical. The pre-V1 spellings remain accepted on
+// CallPurpose is the public action summary accepted on input. Normalized
+// values keep the historical event field names. Older spellings are accepted on
 // input (clients holding a cached pre-V1 tool schema, callers passing a
 // Telemetry straight into WithTelemetry) and are normalized onto the V1
 // fields — with legacy mirrors filled back in — by NormalizeTelemetry before
@@ -77,8 +78,10 @@ func resetOwnedTelemetryToolsForTests() {
 // compatibility; it is ignored.
 type Telemetry struct {
 	// Deprecated: cached clients may still send this field. It is ignored.
-	UserTurn        int    `json:"user_turn,omitempty"`
-	UserIntent      string `json:"user_intent,omitempty"`
+	UserTurn    int    `json:"user_turn,omitempty"`
+	UserIntent  string `json:"user_intent,omitempty"`
+	CallPurpose string `json:"call_purpose,omitempty"`
+	// Deprecated: accepted for cached clients. Use CallPurpose for new code.
 	AgentThinking   string `json:"agent_thinking,omitempty"`
 	UserFrustration string `json:"user_frustration,omitempty"`
 	// Deprecated: pre-V1 spelling of UserIntent; still accepted.
@@ -87,6 +90,33 @@ type Telemetry struct {
 	Context string `json:"context,omitempty"`
 	// Deprecated: pre-V1 spelling of UserFrustration; still accepted.
 	FrustrationLevel string `json:"frustration_level,omitempty"`
+	// Preserves an explicitly blank call_purpose from JSON or tool arguments.
+	callPurposePresent bool
+}
+
+// UnmarshalJSON preserves call_purpose presence so an explicit empty string
+// overrides cached agent_thinking and context values. Other call_purpose
+// types are ignored so valid legacy fields remain available.
+func (t *Telemetry) UnmarshalJSON(data []byte) error {
+	type plain Telemetry
+	// Shadow the new input alias with raw JSON. The existing fields still use
+	// their typed decoder, preserving their previous validation behavior.
+	var decoded struct {
+		plain
+		CallPurpose json.RawMessage `json:"call_purpose"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	raw := strings.TrimSpace(string(decoded.CallPurpose))
+	if strings.HasPrefix(raw, `"`) {
+		if err := json.Unmarshal(decoded.CallPurpose, &decoded.plain.CallPurpose); err != nil {
+			return err
+		}
+		decoded.callPurposePresent = true
+	}
+	*t = Telemetry(decoded.plain)
+	return nil
 }
 
 // telemetryKey identifies the extracted Telemetry value on context.Context.
@@ -122,15 +152,20 @@ func TelemetryInputSchema() map[string]any {
 	return telemetrySchemaObject()
 }
 
-// NormalizeTelemetry canonicalizes t onto the V1 field names and fills the
-// legacy mirrors so both spellings always agree. Legacy spellings lose to an
-// explicit V1 value when both are present; UserFrustration only keeps
+// NormalizeTelemetry moves CallPurpose into the historical AgentThinking
+// storage field and fills legacy mirrors. CallPurpose takes precedence over
+// AgentThinking and Context. Explicit empty JSON or tool argument values also win; UserFrustration only keeps
 // low/medium/high. UserTurn is intentionally ignored. Matches the TS and
 // Python normalizers.
 func NormalizeTelemetry(t Telemetry) Telemetry {
 	out := Telemetry{}
 	out.UserIntent = firstNonEmpty(t.UserIntent, t.Intent)
-	out.AgentThinking = firstNonEmpty(t.AgentThinking, t.Context)
+	out.callPurposePresent = t.callPurposePresent && t.CallPurpose == ""
+	if t.callPurposePresent || t.CallPurpose != "" {
+		out.AgentThinking = t.CallPurpose
+	} else {
+		out.AgentThinking = firstNonEmpty(t.AgentThinking, t.Context)
+	}
 	out.UserFrustration = firstFrustration(t.UserFrustration, t.FrustrationLevel)
 	// Legacy mirrors so a not-yet-updated ingest keeps reading events built
 	// from this value.
@@ -165,8 +200,16 @@ func applyTelemetryFieldMap(t Telemetry, args any, fieldMap map[string]string) T
 	if t.UserIntent == "" && t.Intent == "" {
 		t.UserIntent = argString("user_intent")
 	}
-	if t.AgentThinking == "" && t.Context == "" {
-		t.AgentThinking = argString("agent_thinking")
+	if !t.callPurposePresent && t.CallPurpose == "" && t.AgentThinking == "" && t.Context == "" {
+		if key := fieldMap["call_purpose"]; key != "" {
+			if value, ok := m[key].(string); ok && value != "" {
+				t.CallPurpose = value
+				t.callPurposePresent = true
+			}
+		}
+		if !t.callPurposePresent {
+			t.AgentThinking = argString("agent_thinking")
+		}
 	}
 	if t.UserFrustration == "" && t.FrustrationLevel == "" {
 		t.UserFrustration = firstFrustration(argString("user_frustration"))
@@ -197,7 +240,7 @@ func firstFrustration(values ...string) string {
 // automatically supply their capture policy; standalone servers default to
 // capture enabled and can use InstrumentToolWithConfig explicitly. It
 // decorates the tool's input schema with an
-// optional `telemetry` object (user_intent / agent_thinking /
+// optional `telemetry` object (user_intent / call_purpose /
 // user_frustration), appends the telemetry nudge to the tool description,
 // and wraps the handler so that the telemetry arguments are stripped before
 // the handler runs but kept on the request context for the recorder's hooks
@@ -266,10 +309,10 @@ func WrapHandler(handler server.ToolHandlerFunc) server.ToolHandlerFunc {
 	}
 }
 
-// AppendTelemetryHint appends the telemetry.user_intent nudge to a tool
-// description, idempotently — a description that already carries any
-// recognized hint (current, or an older generation) passes through
-// unchanged. It always emits the CURRENT (request_capability-agnostic) hint;
+// AppendTelemetryHint appends the public task-context hint to a tool
+// description. Current hints stay unchanged. Known older SDK suffixes are
+// replaced so they no longer request private reasoning. It emits the current
+// request_capability-agnostic hint;
 // InstrumentTool / InstrumentToolWithConfig use the request_capability-aware
 // hint when the server lists that tool, and AppendTelemetryHintWithOptions
 // exposes the same choice. Every registration path must
@@ -294,10 +337,8 @@ type HintOptions struct {
 }
 
 // AppendTelemetryHintWithOptions is AppendTelemetryHint with explicit
-// options. Idempotent against ANY recognized hint (current, the
-// request_capability-aware hint, its telemetry sentence, or an older
-// generation), so a description already decorated under one policy is never
-// re-decorated under another.
+// options. Current hints stay idempotent across configurations. Known
+// historical SDK suffixes are migrated to the current public task context.
 //
 // The result never exceeds MaxToolDescriptionLength because of the hint: when
 // the full hint does not fit, only the telemetry sentence is appended (it
@@ -329,6 +370,7 @@ func warnDescriptionTooLong(toolName, message string) {
 }
 
 func appendTelemetryHint(description string, requestCapability bool, toolName string) string {
+	description = stripLegacyTelemetryHint(description)
 	if description == "" {
 		if requestCapability {
 			return strings.TrimLeft(telemetryDescriptionHintWithCapability, "\n")
@@ -364,11 +406,35 @@ func appendTelemetryHint(description string, requestCapability bool, toolName st
 	return description
 }
 
-// hasRecognizedTelemetryHint reports whether description already carries any
-// hint AppendTelemetryHint / AppendTelemetryHintWithOptions would emit, past
-// or present, so appending stays idempotent across SDK versions and configs.
+// stripLegacyTelemetryHint replaces only a known SDK suffix. Identical words
+// embedded in customer prose are left untouched.
+func stripLegacyTelemetryHint(description string) string {
+	for {
+		stripped := false
+		for _, hint := range legacyTelemetryHints {
+			for _, suffix := range []string{hint + " " + requestCapabilitySentence, hint} {
+				if description == strings.TrimLeft(suffix, "\n") {
+					return ""
+				}
+				if strings.HasSuffix(description, suffix) {
+					description = strings.TrimSuffix(description, suffix)
+					stripped = true
+					break
+				}
+			}
+			if stripped {
+				break
+			}
+		}
+		if !stripped {
+			return description
+		}
+	}
+}
+
+// hasRecognizedTelemetryHint keeps current hints idempotent across configs.
 func hasRecognizedTelemetryHint(description string) bool {
-	for _, hint := range recognizedTelemetryHints {
+	for _, hint := range []string{telemetryDescriptionHint, telemetrySentenceHint} {
 		if strings.Contains(description, strings.TrimSpace(hint)) {
 			return true
 		}
@@ -388,7 +454,7 @@ func hasRecognizedTelemetryHint(description string) bool {
 // advertises. InstrumentTool applies exactly this rule.
 //
 // Mirrors the TS SDK's decorateInputSchemaWithTelemetry: telemetry is added
-// under `properties`, is itself an object with user_intent / agent_thinking /
+// under `properties`, is itself an object with user_intent / call_purpose /
 // user_frustration, and is NEVER added to the schema's
 // `required` array. The Required list inside the telemetry object is also
 // empty by design — user_intent is a soft nudge.
@@ -477,9 +543,9 @@ func telemetrySchemaObject() map[string]any {
 				"type":        "string",
 				"description": userIntentDescription,
 			},
-			"agent_thinking": map[string]any{
+			"call_purpose": map[string]any{
 				"type":        "string",
-				"description": agentThinkingDescription,
+				"description": callPurposeDescription,
 			},
 			"user_frustration": map[string]any{
 				"type":        "string",
@@ -495,40 +561,25 @@ func telemetrySchemaObject() map[string]any {
 // byte-identical copies so agents see the same tool statements regardless of
 // the server's implementation language.
 const (
-	telemetryPropertyDescription = "Conversation telemetry. Include `agent_thinking` on every call. Include `user_intent` and `user_frustration` only on the first tool call after each new user message; omit them on subsequent calls while continuing the same turn."
-	userIntentDescription        = "What the user asked for in their most recent message, restated in one line. Include this field only on the first tool call after each new user message; omit it on subsequent calls until the user speaks again. If a new message preserves the same goal, repeat the same intent once. Stay faithful to the user's words; do not describe your plan. Omit argument values, PII, and secrets. Use English."
-	agentThinkingDescription     = "Your reasoning for this specific call: why this tool, why now, what you expect it to contribute to. Do not restate the user's request, that belongs in user_intent. Always provide this, even when the field is marked optional. Omit argument values, PII, secrets. Use English."
-	userFrustrationDescription   = "Frustration evident in the user's most recent message, judged only from their words, not from tool results: one of low, medium, high. Include this field only on the first tool call after each new user message; omit it on subsequent calls until the user speaks again."
-
-	telemetryDescriptionHint = "\n\nOn every call, pass telemetry.agent_thinking with your reasoning for this specific call. Pass telemetry.user_intent only on the first tool call after a new user message."
-	// telemetryDescriptionHintWithCapability is the hint appended instead of
-	// telemetryDescriptionHint when the server lists the SDK-owned
-	// request_capability tool (see AppendTelemetryHintWithOptions). Same
-	// length budget as telemetryDescriptionHint; some MCP clients cap tool
-	// descriptions at 1024 bytes.
-	telemetryDescriptionHintWithCapability = telemetrySentenceHint + " " + requestCapabilitySentence
-	// telemetrySentenceHint is the hint's first sentence alone: what is
-	// appended when the full hint would push a description past
-	// MaxToolDescriptionLength.
-	telemetrySentenceHint     = "\n\nPass telemetry.agent_thinking on every call, telemetry.user_intent on the first call after each user message."
-	requestCapabilitySentence = "If no tool can do what the user asks, call request_capability."
-	// Earlier-V1 (user_intent only, before agent_thinking) and pre-V1 (`intent`)
-	// hints, recognized (never emitted) so AppendTelemetryHint stays idempotent
-	// on descriptions written by an older SDK build.
+	telemetryPropertyDescription           = "Optional task context for usage analytics, based on the visible user request and the action performed by this tool."
+	userIntentDescription                  = "Generalized one-sentence summary of the task stated in the user's latest message. Describe actions and generic roles only. Replace all tool argument values with generic terms, including names, contacts, IDs, credentials, document titles, team names and filters. For example, 'List employees in the selected team.' Include only on the first tool call after each new user message; omit on later calls in the same turn. Use English."
+	callPurposeDescription                 = "Short public description of the action this tool performs toward the user's stated goal. Base it only on the visible request, the tool's function and its inputs. Use English. Omit names, contact details, identifiers, credentials and argument values. Generalize document titles, team names and filter values (for example, 'the selected team')."
+	userFrustrationDescription             = "Frustration expressed in the user's latest message: low when none is expressed, medium for explicit dissatisfaction, high for strong or repeated dissatisfaction. Use only the user's words. Include on the first tool call after each new user message; omit on later calls in the same turn."
+	telemetryDescriptionHint               = "\n\nInclude telemetry.call_purpose with a short description of this action. Include telemetry.user_intent and telemetry.user_frustration only on the first tool call after each new user message."
+	telemetrySentenceHint                  = telemetryDescriptionHint
+	requestCapabilitySentence              = "If no tool can do what the user asks, call request_capability."
+	telemetryDescriptionHintWithCapability = telemetryDescriptionHint + " " + requestCapabilitySentence
+	// Historical SDK suffixes are accepted only for migration, never emitted.
+	telemetryDescriptionHintReasoning    = "\n\nOn every call, pass telemetry.agent_thinking with your reasoning for this specific call. Pass telemetry.user_intent only on the first tool call after a new user message."
+	telemetrySentenceHintReasoning       = "\n\nPass telemetry.agent_thinking on every call, telemetry.user_intent on the first call after each user message."
 	telemetryDescriptionHintRepeatIntent = "\n\nPass telemetry.user_intent with a one-line restatement of the user's most recent request, and telemetry.agent_thinking with your reasoning for making this specific call."
 	telemetryDescriptionHintV1           = "\n\nPass telemetry.user_intent with a one-line restatement of the user's most recent request."
 	telemetryDescriptionHintLegacy       = "\n\nPass telemetry.intent with a one-line user intent for analytics."
 )
 
-// recognizedTelemetryHints lists every hint AppendTelemetryHint /
-// AppendTelemetryHintWithOptions have ever emitted (current generation first),
-// each checked (trimmed) against a tool description so appending a hint is
-// idempotent no matter which SDK version or Config produced the one already
-// there.
-var recognizedTelemetryHints = []string{
-	telemetryDescriptionHint,
-	// Also covers telemetryDescriptionHintWithCapability, which starts with it.
-	telemetrySentenceHint,
+var legacyTelemetryHints = []string{
+	telemetryDescriptionHintReasoning,
+	telemetrySentenceHintReasoning,
 	telemetryDescriptionHintRepeatIntent,
 	telemetryDescriptionHintV1,
 	telemetryDescriptionHintLegacy,
@@ -564,8 +615,12 @@ func extractTelemetryFromArgs(args map[string]any) (Telemetry, map[string]any) {
 		} else if s, ok := v["intent"].(string); ok {
 			t.Intent = s
 		}
+		callPurpose, hasCallPurpose := v["call_purpose"].(string)
 		agentThinking, hasAgentThinking := v["agent_thinking"].(string)
-		if hasAgentThinking {
+		if hasCallPurpose {
+			t.CallPurpose = callPurpose
+			t.callPurposePresent = true
+		} else if hasAgentThinking {
 			t.AgentThinking = agentThinking
 		} else if s, ok := v["context"].(string); ok {
 			t.Context = s

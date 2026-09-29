@@ -91,7 +91,7 @@ type Config struct {
 	RequestCapability *bool
 
 	// CaptureTelemetry is the master switch for conversation-derived telemetry
-	// (user_intent, agent_thinking, user_frustration). nil or true
+	// (user_intent, call_purpose, user_frustration). nil or true
 	// means on. When false the SDK injects no telemetry schema, appends no
 	// description nudges (see InstrumentToolWithConfig), and never exports
 	// telemetry values — including values sent by clients holding a cached
@@ -116,7 +116,8 @@ type Config struct {
 
 	// TelemetryFieldMap opts specific customer-owned argument fields into
 	// export as Armature telemetry (TELEMETRY-CONTRACT.md). Keys are the V1
-	// telemetry field names (user_intent, agent_thinking, user_frustration);
+	// telemetry field names (user_intent, call_purpose, user_frustration);
+	// agent_thinking remains accepted as a legacy mapping key.
 	// values are top-level argument property names to READ
 	// (never strip) from the tool's arguments. Ignored while CaptureTelemetry
 	// is false.

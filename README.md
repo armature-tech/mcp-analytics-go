@@ -158,7 +158,7 @@ official.InstrumentTool(s, &mcp.Tool{
 
 | Understand demand | Find what breaks | Improve with context |
 | --- | --- | --- |
-| See which tools and use cases people actually need. | Surface failures, retries, latency, and dead ends. | Connect every call to user intent and agent reasoning. |
+| See which tools and use cases people actually need. | Surface failures, retries, latency, and dead ends. | Connect every call to user intent and the public purpose of the action. |
 
 No custom event schema. No logging pipeline. No changes to your tool handlers.
 
@@ -178,7 +178,7 @@ The wire format matches the [TypeScript SDK](https://github.com/armature-tech/mc
 Armature instruments the boundary around every tool call:
 
 1. **InstrumentTool** adds an optional **telemetry** block to the tool’s input schema.
-2. The agent can attach user intent, reasoning, and frustration to the call.
+2. The agent can attach user intent, a public action summary, and expressed frustration to the call.
 3. The SDK removes telemetry before your handler receives the arguments.
 4. Hooks capture timing and outcome, then send truncated previews to your dashboard.
 
@@ -186,13 +186,13 @@ Armature instruments the boundary around every tool call:
 {
   "telemetry": {
     "user_intent": "Check whether the customer's last payment succeeded",
-    "agent_thinking": "The payment lookup tool provides the requested status",
+    "call_purpose": "The payment lookup tool provides the requested status",
     "user_frustration": "low"
   }
 }
 ~~~
 
-All telemetry fields are optional. Send **agent_thinking** on every call; send **user_intent** and **user_frustration** only on the first call after each new user message. Their absence on later calls means the same turn continues. The earlier aliases remain accepted, while cached **user_turn** values are ignored.
+All telemetry fields are optional. **call_purpose** describes the public action from the visible request and tool inputs. It must omit private reasoning and argument values. Send **call_purpose** on every call; send **user_intent** and **user_frustration** only on the first call after each new user message. Their absence on later calls means the same turn continues. The cached aliases **agent_thinking** and **context** remain accepted. **call_purpose** takes precedence, including an explicit empty string from a tool call. Events keep the historical **agent_thinking** and **context** storage fields. Cached **user_turn** values are ignored.
 
 > **Privacy:** Armature is observability, not authentication. Keep your existing MCP authentication and authorization in place. Do not put secrets in tool arguments or telemetry fields.
 
@@ -502,6 +502,10 @@ accepts one required `capability` string and uses this description exactly:
 
 > Request a capability that is not provided by the currently available tools. Use this when a capability is required to complete the user’s request and no existing tool can perform it.
 
+The `capability` argument asks for one English sentence. It explicitly requests
+translation when the user writes in another language. Summaries use generic
+actions and roles, and omit personal details and tool argument values.
+
 Calls flow through the normal analytics hooks and feed Armature's unmet-demand
 signals. `RequestCapability` is a `*bool`: `nil` means on (the default); set it
 to a pointer to `false` to disable. The tool is also suppressed when `Disabled`
@@ -521,11 +525,11 @@ leaves the description unchanged and logs a warning.
 
 ### Telemetry capture and privacy
 
-`InstrumentTool` injects an optional `telemetry` object (`user_intent`, `agent_thinking`, `user_frustration`) into each wrapped tool's input schema. This is conversation-derived data: if your deployment cannot disclose it — for example in a privacy policy required for an app-store submission — set **CaptureTelemetry** to a false pointer and register tools through `InstrumentToolWithConfig` (both packages provide it). With capture off, tool schemas and descriptions pass through completely untouched, and telemetry sent by clients holding an older cached schema is stripped and never delivered anywhere (ingest or `OnError`). Tool-call and session analytics keep working without the conversational fields.
+`InstrumentTool` injects an optional `telemetry` object (`user_intent`, `call_purpose`, `user_frustration`) into each wrapped tool's input schema. This is conversation-derived data: if your deployment cannot disclose it (for example in a privacy policy required for an app-store submission), set **CaptureTelemetry** to a false pointer and register tools through `InstrumentToolWithConfig` (both packages provide it). With capture off, tool schemas and descriptions pass through completely untouched, and telemetry sent by clients holding an older cached schema is stripped and never delivered anywhere (ingest or `OnError`). Tool-call and session analytics keep working without the conversational fields.
 
 Disclosure summary for privacy policies: with capture **on**, the SDK collects tool names, tool call inputs/outputs (size-capped previews), error messages, timing, a one-way hash of the actor seed, the verbatim `ActorIdentifier` when configured, client name/version, and the agent-supplied `telemetry` fields above; recipients are your Armature workspace. With capture **off**, the `telemetry` fields are not collected.
 
-If a tool's own input schema already declares a top-level `telemetry` property, the SDK treats that field as **yours**: the schema, description, and arguments pass through untouched (including in the recorder hooks and middleware), nothing is interpreted as Armature telemetry, and a warning is logged once at registration. To export an existing, semantically equivalent field, opt in explicitly with **TelemetryFieldMap** — e.g. `map[string]string{"user_intent": "purpose"}` reads (never strips) the tool's `purpose` argument into `user_intent`. Explicit telemetry values always win over mapped ones, and the map is ignored while capture is off.
+If a tool's own input schema already declares a top-level `telemetry` property, the SDK treats that field as **yours**: the schema, description, and arguments pass through untouched (including in the recorder hooks and middleware), nothing is interpreted as Armature telemetry, and a warning is logged once at registration. To export an existing, semantically equivalent field, opt in explicitly with **TelemetryFieldMap**. For example, `map[string]string{"call_purpose": "purpose"}` reads the tool's `purpose` argument into the historical `agent_thinking` event field. It preserves the original argument. The legacy mapping key `agent_thinking` remains accepted. Explicit telemetry values always win over mapped ones, and the map is ignored while capture is off.
 
 ### Redaction and binary payloads
 
@@ -570,7 +574,7 @@ Each **tool_call** event includes:
 - Start time, finish time, and duration
 - Session, client, and protocol information
 - Hashed actor identifier
-- Optional user intent, agent reasoning, and frustration
+- Optional user intent, public action summaries, and expressed frustration
 
 Each session emits one deduplicated **session_init** event: at the initialize
 handshake for pre-2026-07-28 clients, or on first sight of a new session

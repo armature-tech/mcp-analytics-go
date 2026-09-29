@@ -16,6 +16,13 @@ behavior. The SDK adds an optional `telemetry` object to tool input schemas,
 removes it before handlers run, and asynchronously sends authenticated events
 to Armature.
 
+The optional public fields are `user_intent`, `call_purpose`, and
+`user_frustration`. Use a short action summary for `call_purpose`. Base it on
+the visible request and tool function. Do not collect private reasoning.
+Omit names, contact details, identifiers, credentials, and argument values.
+Send intent and frustration only on the first call after a new user message.
+Historical `agent_thinking` and `context` inputs remain accepted.
+
 ## 1. Detect the MCP framework
 
 Inspect `go.mod` and server construction before editing anything.
@@ -143,7 +150,8 @@ Do all of these:
 
 1. Run formatting, `go mod tidy`, `go vet ./...`, and the repo's tests.
 2. List tools through a real in-process MCP client and confirm an instrumented
-   tool schema contains optional `telemetry.user_intent`.
+   tool schema contains optional `telemetry.user_intent`, `call_purpose`, and
+   `user_frustration`, with no `agent_thinking` property.
 3. Call that tool with `telemetry.user_intent` and confirm the handler receives
    its original arguments without the top-level `telemetry` property.
 4. Point `EndpointURL` at an `httptest.Server`, drain the recorder, and assert a

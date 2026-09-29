@@ -42,7 +42,7 @@ func TestProductionPlatformSessionIsolation(t *testing.T) {
 		}{{"call-1", false}, {"call-2", true}} {
 			call, failed := step.call, step.failed
 			started := time.Now()
-			telemetry := armatureanalytics.Telemetry{AgentThinking: "exercise the canary path"}
+			telemetry := armatureanalytics.Telemetry{CallPurpose: "exercise the canary path"}
 			if call == "call-1" {
 				telemetry.UserIntent = marker
 			}

@@ -125,7 +125,7 @@ func TestOfficialSDKEndToEnd(t *testing.T) {
 			"telemetry": map[string]any{
 				"user_turn":        2,
 				"user_intent":      "verify the official adapter",
-				"agent_thinking":   "the echo tool exercises a typed call",
+				"call_purpose":     "the echo tool exercises a typed call",
 				"user_frustration": "low",
 			},
 		},
@@ -173,6 +173,9 @@ func TestOfficialSDKEndToEnd(t *testing.T) {
 	}
 	if toolEvent.Metadata["user_intent"] != "verify the official adapter" {
 		t.Fatalf("user_intent = %#v", toolEvent.Metadata["user_intent"])
+	}
+	if toolEvent.Metadata["agent_thinking"] != "the echo tool exercises a typed call" {
+		t.Fatalf("call_purpose was not stored in the compatible field: %#v", toolEvent.Metadata["agent_thinking"])
 	}
 	if toolEvent.Metadata["client_name"] != "official-client" {
 		t.Fatalf("tool client_name = %#v, want official-client", toolEvent.Metadata["client_name"])

@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- The `request_capability` argument description explicitly requests an English
+  summary, including translation of requests written in other languages.
+  Summaries use generic actions and roles and omit argument values.
+
+- Tool schemas now request `call_purpose`, a public action summary from the
+  visible request and tool inputs. They no longer request internal reasoning.
+  Known historical SDK description suffixes migrate to the new wording.
+  Customer text and the 1024-byte UTF-8 budget are preserved.
+- `Telemetry.CallPurpose` and `TelemetryFieldMap["call_purpose"]` are supported.
+  Cached `agent_thinking` and `context` inputs remain accepted. A present
+  `call_purpose` string wins, including an empty value from JSON or tool arguments.
+  Event storage keeps the historical `agent_thinking` and `context` fields.
+
 - **The `request_capability` registry no longer retains servers.** It keys on
   weak pointers, and an entry is dropped once its server is garbage collected,
   so a standalone server that is never shut down through the SDK is not kept
@@ -21,9 +34,9 @@ All notable changes to this project will be documented in this file.
   `Emit` is configured, or by `AddRequestCapabilityTool` on a standalone
   mark3labs server), `InstrumentTool` / `InstrumentToolWithConfig` append a
   hint that also tells agents to call `request_capability` when no other tool
-  fits the user's request. Everywhere else the hint is byte-identical to
-  before. Appending stays idempotent: a description already carrying any
-  recognized hint is left unchanged. Owned/scrub-mode tools and the
+  fits the user's request. Other servers receive the public task-context hint without that sentence.
+  Current hints stay idempotent. Known older SDK suffixes migrate to the
+  current wording. Owned/scrub-mode tools and the
   `request_capability` tool itself are never decorated. New exported API:
   `HintOptions`, `AppendTelemetryHintWithOptions`,
   `MarkRequestCapabilityRegistered`, `RequestCapabilityRegistered`,

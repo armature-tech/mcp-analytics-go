@@ -116,19 +116,12 @@ func TestAppendTelemetryHint_Idempotent(t *testing.T) {
 	if AppendTelemetryHint(once) != once {
 		t.Errorf("hint appended twice")
 	}
-	// A description written by an earlier-V1 (user_intent only) or pre-V1 SDK
-	// build keeps its old hint without gaining a second one.
-	v1 := "Echoes." + telemetryDescriptionHintV1
-	if AppendTelemetryHint(v1) != v1 {
-		t.Errorf("earlier-V1-hinted description modified")
-	}
-	repeatedIntent := "Echoes." + telemetryDescriptionHintRepeatIntent
-	if AppendTelemetryHint(repeatedIntent) != repeatedIntent {
-		t.Errorf("prior repeated-intent description modified")
-	}
-	legacy := "Echoes." + telemetryDescriptionHintLegacy
-	if AppendTelemetryHint(legacy) != legacy {
-		t.Errorf("legacy-hinted description modified")
+	// Known historical SDK suffixes migrate to the public task-context hint.
+	for _, hint := range legacyTelemetryHints {
+		old := "Echoes." + hint
+		if got := AppendTelemetryHint(old); got != once {
+			t.Errorf("historical hint was not migrated: %q", got)
+		}
 	}
 	if AppendTelemetryHint("") == "" {
 		t.Errorf("empty description should become the hint")
@@ -282,7 +275,7 @@ func TestDecorateInputSchemaWithTelemetry_AddsOptionalTelemetry(t *testing.T) {
 	if _, ok := props["user_turn"]; ok {
 		t.Errorf("removed user_turn sub-property still advertised")
 	}
-	for _, key := range []string{"user_intent", "agent_thinking", "user_frustration"} {
+	for _, key := range []string{"user_intent", "call_purpose", "user_frustration"} {
 		if _, ok := props[key]; !ok {
 			t.Errorf("missing %s sub-property", key)
 		}
@@ -389,8 +382,12 @@ func TestAppendTelemetryHintFallsBackToTheTelemetrySentenceThenNothing(t *testin
 			t.Fatalf("full hint should fit, got %d bytes", len(got))
 		}
 		sentenceOnly := fullFits + "a"
-		if got := AppendTelemetryHintWithOptions(sentenceOnly, tc.cfg); got != sentenceOnly+telemetrySentenceHint {
-			t.Fatalf("expected the telemetry sentence only, got %q", got[len(sentenceOnly):])
+		want := sentenceOnly
+		if len(tc.hint) > len(telemetrySentenceHint) {
+			want += telemetrySentenceHint
+		}
+		if got := AppendTelemetryHintWithOptions(sentenceOnly, tc.cfg); got != want {
+			t.Fatalf("unexpected fallback: %q", got[len(sentenceOnly):])
 		}
 		sentenceFits := strings.Repeat("a", MaxToolDescriptionLength-len(telemetrySentenceHint))
 		if got := AppendTelemetryHintWithOptions(sentenceFits, tc.cfg); len(got) != MaxToolDescriptionLength {
@@ -402,9 +399,9 @@ func TestAppendTelemetryHintFallsBackToTheTelemetrySentenceThenNothing(t *testin
 		}
 	}
 	// Length is counted in UTF-8 bytes: "é" is one character but two bytes.
-	accented := strings.Repeat("é", 440)
+	accented := strings.Repeat("é", (MaxToolDescriptionLength-len(telemetrySentenceHint))/2)
 	if got := AppendTelemetryHintWithOptions(accented, enabled); got != accented+telemetrySentenceHint {
-		t.Fatalf("880-byte description should get the telemetry sentence only")
+		t.Fatalf("UTF-8 description should get the telemetry hint only")
 	}
 	// The exported config-less helper applies the same guard.
 	tooLong := strings.Repeat("a", MaxToolDescriptionLength)
@@ -444,7 +441,7 @@ func TestAppendTelemetryHintWarnsOncePerToolWhenShortened(t *testing.T) {
 		log.SetFlags(prevFlags)
 	}()
 	tooLong := strings.Repeat("x", MaxToolDescriptionLength-10)
-	shortened := strings.Repeat("y", MaxToolDescriptionLength-150)
+	shortened := strings.Repeat("y", MaxToolDescriptionLength-len(telemetrySentenceHint))
 	for i := 0; i < 2; i++ {
 		AppendTelemetryHintWithOptions(tooLong, HintOptions{RequestCapability: true, ToolName: "go_long_description_tool"})
 		AppendTelemetryHintWithOptions(shortened, HintOptions{RequestCapability: true, ToolName: "go_shortened_hint_tool"})

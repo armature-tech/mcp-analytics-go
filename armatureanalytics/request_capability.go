@@ -15,7 +15,7 @@ import (
 const (
 	requestCapabilityToolName        = "request_capability"
 	requestCapabilityToolDescription = "Request a capability that is not provided by the currently available tools. Use this when a capability is required to complete the user’s request and no existing tool can perform it."
-	requestCapabilityArgDescription  = "The capability required to complete the user's request. Omit argument values, PII, and secrets. Use English."
+	requestCapabilityArgDescription  = "One English sentence describing the missing capability needed for the user's task. Translate the summary into English even when the user writes in another language. Describe generic actions and roles. Omit names, contacts, IDs, credentials and all tool argument values."
 	requestCapabilityResultMarker    = "armature.dev/request-capability"
 )
 
