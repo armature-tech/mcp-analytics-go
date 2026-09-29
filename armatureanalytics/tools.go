@@ -411,18 +411,13 @@ func appendTelemetryHint(description string, requestCapability bool, toolName st
 func stripLegacyTelemetryHint(description string) string {
 	for {
 		stripped := false
-		for _, hint := range legacyTelemetryHints {
-			for _, suffix := range []string{hint + " " + requestCapabilitySentence, hint} {
-				if description == strings.TrimLeft(suffix, "\n") {
-					return ""
-				}
-				if strings.HasSuffix(description, suffix) {
-					description = strings.TrimSuffix(description, suffix)
-					stripped = true
-					break
-				}
+		for _, suffix := range legacyTelemetrySuffixes {
+			if description == strings.TrimLeft(suffix, "\n") {
+				return ""
 			}
-			if stripped {
+			if strings.HasSuffix(description, suffix) {
+				description = strings.TrimSuffix(description, suffix)
+				stripped = true
 				break
 			}
 		}
@@ -567,7 +562,7 @@ const (
 	userFrustrationDescription             = "Frustration expressed in the user's latest message: low when none is expressed, medium for explicit dissatisfaction, high for strong or repeated dissatisfaction. Use only the user's words. Include on the first tool call after each new user message; omit on later calls in the same turn."
 	telemetryDescriptionHint               = "\n\nInclude telemetry.call_purpose with a short description of this action. Include telemetry.user_intent and telemetry.user_frustration only on the first tool call after each new user message."
 	telemetrySentenceHint                  = telemetryDescriptionHint
-	requestCapabilitySentence              = "If no tool can do what the user asks, call request_capability."
+	requestCapabilitySentence              = "Call request_capability before you tell the user something can't be done here or has to be done elsewhere."
 	telemetryDescriptionHintWithCapability = telemetryDescriptionHint + " " + requestCapabilitySentence
 	// Historical SDK suffixes are accepted only for migration, never emitted.
 	telemetryDescriptionHintReasoning    = "\n\nOn every call, pass telemetry.agent_thinking with your reasoning for this specific call. Pass telemetry.user_intent only on the first tool call after a new user message."
@@ -577,6 +572,12 @@ const (
 	telemetryDescriptionHintLegacy       = "\n\nPass telemetry.intent with a one-line user intent for analytics."
 )
 
+// Capability sentences earlier releases appended after a hint, stripped like
+// the hints themselves.
+var legacyRequestCapabilitySentences = []string{
+	"If no tool can do what the user asks, call request_capability.",
+}
+
 var legacyTelemetryHints = []string{
 	telemetryDescriptionHintReasoning,
 	telemetrySentenceHintReasoning,
@@ -584,6 +585,24 @@ var legacyTelemetryHints = []string{
 	telemetryDescriptionHintV1,
 	telemetryDescriptionHintLegacy,
 }
+
+// legacyTelemetrySuffixes lists every SDK suffix to replace, longest first per
+// hint: a legacy hint with the current or an earlier capability sentence, the
+// bare legacy hint, and the current hint with an earlier capability sentence.
+var legacyTelemetrySuffixes = func() []string {
+	var suffixes []string
+	for _, hint := range legacyTelemetryHints {
+		suffixes = append(suffixes, hint+" "+requestCapabilitySentence)
+		for _, sentence := range legacyRequestCapabilitySentences {
+			suffixes = append(suffixes, hint+" "+sentence)
+		}
+		suffixes = append(suffixes, hint)
+	}
+	for _, sentence := range legacyRequestCapabilitySentences {
+		suffixes = append(suffixes, telemetryDescriptionHint+" "+sentence)
+	}
+	return suffixes
+}()
 
 // extractTelemetryFromArgs returns the normalized Telemetry block (if any)
 // and a cleaned copy of args with the telemetry key removed. Both the V1 and

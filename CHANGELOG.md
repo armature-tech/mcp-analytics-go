@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- **`request_capability` is worded so agents call it.** Its description now
+  says it records the request, changes no data and contacts no one, and
+  applies when the agent sends the user to an app, a website or a manual step.
+  The hint's last sentence is now "Call request_capability before you tell the
+  user something can't be done here or has to be done elsewhere." A
+  description ending with the previous sentence is upgraded. The full hint is
+  45 bytes longer (299). In Claude Code, against tools that send users to
+  their app, Sonnet 5 called it for 38 of 42 unsupported requests, up from 16,
+  and never on supported ones.
+
 ### Fixed
 
 - The `request_capability` argument description explicitly requests an English

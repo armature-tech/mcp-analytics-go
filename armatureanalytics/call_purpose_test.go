@@ -208,6 +208,21 @@ func TestLegacyHintMigrationPreservesCustomerText(t *testing.T) {
 	}
 }
 
+// A hint ending in an earlier request_capability sentence is upgraded to the
+// current one, whichever telemetry sentence precedes it.
+func TestEarlierRequestCapabilitySentenceIsUpgraded(t *testing.T) {
+	opts := HintOptions{RequestCapability: true}
+	base := "Recherche les documents demandés."
+	want := AppendTelemetryHintWithOptions(base, opts)
+	for _, hint := range append([]string{telemetryDescriptionHint}, legacyTelemetryHints...) {
+		for _, sentence := range legacyRequestCapabilitySentences {
+			if got := AppendTelemetryHintWithOptions(base+hint+" "+sentence, opts); got != want {
+				t.Fatalf("earlier sentence not upgraded: %q", got)
+			}
+		}
+	}
+}
+
 func TestLegacyHintMigrationRemovesStackedSuffixes(t *testing.T) {
 	for _, first := range legacyTelemetryHints {
 		for _, second := range legacyTelemetryHints {
