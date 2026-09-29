@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Fixed
+
+- **The `request_capability` registry no longer retains servers.** It keys on
+  weak pointers, and an entry is dropped once its server is garbage collected,
+  so a standalone server that is never shut down through the SDK is not kept
+  alive. `MarkRequestCapabilityRegistered`, `RequestCapabilityRegistered`, and
+  `ForgetRequestCapabilityServer` now take a server pointer (`*T`) instead of
+  `any`; calls that pass a server pointer compile unchanged.
+
 ### Added
 
 - **Per-tool telemetry hint now points agents at `request_capability`.** On a

@@ -3,8 +3,10 @@ package armatureanalytics
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
+	"weak"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -68,26 +70,37 @@ func AddRequestCapabilityTool(s *server.MCPServer, recorder *Recorder) error {
 // requestCapabilityServers records the servers the SDK-owned request_capability
 // tool is registered on, so the per-tool hint names it only where tools/list
 // actually carries it (a config with a delivery path does not prove that).
-var requestCapabilityServers sync.Map // server pointer → struct{}
+// Keys are weak pointers and a GC cleanup deletes them, so a server nobody
+// shuts down through this SDK is not retained.
+var requestCapabilityServers sync.Map // weak.Pointer[T] → struct{}
 
 // MarkRequestCapabilityRegistered records that the SDK-owned request_capability
 // tool is registered on s. AddRequestCapabilityTool and the official adapter
 // call it; InstrumentTool then points each tool's hint at request_capability.
-func MarkRequestCapabilityRegistered(s any) {
-	if s != nil {
-		requestCapabilityServers.Store(s, struct{}{})
+func MarkRequestCapabilityRegistered[T any](s *T) {
+	if s == nil {
+		return
+	}
+	key := weak.Make(s)
+	if _, loaded := requestCapabilityServers.LoadOrStore(key, struct{}{}); !loaded {
+		runtime.AddCleanup(s, func(key weak.Pointer[T]) { requestCapabilityServers.Delete(key) }, key)
 	}
 }
 
 // ForgetRequestCapabilityServer drops s from that registry (server shutdown).
-func ForgetRequestCapabilityServer(s any) {
-	requestCapabilityServers.Delete(s)
+func ForgetRequestCapabilityServer[T any](s *T) {
+	if s != nil {
+		requestCapabilityServers.Delete(weak.Make(s))
+	}
 }
 
 // RequestCapabilityRegistered reports whether MarkRequestCapabilityRegistered
 // ran for s.
-func RequestCapabilityRegistered(s any) bool {
-	_, ok := requestCapabilityServers.Load(s)
+func RequestCapabilityRegistered[T any](s *T) bool {
+	if s == nil {
+		return false
+	}
+	_, ok := requestCapabilityServers.Load(weak.Make(s))
 	return ok
 }
 
