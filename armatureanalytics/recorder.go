@@ -90,6 +90,12 @@ type Config struct {
 	// customer's tool.
 	RequestCapability *bool
 
+	// DescriptionLengthLogLevel sets how the one-time notice for a tool
+	// description too long for the full telemetry hint is logged: "none",
+	// "debug" or "info" (through log/slog), or "warning" (the default, through
+	// the standard log package). Other values log as "warning".
+	DescriptionLengthLogLevel string
+
 	// CaptureTelemetry is the master switch for conversation-derived telemetry
 	// (user_intent, call_purpose, user_frustration). nil or true
 	// means on. When false the SDK injects no telemetry schema, appends no

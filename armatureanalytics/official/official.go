@@ -555,6 +555,7 @@ func InstrumentToolWithConfig[In, Out any](cfg Config, s *mcp.Server, tool *mcp.
 	decorated, ok, err := decorateInputSchemaWithTelemetry[In](tool, &armatureanalytics.HintOptions{
 		RequestCapability: armatureanalytics.RequestCapabilityRegistered(s),
 		ToolName:          toolName(tool),
+		LogLevel:          cfg.DescriptionLengthLogLevel,
 	})
 	if err != nil {
 		panic(fmt.Sprintf("armatureanalytics/official: instrument tool %q: %v", toolName(tool), err))

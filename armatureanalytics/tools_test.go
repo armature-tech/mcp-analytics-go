@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -450,6 +451,36 @@ func TestAppendTelemetryHintWarnsOncePerToolWhenShortened(t *testing.T) {
 		`[mcp-analytics] Tool "go_shortened_hint_tool" description is too long for the full Armature telemetry hint within 1024 characters; appended only the telemetry sentence.` + "\n"
 	if buf.String() != want {
 		t.Fatalf("unexpected warnings:\n%s", buf.String())
+	}
+}
+
+func TestAppendTelemetryHintLogsAtTheConfiguredLevel(t *testing.T) {
+	var logBuf, slogBuf bytes.Buffer
+	prevOut, prevFlags, prevDefault := log.Writer(), log.Flags(), slog.Default()
+	log.SetOutput(&logBuf)
+	log.SetFlags(0)
+	slog.SetDefault(slog.New(slog.NewTextHandler(&slogBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+		slog.SetDefault(prevDefault)
+	}()
+	tooLong := strings.Repeat("x", MaxToolDescriptionLength-10)
+	for _, level := range []string{"none", "debug", "info"} {
+		AppendTelemetryHintWithOptions(tooLong, HintOptions{ToolName: "go_log_level_" + level, LogLevel: level})
+	}
+	if logBuf.Len() != 0 {
+		t.Fatalf("standard log should stay silent, got %q", logBuf.String())
+	}
+	got := slogBuf.String()
+	if strings.Contains(got, "go_log_level_none") {
+		t.Fatalf("none should not log, got %q", got)
+	}
+	if !strings.Contains(got, "level=DEBUG") || !strings.Contains(got, `\"go_log_level_debug\"`) {
+		t.Fatalf("missing debug notice: %q", got)
+	}
+	if !strings.Contains(got, "level=INFO") || !strings.Contains(got, `\"go_log_level_info\"`) {
+		t.Fatalf("missing info notice: %q", got)
 	}
 }
 

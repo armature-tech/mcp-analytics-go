@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Added
+
+- **`Config.DescriptionLengthLogLevel`** sets the level of the one-time notice
+  for a tool description too long for the full telemetry hint: `"none"`,
+  `"debug"` or `"info"` (through `log/slog`), or `"warning"` (the default,
+  through the standard `log` package, as before).
+
 ### Changed
 
 - **`request_capability` is worded so agents call it.** Its description now

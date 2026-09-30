@@ -494,6 +494,7 @@ The official adapter accepts the same `Config` fields through
 | **RedactEvent** | None | Context-aware whole-event hook that may mutate or drop a tool call |
 | **TelemetryFieldMap** | None | Export existing argument fields as telemetry (see below) |
 | **RequestCapability** | **nil** (on) | Inject `request_capability` so agents can report an unmet tool need; set a `*bool` false to disable |
+| **DescriptionLengthLogLevel** | `"warning"` | Level of the one-time notice for a description too long for the full hint: `"none"`, `"debug"`, `"info"` or `"warning"` |
 
 ### Capability requests
 
@@ -521,7 +522,10 @@ the per-tool telemetry hint (see below) also points agents at it, so they
 know to call `request_capability` when no other tool fits. The SDK never pushes
 a description past 1024 characters (UTF-8 bytes): if the full hint does not
 fit it appends only the telemetry sentence, and if that does not fit either it
-leaves the description unchanged and logs a warning.
+leaves the description unchanged and logs a warning. The notice is logged once
+per tool through the standard `log` package. Set `DescriptionLengthLogLevel`
+to `"debug"` or `"info"` to send it through `log/slog` at that level instead,
+or to `"none"` to silence it.
 
 ### Telemetry capture and privacy
 

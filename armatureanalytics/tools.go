@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"strings"
 	"sync"
 
@@ -286,7 +287,7 @@ func InstrumentToolWithConfig(cfg Config, s *server.MCPServer, tool mcp.Tool, ha
 	// Name request_capability only if this server actually lists it: the
 	// SDK constructors register it before customer tools, and standalone
 	// servers opt in through AddRequestCapabilityTool.
-	decorated.Description = appendTelemetryHint(decorated.Description, RequestCapabilityRegistered(s), decorated.Name)
+	decorated.Description = appendTelemetryHint(decorated.Description, RequestCapabilityRegistered(s), decorated.Name, cfg.DescriptionLengthLogLevel)
 	s.AddTool(decorated, WrapHandler(handler))
 }
 
@@ -321,7 +322,7 @@ func WrapHandler(handler server.ToolHandlerFunc) server.ToolHandlerFunc {
 // AppendTelemetryHintWithOptions it never pushes a description past
 // MaxToolDescriptionLength.
 func AppendTelemetryHint(description string) string {
-	return appendTelemetryHint(description, false, "")
+	return appendTelemetryHint(description, false, "", "")
 }
 
 // HintOptions tunes AppendTelemetryHintWithOptions.
@@ -334,6 +335,9 @@ type HintOptions struct {
 	// whenever the hint is shortened or dropped to respect
 	// MaxToolDescriptionLength.
 	ToolName string
+	// LogLevel sets the level of that notice; see
+	// Config.DescriptionLengthLogLevel.
+	LogLevel string
 }
 
 // AppendTelemetryHintWithOptions is AppendTelemetryHint with explicit
@@ -346,7 +350,7 @@ type HintOptions struct {
 // carry); when that does not fit either, the description is returned
 // unchanged. Sentences are never cut.
 func AppendTelemetryHintWithOptions(description string, opts HintOptions) string {
-	return appendTelemetryHint(description, opts.RequestCapability, opts.ToolName)
+	return appendTelemetryHint(description, opts.RequestCapability, opts.ToolName, opts.LogLevel)
 }
 
 // MaxToolDescriptionLength is the longest tool description the SDK will
@@ -359,17 +363,25 @@ const MaxToolDescriptionLength = 1024
 
 var warnedLongDescriptions sync.Map // tool name → struct{}
 
-func warnDescriptionTooLong(toolName, message string) {
-	if toolName == "" {
+func warnDescriptionTooLong(toolName, message, level string) {
+	if toolName == "" || level == "none" {
 		return
 	}
 	if _, already := warnedLongDescriptions.LoadOrStore(toolName, struct{}{}); already {
 		return
 	}
-	log.Printf("[mcp-analytics] Tool %q description is too long %s", toolName, message)
+	text := fmt.Sprintf("[mcp-analytics] Tool %q description is too long %s", toolName, message)
+	switch level {
+	case "debug":
+		slog.Debug(text)
+	case "info":
+		slog.Info(text)
+	default:
+		log.Print(text)
+	}
 }
 
-func appendTelemetryHint(description string, requestCapability bool, toolName string) string {
+func appendTelemetryHint(description string, requestCapability bool, toolName, logLevel string) string {
 	description = stripLegacyTelemetryHint(description)
 	if description == "" {
 		if requestCapability {
@@ -396,13 +408,13 @@ func appendTelemetryHint(description string, requestCapability bool, toolName st
 		warnDescriptionTooLong(toolName, fmt.Sprintf(
 			"for the full Armature telemetry hint within %d characters; appended only the telemetry sentence.",
 			MaxToolDescriptionLength,
-		))
+		), logLevel)
 		return description + telemetrySentenceHint
 	}
 	warnDescriptionTooLong(toolName, fmt.Sprintf(
 		"to append the Armature telemetry hint without exceeding %d characters; leaving it unchanged. Telemetry is still collected.",
 		MaxToolDescriptionLength,
-	))
+	), logLevel)
 	return description
 }
 

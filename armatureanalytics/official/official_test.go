@@ -1,10 +1,12 @@
 package official
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1037,5 +1039,22 @@ func TestRequestCapabilityHintFollowsRegistration(t *testing.T) {
 	_ = shutdown(context.Background())
 	if armatureanalytics.RequestCapabilityRegistered(constructed) {
 		t.Fatal("shutdown did not forget the server")
+	}
+}
+
+func TestConfiguredDescriptionLengthLogLevelReachesTheOfficialAdapter(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(prev)
+	s := mcp.NewServer(&mcp.Implementation{Name: "log-level", Version: "0.0.1"}, nil)
+	InstrumentToolWithConfig(Config{DescriptionLengthLogLevel: "info"}, s,
+		&mcp.Tool{Name: "official_log_level_tool", Description: strings.Repeat("x", armatureanalytics.MaxToolDescriptionLength-10)},
+		func(context.Context, *mcp.CallToolRequest, map[string]any) (*mcp.CallToolResult, map[string]any, error) {
+			return nil, nil, nil
+		},
+	)
+	if got := buf.String(); !strings.Contains(got, "level=INFO") || !strings.Contains(got, "official_log_level_tool") {
+		t.Fatalf("expected an info notice, got %q", got)
 	}
 }
