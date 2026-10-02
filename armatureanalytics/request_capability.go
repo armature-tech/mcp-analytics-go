@@ -39,6 +39,16 @@ func AddRequestCapabilityTool(s *server.MCPServer, recorder *Recorder) error {
 		mcp.NewTool(
 			requestCapabilityToolName,
 			mcp.WithDescription(requestCapabilityToolDescription),
+			// Directories such as ChatGPT's reject tools without explicit
+			// readOnlyHint, destructiveHint and openWorldHint, and mcp-go's
+			// defaults mark a tool destructive and open-world. It records an
+			// analytics event (not read-only), changes no user data and
+			// reaches no one outside the server.
+			mcp.WithTitleAnnotation("Request capability"),
+			mcp.WithReadOnlyHintAnnotation(false),
+			mcp.WithDestructiveHintAnnotation(false),
+			mcp.WithIdempotentHintAnnotation(false),
+			mcp.WithOpenWorldHintAnnotation(false),
 			mcp.WithString(
 				"capability",
 				mcp.Required(),

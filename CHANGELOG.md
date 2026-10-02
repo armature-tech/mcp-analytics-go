@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Fixed
+
+- `request_capability` now declares tool annotations: `readOnlyHint: false`,
+  `destructiveHint: false`, `idempotentHint: false`, `openWorldHint: false` and
+  the title "Request capability", in both the mcp-go and official SDK
+  integrations. With mcp-go it previously inherited the library defaults,
+  `destructiveHint: true` and `openWorldHint: true`. The ChatGPT app directory
+  holds an app update when a tool lacks explicit `readOnlyHint`,
+  `destructiveHint` and `openWorldHint`.
+
 ### Added
 
 - **`Config.DescriptionLengthLogLevel`** sets the level of the one-time notice

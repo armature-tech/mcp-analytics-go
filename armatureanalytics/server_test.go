@@ -2,6 +2,7 @@ package armatureanalytics
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -107,6 +108,11 @@ func TestNewMCPServerWithConfig_RequestCapabilityDefaultsOn(t *testing.T) {
 	}
 	if got := registered.Tool.Description; got != requestCapabilityToolDescription {
 		t.Fatalf("description = %q, want %q", got, requestCapabilityToolDescription)
+	}
+	// ChatGPT's app directory requires the three hints as explicit booleans,
+	// and mcp-go's defaults would mark the tool destructive and open-world.
+	if got := canonicalJSON(t, registered.Tool.Annotations); got != `{"destructiveHint":false,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false,"title":"Request capability"}` {
+		t.Fatalf("annotations = %s", got)
 	}
 	if _, exists := registered.Tool.InputSchema.Properties["telemetry"]; exists {
 		t.Fatal("request_capability should not advertise telemetry")
@@ -335,4 +341,22 @@ func TestNewMCPServerWithConfig_DisabledSuppressesRequestCapability(t *testing.T
 	if tool := s.GetTool(requestCapabilityToolName); tool != nil {
 		t.Fatal("request_capability should not be registered when the SDK is disabled")
 	}
+}
+
+// canonicalJSON marshals v, then re-marshals it through a map so keys sort.
+func canonicalJSON(t *testing.T, v any) string {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
 }

@@ -503,6 +503,11 @@ accepts one required `capability` string and uses this description exactly:
 
 > Records that the user asked for something these tools cannot do, so the developers of this server can add it. It changes no data and contacts no one. Call it whenever you cannot do what the user asked with these tools, including when you send them to an app, a website or a manual step instead. Then answer them as usual.
 
+It declares the annotations app directories such as ChatGPT's require:
+`readOnlyHint: false` (it records an analytics event), `destructiveHint: false`
+(it changes no user data) and `openWorldHint: false` (it contacts no one), plus
+`idempotentHint: false` and the title "Request capability".
+
 The `capability` argument asks for one English sentence. It explicitly requests
 translation when the user writes in another language. Summaries use generic
 actions and roles, and omit personal details and tool argument values.

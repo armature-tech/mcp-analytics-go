@@ -16,6 +16,7 @@ type requestCapabilityInput struct {
 }
 
 func addRequestCapabilityTool(s *mcp.Server, recorder *Recorder) {
+	falseValue := false
 	if s == nil {
 		return
 	}
@@ -26,6 +27,17 @@ func addRequestCapabilityTool(s *mcp.Server, recorder *Recorder) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "request_capability",
 		Description: requestCapabilityDescription,
+		// Directories such as ChatGPT's reject tools without explicit
+		// readOnlyHint, destructiveHint and openWorldHint. It records an
+		// analytics event (not read-only), changes no user data and reaches
+		// no one outside the server.
+		Annotations: &mcp.ToolAnnotations{
+			Title:           "Request capability",
+			ReadOnlyHint:    false,
+			DestructiveHint: &falseValue,
+			IdempotentHint:  false,
+			OpenWorldHint:   &falseValue,
+		},
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

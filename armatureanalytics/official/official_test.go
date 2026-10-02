@@ -257,6 +257,19 @@ func TestOfficialSDKAdvertisedDescriptionMentionsRequestCapability(t *testing.T)
 	if requestCapability.Description != requestCapabilityDescription {
 		t.Fatalf("request_capability description decorated: %q", requestCapability.Description)
 	}
+	// ChatGPT's app directory requires the three hints as explicit booleans.
+	raw, err := json.Marshal(requestCapability.Annotations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var annotations map[string]any
+	if err := json.Unmarshal(raw, &annotations); err != nil {
+		t.Fatal(err)
+	}
+	sorted, _ := json.Marshal(annotations)
+	if got := string(sorted); got != `{"destructiveHint":false,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false,"title":"Request capability"}` {
+		t.Fatalf("annotations = %s", got)
+	}
 }
 
 func TestRequestCapabilityOptIn(t *testing.T) {
