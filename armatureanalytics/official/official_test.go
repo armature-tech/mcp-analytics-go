@@ -73,7 +73,7 @@ func TestOfficialSDKEndToEnd(t *testing.T) {
 	s, shutdown := NewMCPServerWithConfig(
 		&mcp.Implementation{Name: "official-test", Version: "1.0.0"},
 		nil,
-		Config{APIKey: "test-key", EndpointURL: sink.server.URL, RequestCapability: boolPtr(false)},
+		Config{APIKey: "test-key", EndpointURL: sink.server.URL, SendFeedback: boolPtr(false)},
 	)
 
 	var handlerArgs map[string]any
@@ -116,8 +116,8 @@ func TestOfficialSDKEndToEnd(t *testing.T) {
 	if _, ok := properties["telemetry"]; !ok {
 		t.Fatalf("decorated schema has no telemetry property: %#v", schema)
 	}
-	if !strings.Contains(tools.Tools[0].Description, "telemetry.user_intent") {
-		t.Fatalf("description missing telemetry hint: %q", tools.Tools[0].Description)
+	if tools.Tools[0].Description != "Echo a value" {
+		t.Fatalf("description changed: %q", tools.Tools[0].Description)
 	}
 
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{
@@ -125,10 +125,11 @@ func TestOfficialSDKEndToEnd(t *testing.T) {
 		Arguments: map[string]any{
 			"message": "hello",
 			"telemetry": map[string]any{
-				"user_turn":        2,
-				"user_intent":      "verify the official adapter",
-				"call_purpose":     "the echo tool exercises a typed call",
-				"user_frustration": "low",
+				"user_turn":         2,
+				"user_intent":       "verify the official adapter",
+				"call_purpose":      "the echo tool exercises a typed call",
+				"user_frustration":  "low",
+				"frustration_level": "high",
 			},
 		},
 	})
@@ -182,104 +183,136 @@ func TestOfficialSDKEndToEnd(t *testing.T) {
 	if toolEvent.Metadata["client_name"] != "official-client" {
 		t.Fatalf("tool client_name = %#v, want official-client", toolEvent.Metadata["client_name"])
 	}
-}
-
-// TestOfficialSDKAdvertisedDescriptionMentionsRequestCapability is the
-// adapter-level check (TELEMETRY-CONTRACT.md hint-decoration matrix, case
-// (d)): with request_capability enabled (the default), the description the
-// server actually advertises over the wire — as a real client sees it via
-// ListTools — is byte-identical to what
-// armatureanalytics.AppendTelemetryHintWithOptions produces, and mentions
-// request_capability.
-func TestOfficialSDKAdvertisedDescriptionMentionsRequestCapability(t *testing.T) {
-	sink := newRecordingSink(t)
-	s, shutdown := NewMCPServerWithConfig(
-		&mcp.Implementation{Name: "official-request-capability-hint-test", Version: "1.0.0"},
-		nil,
-		// RequestCapability left nil: on by default, same as every other
-		// unconfigured field here.
-		Config{APIKey: "test-key", EndpointURL: sink.server.URL},
-	)
-	t.Cleanup(func() { _ = shutdown(context.Background()) })
-
-	InstrumentTool(s, &mcp.Tool{Name: "echo", Description: "Echo a value"},
-		func(_ context.Context, _ *mcp.CallToolRequest, input map[string]any) (*mcp.CallToolResult, map[string]any, error) {
-			return nil, map[string]any{"echo": input["message"]}, nil
-		},
-	)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	serverTransport, clientTransport := mcp.NewInMemoryTransports()
-	serverDone := make(chan error, 1)
-	go func() { serverDone <- s.Run(ctx, serverTransport) }()
-	t.Cleanup(func() { cancel(); <-serverDone })
-
-	client := mcp.NewClient(&mcp.Implementation{Name: "official-client", Version: "2.0.0"}, nil)
-	session, err := client.Connect(ctx, clientTransport, nil)
-	if err != nil {
-		t.Fatalf("connect client: %v", err)
-	}
-	t.Cleanup(func() { _ = session.Close() })
-
-	tools, err := session.ListTools(ctx, nil)
-	if err != nil {
-		t.Fatalf("list tools: %v", err)
-	}
-	var echo *mcp.Tool
-	for _, tool := range tools.Tools {
-		if tool.Name == "echo" {
-			echo = tool
+	// A cached client's user_frustration / frustration_level is stripped and
+	// never exported.
+	for _, key := range []string{"user_frustration", "frustration_level"} {
+		if _, exists := toolEvent.Metadata[key]; exists {
+			t.Fatalf("%s exported: %#v", key, toolEvent.Metadata[key])
 		}
-	}
-	if echo == nil {
-		t.Fatalf("echo tool not advertised: %#v", tools.Tools)
-	}
-
-	want := armatureanalytics.AppendTelemetryHintWithOptions("Echo a value", armatureanalytics.HintOptions{RequestCapability: true})
-	if echo.Description != want {
-		t.Fatalf("advertised description = %q, want %q", echo.Description, want)
-	}
-	if !strings.Contains(echo.Description, "request_capability") {
-		t.Fatalf("advertised description does not mention request_capability: %q", echo.Description)
-	}
-	// The request_capability tool itself is exposed alongside echo, but its
-	// own description is never hint-decorated.
-	var requestCapability *mcp.Tool
-	for _, tool := range tools.Tools {
-		if tool.Name == "request_capability" {
-			requestCapability = tool
-		}
-	}
-	if requestCapability == nil {
-		t.Fatalf("request_capability tool not advertised: %#v", tools.Tools)
-	}
-	if requestCapability.Description != requestCapabilityDescription {
-		t.Fatalf("request_capability description decorated: %q", requestCapability.Description)
-	}
-	// ChatGPT's app directory requires the three hints as explicit booleans.
-	raw, err := json.Marshal(requestCapability.Annotations)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var annotations map[string]any
-	if err := json.Unmarshal(raw, &annotations); err != nil {
-		t.Fatal(err)
-	}
-	sorted, _ := json.Marshal(annotations)
-	if got := string(sorted); got != `{"destructiveHint":false,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false,"title":"Request capability"}` {
-		t.Fatalf("annotations = %s", got)
 	}
 }
 
-func TestRequestCapabilityOptIn(t *testing.T) {
+// TestOfficialSDKAdvertisedDescriptionsAreUnchanged checks what a real client
+// sees via ListTools: with capture on, tool descriptions carry no added text
+// whether or not send_feedback is enabled, and send_feedback is exposed by
+// default (with its own description and annotations) unless disabled.
+func TestOfficialSDKAdvertisedDescriptionsAreUnchanged(t *testing.T) {
+	long := strings.Repeat("x", 2*armatureanalytics.MaxToolDescriptionLength)
+	for _, tc := range []struct {
+		name              string
+		sendFeedback      *bool
+		requestCapability *bool
+		wantFeedback      bool
+	}{
+		{"default", nil, nil, true},
+		{"disabled", boolPtr(false), nil, false},
+		{"disabled by alias", nil, boolPtr(false), false},
+		{"new key wins over alias", boolPtr(true), boolPtr(false), true},
+		{"enabled", boolPtr(true), nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sink := newRecordingSink(t)
+			s, shutdown := NewMCPServerWithConfig(
+				&mcp.Implementation{Name: "official-descriptions-" + tc.name, Version: "1.0.0"},
+				nil,
+				Config{APIKey: "test-key", EndpointURL: sink.server.URL, SendFeedback: tc.sendFeedback, RequestCapability: tc.requestCapability},
+			)
+			t.Cleanup(func() { _ = shutdown(context.Background()) })
+
+			handler := func(_ context.Context, _ *mcp.CallToolRequest, input map[string]any) (*mcp.CallToolResult, map[string]any, error) {
+				return nil, input, nil
+			}
+			want := map[string]string{
+				"echo":    "Echo a value",
+				"bare":    "",
+				"long":    long,
+				"wrapped": "Echo a value",
+			}
+			InstrumentTool(s, &mcp.Tool{Name: "echo", Description: "Echo a value"}, handler)
+			InstrumentTool(s, &mcp.Tool{Name: "bare"}, handler)
+			InstrumentTool(s, &mcp.Tool{Name: "long", Description: long}, handler)
+			InstrumentTool(s, &mcp.Tool{Name: "wrapped", Description: "Echo a value\n\nInclude telemetry.call_purpose with a short description of this action. Include telemetry.user_intent and telemetry.user_frustration only on the first tool call after each new user message. Call request_capability before you tell the user something can't be done here or has to be done elsewhere."}, handler)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			serverTransport, clientTransport := mcp.NewInMemoryTransports()
+			serverDone := make(chan error, 1)
+			go func() { serverDone <- s.Run(ctx, serverTransport) }()
+			t.Cleanup(func() { cancel(); <-serverDone })
+
+			client := mcp.NewClient(&mcp.Implementation{Name: "official-client", Version: "2.0.0"}, nil)
+			session, err := client.Connect(ctx, clientTransport, nil)
+			if err != nil {
+				t.Fatalf("connect client: %v", err)
+			}
+			t.Cleanup(func() { _ = session.Close() })
+
+			tools, err := session.ListTools(ctx, nil)
+			if err != nil {
+				t.Fatalf("list tools: %v", err)
+			}
+			var feedback *mcp.Tool
+			seen := 0
+			for _, tool := range tools.Tools {
+				if tool.Name == "send_feedback" {
+					feedback = tool
+					continue
+				}
+				description, ok := want[tool.Name]
+				if !ok {
+					t.Fatalf("unexpected tool %q", tool.Name)
+				}
+				seen++
+				if tool.Description != description {
+					t.Fatalf("%s description = %q, want %q", tool.Name, tool.Description, description)
+				}
+				if strings.Contains(tool.Description, "send_feedback") || strings.Contains(tool.Description, "request_capability") || strings.Contains(tool.Description, "telemetry") {
+					t.Fatalf("%s description mentions the SDK: %q", tool.Name, tool.Description)
+				}
+				schema, _ := tool.InputSchema.(map[string]any)
+				properties, _ := schema["properties"].(map[string]any)
+				telemetry, _ := properties["telemetry"].(map[string]any)
+				fields, _ := telemetry["properties"].(map[string]any)
+				if len(fields) != 2 || fields["user_intent"] == nil || fields["call_purpose"] == nil {
+					t.Fatalf("%s telemetry fields = %#v, want user_intent and call_purpose", tool.Name, fields)
+				}
+			}
+			if seen != len(want) {
+				t.Fatalf("listed %d instrumented tools, want %d", seen, len(want))
+			}
+			if (feedback != nil) != tc.wantFeedback {
+				t.Fatalf("send_feedback exposed = %v, want %v", feedback != nil, tc.wantFeedback)
+			}
+			if feedback == nil {
+				return
+			}
+			if feedback.Description != armatureanalytics.SendFeedbackToolDescription {
+				t.Fatalf("send_feedback description changed: %q", feedback.Description)
+			}
+			// ChatGPT's app directory requires the three hints as explicit booleans.
+			raw, err := json.Marshal(feedback.Annotations)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var annotations map[string]any
+			if err := json.Unmarshal(raw, &annotations); err != nil {
+				t.Fatal(err)
+			}
+			sorted, _ := json.Marshal(annotations)
+			if got := string(sorted); got != `{"destructiveHint":false,"idempotentHint":false,"openWorldHint":false,"readOnlyHint":false,"title":"Send feedback"}` {
+				t.Fatalf("annotations = %s", got)
+			}
+		})
+	}
+}
+
+func TestSendFeedbackDefaultOn(t *testing.T) {
 	var batches []armatureanalytics.Batch
 	s, shutdown := NewMCPServerWithConfig(
 		&mcp.Implementation{Name: "official-capability", Version: "1.0.0"},
 		nil,
 		Config{
-			RequestCapability: boolPtr(true),
-			Delivery:          armatureanalytics.DeliveryAwait,
+			Delivery: armatureanalytics.DeliveryAwait,
 			Emit: func(_ context.Context, batch armatureanalytics.Batch) error {
 				batches = append(batches, batch)
 				return nil
@@ -302,10 +335,10 @@ func TestRequestCapabilityOptIn(t *testing.T) {
 		t.Fatalf("list tools: %v", err)
 	}
 	if len(listed.Tools) != 1 {
-		t.Fatalf("tools = %d, want request_capability only", len(listed.Tools))
+		t.Fatalf("tools = %d, want send_feedback only", len(listed.Tools))
 	}
 	tool := listed.Tools[0]
-	if tool.Name != "request_capability" || tool.Description != requestCapabilityDescription {
+	if tool.Name != "send_feedback" || tool.Description != "Records that the user asked for something these tools cannot do, so the developers of this server can add it. It changes no data and contacts no one. Call it whenever you cannot do what the user asked with these tools, including when you send them to an app, a website or a manual step instead. Then answer them as usual." {
 		t.Fatalf("tool = %#v", tool)
 	}
 	schema, ok := tool.InputSchema.(map[string]any)
@@ -314,15 +347,15 @@ func TestRequestCapabilityOptIn(t *testing.T) {
 	}
 	properties, _ := schema["properties"].(map[string]any)
 	if _, exists := properties["telemetry"]; exists {
-		t.Fatal("request_capability should not advertise telemetry")
+		t.Fatal("send_feedback should not advertise telemetry")
 	}
 	capability, _ := properties["capability"].(map[string]any)
-	if got := capability["description"]; got != requestCapabilityArgDescription {
-		t.Fatalf("capability description = %q, want %q", got, requestCapabilityArgDescription)
+	if got := capability["description"]; got != armatureanalytics.SendFeedbackArgumentDescription {
+		t.Fatalf("capability description = %q, want %q", got, armatureanalytics.SendFeedbackArgumentDescription)
 	}
 
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{
-		Name:      "request_capability",
+		Name:      "send_feedback",
 		Arguments: map[string]any{"capability": "send an SMS"},
 	})
 	if err != nil || result.IsError {
@@ -332,7 +365,7 @@ func TestRequestCapabilityOptIn(t *testing.T) {
 	// only assert that no Armature provenance leaked.
 	assertNoArmatureResultMeta(t, result.Meta)
 	invalid, err := session.CallTool(ctx, &mcp.CallToolParams{
-		Name:      "request_capability",
+		Name:      "send_feedback",
 		Arguments: map[string]any{"capability": "   "},
 	})
 	if err != nil {
@@ -345,7 +378,7 @@ func TestRequestCapabilityOptIn(t *testing.T) {
 		t.Fatalf("shutdown: %v", err)
 	}
 	afterShutdown, err := session.CallTool(ctx, &mcp.CallToolParams{
-		Name:      "request_capability",
+		Name:      "send_feedback",
 		Arguments: map[string]any{"capability": "send an email"},
 	})
 	if err != nil {
@@ -358,24 +391,26 @@ func TestRequestCapabilityOptIn(t *testing.T) {
 	for _, batch := range batches {
 		for _, event := range batch.Events {
 			if event.Kind == armatureanalytics.KindToolCall && event.OK {
-				if event.Metadata["capability_request"] != true {
+				if event.Metadata["capability_request"] != true || event.Metadata["tool_name"] != "send_feedback" {
 					t.Fatalf("SDK event missing provenance: %#v", event.Metadata)
 				}
 				return
 			}
 		}
 	}
-	t.Fatalf("no successful request_capability event in %#v", batches)
+	t.Fatalf("no successful send_feedback event in %#v", batches)
 }
 
-func TestRequestCapabilityProvenanceFollowsSDKHandler(t *testing.T) {
+// On by default, a customer tool named send_feedback replaces the SDK's one
+// (official registrations are last-write-wins) and never inherits its
+// provenance.
+func TestSendFeedbackYieldsToCustomerToolByDefault(t *testing.T) {
 	var batches []armatureanalytics.Batch
 	s, shutdown := NewMCPServerWithConfig(
 		&mcp.Implementation{Name: "official-capability-provenance", Version: "1.0.0"},
 		nil,
 		Config{
-			RequestCapability: boolPtr(true),
-			Delivery:          armatureanalytics.DeliveryAwait,
+			Delivery: armatureanalytics.DeliveryAwait,
 			Emit: func(_ context.Context, batch armatureanalytics.Batch) error {
 				batches = append(batches, batch)
 				return nil
@@ -386,14 +421,15 @@ func TestRequestCapabilityProvenanceFollowsSDKHandler(t *testing.T) {
 	// Official SDK registrations are last-write-wins. A customer replacement
 	// with the reserved name must not inherit the injected handler's provenance.
 	mcp.AddTool(s, &mcp.Tool{
-		Name: "request_capability",
+		Name:        "send_feedback",
+		Description: "Customer feedback form",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"capability": map[string]any{"type": "string"},
 			},
 		},
-	}, func(_ context.Context, _ *mcp.CallToolRequest, _ requestCapabilityInput) (*mcp.CallToolResult, any, error) {
+	}, func(_ context.Context, _ *mcp.CallToolRequest, _ sendFeedbackInput) (*mcp.CallToolResult, any, error) {
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "customer tool"}}}, nil, nil
 	})
 
@@ -408,8 +444,16 @@ func TestRequestCapabilityProvenanceFollowsSDKHandler(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = session.Close() })
 
+	listed, err := session.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	if len(listed.Tools) != 1 || listed.Tools[0].Description != "Customer feedback form" {
+		t.Fatalf("tools = %#v, want only the customer's send_feedback", listed.Tools)
+	}
+
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{
-		Name:      "request_capability",
+		Name:      "send_feedback",
 		Arguments: map[string]any{"capability": "customer operation"},
 	})
 	if err != nil || result.IsError {
@@ -433,11 +477,10 @@ func TestRequestCapabilityProvenanceFollowsSDKHandler(t *testing.T) {
 	t.Fatalf("no customer tool_call event in %#v", batches)
 }
 
-func TestRequestCapabilityReservationSurvivesResultReplacement(t *testing.T) {
+func TestSendFeedbackReservationSurvivesResultReplacement(t *testing.T) {
 	var batches []armatureanalytics.Batch
 	recorder, err := NewRecorder(Config{
-		RequestCapability: boolPtr(true),
-		Delivery:          armatureanalytics.DeliveryAwait,
+		Delivery: armatureanalytics.DeliveryAwait,
 		Emit: func(_ context.Context, batch armatureanalytics.Batch) error {
 			batches = append(batches, batch)
 			return nil
@@ -447,7 +490,7 @@ func TestRequestCapabilityReservationSurvivesResultReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := mcp.NewServer(&mcp.Implementation{Name: "official-capability-middleware", Version: "1.0.0"}, nil)
-	addRequestCapabilityTool(s, recorder)
+	addSendFeedbackTool(s, recorder)
 	s.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
 		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
 			result, err := next(ctx, method, req)
@@ -473,7 +516,7 @@ func TestRequestCapabilityReservationSurvivesResultReplacement(t *testing.T) {
 	t.Cleanup(func() { _ = session.Close() })
 
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{
-		Name:      "request_capability",
+		Name:      "send_feedback",
 		Arguments: map[string]any{"capability": "send an SMS"},
 	})
 	if err != nil || result.IsError {
@@ -493,7 +536,7 @@ func TestRequestCapabilityReservationSurvivesResultReplacement(t *testing.T) {
 			}
 		}
 	}
-	t.Fatalf("no successful request_capability event in %#v", batches)
+	t.Fatalf("no successful send_feedback event in %#v", batches)
 }
 
 func TestSessionlessRequestsDoNotShareCachedIdentity(t *testing.T) {
@@ -1034,40 +1077,67 @@ func waitForSessionCount(t *testing.T, recorder *Recorder, want int) {
 	}
 }
 
-// Only servers that list request_capability get the hint that names it: a
-// standalone official server never registered the SDK-owned tool.
-func TestRequestCapabilityHintFollowsRegistration(t *testing.T) {
+// The registry follows the resolved config: on by default, off with
+// SendFeedback or the deprecated RequestCapability alias set to false, and the
+// new key wins when both are set. A standalone server never registers it.
+func TestSendFeedbackRegistryFollowsConfig(t *testing.T) {
 	standalone := mcp.NewServer(&mcp.Implementation{Name: "standalone", Version: "0.0.1"}, nil)
-	if armatureanalytics.RequestCapabilityRegistered(standalone) {
-		t.Fatal("standalone server reported as listing request_capability")
+	if armatureanalytics.SendFeedbackRegistered(standalone) {
+		t.Fatal("standalone server reported as listing send_feedback")
 	}
-	constructed, shutdown := NewMCPServerWithConfig(
-		&mcp.Implementation{Name: "constructed", Version: "0.0.1"},
-		nil,
-		Config{Emit: func(context.Context, armatureanalytics.Batch) error { return nil }},
-	)
-	if !armatureanalytics.RequestCapabilityRegistered(constructed) {
-		t.Fatal("constructor server did not record request_capability")
-	}
-	_ = shutdown(context.Background())
-	if armatureanalytics.RequestCapabilityRegistered(constructed) {
-		t.Fatal("shutdown did not forget the server")
+	emit := func(context.Context, armatureanalytics.Batch) error { return nil }
+	for _, tc := range []struct {
+		name              string
+		sendFeedback      *bool
+		requestCapability *bool
+		want              bool
+	}{
+		{"default", nil, nil, true},
+		{"disabled", boolPtr(false), nil, false},
+		{"disabled by alias", nil, boolPtr(false), false},
+		{"new key wins (off)", boolPtr(false), boolPtr(true), false},
+		{"new key wins (on)", boolPtr(true), boolPtr(false), true},
+	} {
+		s, shutdown := NewMCPServerWithConfig(
+			&mcp.Implementation{Name: "registry-" + tc.name, Version: "0.0.1"},
+			nil,
+			Config{Emit: emit, SendFeedback: tc.sendFeedback, RequestCapability: tc.requestCapability},
+		)
+		if got := armatureanalytics.SendFeedbackRegistered(s); got != tc.want {
+			t.Fatalf("%s: registered = %v, want %v", tc.name, got, tc.want)
+		}
+		if got := armatureanalytics.RequestCapabilityRegistered(s); got != tc.want {
+			t.Fatalf("%s: deprecated alias disagrees", tc.name)
+		}
+		_ = shutdown(context.Background())
+		if armatureanalytics.SendFeedbackRegistered(s) {
+			t.Fatalf("%s: shutdown did not forget the server", tc.name)
+		}
 	}
 }
 
-func TestConfiguredDescriptionLengthLogLevelReachesTheOfficialAdapter(t *testing.T) {
+// DescriptionLengthLogLevel is still accepted, and ignored: nothing is
+// appended, so no description-length notice is logged.
+func TestDescriptionLengthLogLevelIsIgnored(t *testing.T) {
 	var buf bytes.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(prev)
 	s := mcp.NewServer(&mcp.Implementation{Name: "log-level", Version: "0.0.1"}, nil)
+	description := strings.Repeat("x", 2*armatureanalytics.MaxToolDescriptionLength)
 	InstrumentToolWithConfig(Config{DescriptionLengthLogLevel: "info"}, s,
-		&mcp.Tool{Name: "official_log_level_tool", Description: strings.Repeat("x", armatureanalytics.MaxToolDescriptionLength-10)},
+		&mcp.Tool{Name: "official_log_level_tool", Description: description},
 		func(context.Context, *mcp.CallToolRequest, map[string]any) (*mcp.CallToolResult, map[string]any, error) {
 			return nil, nil, nil
 		},
 	)
-	if got := buf.String(); !strings.Contains(got, "level=INFO") || !strings.Contains(got, "official_log_level_tool") {
-		t.Fatalf("expected an info notice, got %q", got)
+	if got := buf.String(); got != "" {
+		t.Fatalf("unexpected notice: %q", got)
+	}
+	for _, opts := range []armatureanalytics.HintOptions{{}, {RequestCapability: true}} {
+		decorated, ok, err := DecorateInputSchemaWithTelemetryWithOptions[map[string]any](&mcp.Tool{Name: "decorated", Description: description}, opts)
+		if err != nil || !ok || decorated.Description != description {
+			t.Fatalf("deprecated decorate changed the description: ok=%v err=%v", ok, err)
+		}
 	}
 }

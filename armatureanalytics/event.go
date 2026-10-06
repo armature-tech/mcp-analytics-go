@@ -107,7 +107,7 @@ type ToolCallInput struct {
 	// Serialized into event metadata as "request_meta", JSON-capped at
 	// MaxRequestMetaBytes with a "request_meta_truncated" marker.
 	RequestMeta map[string]any
-	// CapabilityRequest marks SDK-owned request_capability calls so ingest can
+	// CapabilityRequest marks SDK-owned send_feedback calls so ingest can
 	// distinguish them from a customer tool that happens to use the same name.
 	CapabilityRequest bool
 	// Redact runs over the sanitized args/result (and the normalized telemetry
@@ -265,14 +265,12 @@ func assembleToolCallEvent(in ToolCallInput, candidate *RedactableToolCall) Even
 		tel = NormalizeTelemetry(*candidate.Telemetry)
 	}
 	meta := map[string]any{
-		"tool_name":         candidate.ToolName,
-		"user_intent":       stringOrNil(tel.UserIntent),
-		"agent_thinking":    stringOrNil(tel.AgentThinking),
-		"user_frustration":  stringOrNil(tel.UserFrustration),
-		"intent":            stringOrNil(tel.UserIntent),
-		"context":           stringOrNil(tel.AgentThinking),
-		"frustration_level": stringOrNil(tel.UserFrustration),
-		"input_preview":     inputPreview,
+		"tool_name":      candidate.ToolName,
+		"user_intent":    stringOrNil(tel.UserIntent),
+		"agent_thinking": stringOrNil(tel.AgentThinking),
+		"intent":         stringOrNil(tel.UserIntent),
+		"context":        stringOrNil(tel.AgentThinking),
+		"input_preview":  inputPreview,
 	}
 	if in.CapabilityRequest {
 		meta["capability_request"] = true

@@ -4,6 +4,48 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- **Tool descriptions are left as written.** `InstrumentTool` and
+  `InstrumentToolWithConfig` (both packages) append nothing to any tool
+  description. The injected `telemetry` parameters carry their own
+  descriptions. A hint appended by an earlier release, with or without its
+  `request_capability` sentence, is removed at registration; customer text is
+  kept, a hint-only description becomes empty, and a tool without a
+  description keeps none. New `StripTelemetryHint` applies the same rule for
+  custom registration paths. `AppendTelemetryHint`,
+  `AppendTelemetryHintWithOptions`, `HintOptions`, `MaxToolDescriptionLength`
+  and (official package) `DecorateInputSchemaWithTelemetryWithOptions` are
+  deprecated and only strip.
+- **`user_frustration` is gone.** The advertised `telemetry` object has only
+  `user_intent` and `call_purpose`, with unchanged descriptions.
+  `user_frustration` and `frustration_level` sent by cached clients are
+  stripped with the `telemetry` argument and never exported: events no longer
+  carry the `user_frustration` or `frustration_level` metadata keys, and no
+  emit, `OnError` or `RedactEvent` payload includes them. A `user_frustration`
+  key in `TelemetryFieldMap` is accepted and ignored.
+  `Telemetry.UserFrustration` and `Telemetry.FrustrationLevel` remain for
+  source compatibility: deprecated, never populated, and skipped by JSON
+  encoding and decoding.
+- **`request_capability` is now `send_feedback`.** The SDK-owned feedback
+  tool is registered only under the new name, with the title annotation "Send
+  feedback". Its description, `capability` argument, acknowledgement and
+  other annotations are unchanged. It stays on by default once a delivery
+  path is configured; disable it with the new `Config.SendFeedback` set to
+  `false`. `Config.RequestCapability` is a deprecated alias, and
+  `SendFeedback` wins when both are set. On by default it yields to a customer
+  tool named `send_feedback`; set explicitly to `true`, a mark3labs collision
+  is reported through `OnError`. Calls are `tool_call` events with
+  `tool_name` `send_feedback` and `capability_request: true`. No other tool's
+  description mentions it; a server listed in a connector directory that keeps
+  it should mention it in its listing as a feedback tool. New exports:
+  `AddSendFeedbackTool`, `MarkSendFeedbackRegistered`,
+  `SendFeedbackRegistered`, `ForgetSendFeedbackServer` and the
+  `SendFeedbackTool*` / `SendFeedbackArgument*` constants. The
+  `RequestCapability` functions remain as deprecated aliases.
+- **`Config.DescriptionLengthLogLevel` is deprecated and ignored.** With
+  nothing appended, no description-length notice is logged.
+
 ### Fixed
 
 - `request_capability` now declares tool annotations: `readOnlyHint: false`,

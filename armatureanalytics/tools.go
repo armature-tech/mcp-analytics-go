@@ -3,9 +3,7 @@ package armatureanalytics
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
-	"log/slog"
 	"strings"
 	"sync"
 
@@ -75,22 +73,27 @@ func resetOwnedTelemetryToolsForTests() {
 // input (clients holding a cached pre-V1 tool schema, callers passing a
 // Telemetry straight into WithTelemetry) and are normalized onto the V1
 // fields — with legacy mirrors filled back in — by NormalizeTelemetry before
-// any event is built. UserTurn remains only for cached-client and source
-// compatibility; it is ignored.
+// any event is built. UserTurn, UserFrustration and FrustrationLevel remain
+// only for source compatibility; they are ignored and never exported.
 type Telemetry struct {
 	// Deprecated: cached clients may still send this field. It is ignored.
 	UserTurn    int    `json:"user_turn,omitempty"`
 	UserIntent  string `json:"user_intent,omitempty"`
 	CallPurpose string `json:"call_purpose,omitempty"`
 	// Deprecated: accepted for cached clients. Use CallPurpose for new code.
-	AgentThinking   string `json:"agent_thinking,omitempty"`
-	UserFrustration string `json:"user_frustration,omitempty"`
+	AgentThinking string `json:"agent_thinking,omitempty"`
+	// Deprecated: no longer advertised, read or exported. A user_frustration
+	// value sent by a cached client is stripped with the telemetry argument
+	// and dropped. NormalizeTelemetry clears this field; the SDK never
+	// populates it.
+	UserFrustration string `json:"-"`
 	// Deprecated: pre-V1 spelling of UserIntent; still accepted.
 	Intent string `json:"intent,omitempty"`
 	// Deprecated: pre-V1 spelling of AgentThinking; still accepted.
 	Context string `json:"context,omitempty"`
-	// Deprecated: pre-V1 spelling of UserFrustration; still accepted.
-	FrustrationLevel string `json:"frustration_level,omitempty"`
+	// Deprecated: pre-V1 spelling of UserFrustration. Ignored like it and
+	// never populated.
+	FrustrationLevel string `json:"-"`
 	// Preserves an explicitly blank call_purpose from JSON or tool arguments.
 	callPurposePresent bool
 }
@@ -155,9 +158,9 @@ func TelemetryInputSchema() map[string]any {
 
 // NormalizeTelemetry moves CallPurpose into the historical AgentThinking
 // storage field and fills legacy mirrors. CallPurpose takes precedence over
-// AgentThinking and Context. Explicit empty JSON or tool argument values also win; UserFrustration only keeps
-// low/medium/high. UserTurn is intentionally ignored. Matches the TS and
-// Python normalizers.
+// AgentThinking and Context. Explicit empty JSON or tool argument values also
+// win. UserTurn, UserFrustration and FrustrationLevel are dropped. Matches the
+// TS and Python normalizers.
 func NormalizeTelemetry(t Telemetry) Telemetry {
 	out := Telemetry{}
 	out.UserIntent = firstNonEmpty(t.UserIntent, t.Intent)
@@ -167,12 +170,10 @@ func NormalizeTelemetry(t Telemetry) Telemetry {
 	} else {
 		out.AgentThinking = firstNonEmpty(t.AgentThinking, t.Context)
 	}
-	out.UserFrustration = firstFrustration(t.UserFrustration, t.FrustrationLevel)
 	// Legacy mirrors so a not-yet-updated ingest keeps reading events built
 	// from this value.
 	out.Intent = out.UserIntent
 	out.Context = out.AgentThinking
-	out.FrustrationLevel = out.UserFrustration
 	return out
 }
 
@@ -181,7 +182,8 @@ func NormalizeTelemetry(t Telemetry) Telemetry {
 // the mapped top-level argument properties and fills any telemetry field the
 // call didn't already provide explicitly. Values are validated with the same
 // rules as NormalizeTelemetry, so a wrong-typed customer field is ignored
-// rather than exported as garbage.
+// rather than exported as garbage. A user_frustration mapping is accepted and
+// ignored.
 func applyTelemetryFieldMap(t Telemetry, args any, fieldMap map[string]string) Telemetry {
 	if len(fieldMap) == 0 {
 		return t
@@ -212,9 +214,6 @@ func applyTelemetryFieldMap(t Telemetry, args any, fieldMap map[string]string) T
 			t.AgentThinking = argString("agent_thinking")
 		}
 	}
-	if t.UserFrustration == "" && t.FrustrationLevel == "" {
-		t.UserFrustration = firstFrustration(argString("user_frustration"))
-	}
 	return t
 }
 
@@ -227,25 +226,15 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func firstFrustration(values ...string) string {
-	for _, v := range values {
-		if v == "low" || v == "medium" || v == "high" {
-			return v
-		}
-	}
-	return ""
-}
-
 // InstrumentTool registers a tool on s and instruments it for Armature
 // analytics telemetry capture. Servers created by NewMCPServerWithConfig
 // automatically supply their capture policy; standalone servers default to
 // capture enabled and can use InstrumentToolWithConfig explicitly. It
-// decorates the tool's input schema with an
-// optional `telemetry` object (user_intent / call_purpose /
-// user_frustration), appends the telemetry nudge to the tool description,
-// and wraps the handler so that the telemetry arguments are stripped before
-// the handler runs but kept on the request context for the recorder's hooks
-// to read.
+// decorates the tool's input schema with an optional `telemetry` object
+// (user_intent / call_purpose) and wraps the handler so that the telemetry
+// arguments are stripped before the handler runs but kept on the request
+// context for the recorder's hooks to read. It adds no text to the tool
+// description; an exact SDK hint suffix from an earlier release is removed.
 //
 // Mirrors the TS SDK's instrumentMcpServerTools, applied one tool at a
 // time. InstrumentTool is purely additive on top of Recorder.Hooks(): the
@@ -254,7 +243,7 @@ func firstFrustration(values ...string) string {
 // still emit events, just without intent metadata.
 //
 // Tools whose schema already declares a top-level `telemetry` input are
-// registered untouched (no decoration, no description nudge, no handler
+// registered untouched (no decoration, no description change, no handler
 // wrap): stripping that argument would swallow a real input the tool
 // advertises. The same applies when a RawInputSchema cannot be parsed and
 // extended.
@@ -284,10 +273,7 @@ func InstrumentToolWithConfig(cfg Config, s *server.MCPServer, tool mcp.Tool, ha
 		s.AddTool(tool, WrapHandler(handler))
 		return
 	}
-	// Name request_capability only if this server actually lists it: the
-	// SDK constructors register it before customer tools, and standalone
-	// servers opt in through AddRequestCapabilityTool.
-	decorated.Description = appendTelemetryHint(decorated.Description, RequestCapabilityRegistered(s), decorated.Name, cfg.DescriptionLengthLogLevel)
+	decorated.Description = StripTelemetryHint(decorated.Description)
 	s.AddTool(decorated, WrapHandler(handler))
 }
 
@@ -310,115 +296,55 @@ func WrapHandler(handler server.ToolHandlerFunc) server.ToolHandlerFunc {
 	}
 }
 
-// AppendTelemetryHint appends the public task-context hint to a tool
-// description. Current hints stay unchanged. Known older SDK suffixes are
-// replaced so they no longer request private reasoning. It emits the current
-// request_capability-agnostic hint;
-// InstrumentTool / InstrumentToolWithConfig use the request_capability-aware
-// hint when the server lists that tool, and AppendTelemetryHintWithOptions
-// exposes the same choice. Every registration path must
-// run tool descriptions through one of the two so calling agents know to pass
-// telemetry.user_intent; InstrumentTool applies it automatically. Like
-// AppendTelemetryHintWithOptions it never pushes a description past
-// MaxToolDescriptionLength.
-func AppendTelemetryHint(description string) string {
-	return appendTelemetryHint(description, false, "", "")
+// StripTelemetryHint returns description without the task-context hint an
+// earlier release of this SDK appended to it, including that hint followed by
+// a request_capability sentence. The SDK adds no text to tool descriptions;
+// InstrumentTool applies this automatically, and custom registration paths
+// can call it so descriptions registered through an older wrapper come out
+// clean. Only an exact SDK suffix is removed: customer prose that quotes a
+// hint is preserved, and the result is stable under repeated calls. A
+// description that consisted only of an SDK hint becomes "".
+func StripTelemetryHint(description string) string {
+	return stripLegacyTelemetryHint(description)
 }
 
-// HintOptions tunes AppendTelemetryHintWithOptions.
+// AppendTelemetryHint is StripTelemetryHint.
+//
+// Deprecated: the SDK no longer appends a hint to tool descriptions. This
+// function only removes hints appended by earlier releases. Use
+// StripTelemetryHint.
+func AppendTelemetryHint(description string) string {
+	return stripLegacyTelemetryHint(description)
+}
+
+// HintOptions tuned AppendTelemetryHintWithOptions.
+//
+// Deprecated: no hint is appended, so every option is ignored.
 type HintOptions struct {
-	// RequestCapability selects the hint that also tells agents to call
-	// request_capability. Set it only when the server's tools/list carries
-	// that tool (see RequestCapabilityRegistered); InstrumentTool does this.
+	// Deprecated: ignored. No tool description mentions send_feedback.
 	RequestCapability bool
-	// ToolName, when set, names the tool in the once-per-tool warning logged
-	// whenever the hint is shortened or dropped to respect
-	// MaxToolDescriptionLength.
+	// Deprecated: ignored. No description-length notice is logged.
 	ToolName string
-	// LogLevel sets the level of that notice; see
-	// Config.DescriptionLengthLogLevel.
+	// Deprecated: ignored. No description-length notice is logged.
 	LogLevel string
 }
 
-// AppendTelemetryHintWithOptions is AppendTelemetryHint with explicit
-// options. Current hints stay idempotent across configurations. Known
-// historical SDK suffixes are migrated to the current public task context.
+// AppendTelemetryHintWithOptions is StripTelemetryHint; opts are ignored.
 //
-// The result never exceeds MaxToolDescriptionLength because of the hint: when
-// the full hint does not fit, only the telemetry sentence is appended (it
-// matters per tool; request_capability is a list-wide instruction other tools
-// carry); when that does not fit either, the description is returned
-// unchanged. Sentences are never cut.
-func AppendTelemetryHintWithOptions(description string, opts HintOptions) string {
-	return appendTelemetryHint(description, opts.RequestCapability, opts.ToolName, opts.LogLevel)
+// Deprecated: the SDK no longer appends a hint to tool descriptions. Use
+// StripTelemetryHint.
+func AppendTelemetryHintWithOptions(description string, _ HintOptions) string {
+	return stripLegacyTelemetryHint(description)
 }
 
-// MaxToolDescriptionLength is the longest tool description the SDK will
-// produce by appending its hint. Some providers reject the whole request when
-// one description exceeds 1024 characters (Azure OpenAI, some OpenAI-compatible
-// gateways), and Claude Code cuts descriptions at 2048, which would drop the
-// hint first. It is measured in UTF-8 bytes, which never undercounts characters and matches the
-// TypeScript, Python, and PHP SDKs exactly.
+// MaxToolDescriptionLength was the description length the appended hint was
+// kept within, in UTF-8 bytes.
+//
+// Deprecated: the SDK no longer appends text to tool descriptions, so it
+// enforces no length budget.
 const MaxToolDescriptionLength = 1024
 
-var warnedLongDescriptions sync.Map // tool name → struct{}
-
-func warnDescriptionTooLong(toolName, message, level string) {
-	if toolName == "" || level == "none" {
-		return
-	}
-	if _, already := warnedLongDescriptions.LoadOrStore(toolName, struct{}{}); already {
-		return
-	}
-	text := fmt.Sprintf("[mcp-analytics] Tool %q description is too long %s", toolName, message)
-	switch level {
-	case "debug":
-		slog.Debug(text)
-	case "info":
-		slog.Info(text)
-	default:
-		log.Print(text)
-	}
-}
-
-func appendTelemetryHint(description string, requestCapability bool, toolName, logLevel string) string {
-	description = stripLegacyTelemetryHint(description)
-	if description == "" {
-		if requestCapability {
-			return strings.TrimLeft(telemetryDescriptionHintWithCapability, "\n")
-		}
-		return strings.TrimLeft(telemetryDescriptionHint, "\n")
-	}
-	if hasRecognizedTelemetryHint(description) {
-		return description
-	}
-	hint := telemetryDescriptionHint
-	if requestCapability {
-		hint = telemetryDescriptionHintWithCapability
-		// A customer who already wrote the request_capability sentence gets
-		// only the telemetry one, so the instruction is not repeated.
-		if strings.Contains(description, requestCapabilitySentence) {
-			hint = telemetrySentenceHint
-		}
-	}
-	if len(description)+len(hint) <= MaxToolDescriptionLength {
-		return description + hint
-	}
-	if len(description)+len(telemetrySentenceHint) <= MaxToolDescriptionLength {
-		warnDescriptionTooLong(toolName, fmt.Sprintf(
-			"for the full Armature telemetry hint within %d characters; appended only the telemetry sentence.",
-			MaxToolDescriptionLength,
-		), logLevel)
-		return description + telemetrySentenceHint
-	}
-	warnDescriptionTooLong(toolName, fmt.Sprintf(
-		"to append the Armature telemetry hint without exceeding %d characters; leaving it unchanged. Telemetry is still collected.",
-		MaxToolDescriptionLength,
-	), logLevel)
-	return description
-}
-
-// stripLegacyTelemetryHint replaces only a known SDK suffix. Identical words
+// stripLegacyTelemetryHint removes only a known SDK suffix. Identical words
 // embedded in customer prose are left untouched.
 func stripLegacyTelemetryHint(description string) string {
 	for {
@@ -439,16 +365,6 @@ func stripLegacyTelemetryHint(description string) string {
 	}
 }
 
-// hasRecognizedTelemetryHint keeps current hints idempotent across configs.
-func hasRecognizedTelemetryHint(description string) bool {
-	for _, hint := range []string{telemetryDescriptionHint, telemetrySentenceHint} {
-		if strings.Contains(description, strings.TrimSpace(hint)) {
-			return true
-		}
-	}
-	return false
-}
-
 // DecorateInputSchemaWithTelemetry returns a copy of tool whose input schema
 // includes the optional telemetry object, plus a bool reporting whether the
 // schema was decorated. The original tool value is never modified — use the
@@ -461,10 +377,10 @@ func hasRecognizedTelemetryHint(description string) bool {
 // advertises. InstrumentTool applies exactly this rule.
 //
 // Mirrors the TS SDK's decorateInputSchemaWithTelemetry: telemetry is added
-// under `properties`, is itself an object with user_intent / call_purpose /
-// user_frustration, and is NEVER added to the schema's
-// `required` array. The Required list inside the telemetry object is also
-// empty by design — user_intent is a soft nudge.
+// under `properties`, is itself an object with user_intent / call_purpose, and
+// is NEVER added to the schema's `required` array. The Required list inside
+// the telemetry object is also empty by design — user_intent is a soft nudge.
+// The tool description is left as is; see StripTelemetryHint.
 func DecorateInputSchemaWithTelemetry(tool mcp.Tool) (mcp.Tool, bool) {
 	return decorateToolSchema(tool)
 }
@@ -554,10 +470,6 @@ func telemetrySchemaObject() map[string]any {
 				"type":        "string",
 				"description": callPurposeDescription,
 			},
-			"user_frustration": map[string]any{
-				"type":        "string",
-				"description": userFrustrationDescription,
-			},
 		},
 	}
 }
@@ -568,15 +480,15 @@ func telemetrySchemaObject() map[string]any {
 // byte-identical copies so agents see the same tool statements regardless of
 // the server's implementation language.
 const (
-	telemetryPropertyDescription           = "Optional task context for usage analytics, based on the visible user request and the action performed by this tool."
-	userIntentDescription                  = "Generalized one-sentence summary of the task stated in the user's latest message. Describe actions and generic roles only. Replace all tool argument values with generic terms, including names, contacts, IDs, credentials, document titles, team names and filters. For example, 'List employees in the selected team.' Include only on the first tool call after each new user message; omit on later calls in the same turn. Use English."
-	callPurposeDescription                 = "Short public description of the action this tool performs toward the user's stated goal. Base it only on the visible request, the tool's function and its inputs. Use English. Omit names, contact details, identifiers, credentials and argument values. Generalize document titles, team names and filter values (for example, 'the selected team')."
-	userFrustrationDescription             = "Frustration expressed in the user's latest message: low when none is expressed, medium for explicit dissatisfaction, high for strong or repeated dissatisfaction. Use only the user's words. Include on the first tool call after each new user message; omit on later calls in the same turn."
-	telemetryDescriptionHint               = "\n\nInclude telemetry.call_purpose with a short description of this action. Include telemetry.user_intent and telemetry.user_frustration only on the first tool call after each new user message."
-	telemetrySentenceHint                  = telemetryDescriptionHint
-	requestCapabilitySentence              = "Call request_capability before you tell the user something can't be done here or has to be done elsewhere."
-	telemetryDescriptionHintWithCapability = telemetryDescriptionHint + " " + requestCapabilitySentence
-	// Historical SDK suffixes are accepted only for migration, never emitted.
+	telemetryPropertyDescription = "Optional task context for usage analytics, based on the visible user request and the action performed by this tool."
+	userIntentDescription        = "Generalized one-sentence summary of the task stated in the user's latest message. Describe actions and generic roles only. Replace all tool argument values with generic terms, including names, contacts, IDs, credentials, document titles, team names and filters. For example, 'List employees in the selected team.' Include only on the first tool call after each new user message; omit on later calls in the same turn. Use English."
+	callPurposeDescription       = "Short public description of the action this tool performs toward the user's stated goal. Base it only on the visible request, the tool's function and its inputs. Use English. Omit names, contact details, identifiers, credentials and argument values. Generalize document titles, team names and filter values (for example, 'the selected team')."
+)
+
+// Description suffixes earlier releases appended. They are recognized only so
+// StripTelemetryHint can remove them; the SDK never emits them.
+const (
+	telemetryDescriptionHintCallPurpose  = "\n\nInclude telemetry.call_purpose with a short description of this action. Include telemetry.user_intent and telemetry.user_frustration only on the first tool call after each new user message."
 	telemetryDescriptionHintReasoning    = "\n\nOn every call, pass telemetry.agent_thinking with your reasoning for this specific call. Pass telemetry.user_intent only on the first tool call after a new user message."
 	telemetrySentenceHintReasoning       = "\n\nPass telemetry.agent_thinking on every call, telemetry.user_intent on the first call after each user message."
 	telemetryDescriptionHintRepeatIntent = "\n\nPass telemetry.user_intent with a one-line restatement of the user's most recent request, and telemetry.agent_thinking with your reasoning for making this specific call."
@@ -584,13 +496,15 @@ const (
 	telemetryDescriptionHintLegacy       = "\n\nPass telemetry.intent with a one-line user intent for analytics."
 )
 
-// Capability sentences earlier releases appended after a hint, stripped like
-// the hints themselves.
+// Capability sentences earlier releases appended after a hint, removed with
+// it. The first is the last one shipped.
 var legacyRequestCapabilitySentences = []string{
+	"Call request_capability before you tell the user something can't be done here or has to be done elsewhere.",
 	"If no tool can do what the user asks, call request_capability.",
 }
 
 var legacyTelemetryHints = []string{
+	telemetryDescriptionHintCallPurpose,
 	telemetryDescriptionHintReasoning,
 	telemetrySentenceHintReasoning,
 	telemetryDescriptionHintRepeatIntent,
@@ -598,20 +512,15 @@ var legacyTelemetryHints = []string{
 	telemetryDescriptionHintLegacy,
 }
 
-// legacyTelemetrySuffixes lists every SDK suffix to replace, longest first per
-// hint: a legacy hint with the current or an earlier capability sentence, the
-// bare legacy hint, and the current hint with an earlier capability sentence.
+// legacyTelemetrySuffixes lists every SDK suffix to remove: each hint followed
+// by each capability sentence, then the bare hint.
 var legacyTelemetrySuffixes = func() []string {
 	var suffixes []string
 	for _, hint := range legacyTelemetryHints {
-		suffixes = append(suffixes, hint+" "+requestCapabilitySentence)
 		for _, sentence := range legacyRequestCapabilitySentences {
 			suffixes = append(suffixes, hint+" "+sentence)
 		}
 		suffixes = append(suffixes, hint)
-	}
-	for _, sentence := range legacyRequestCapabilitySentences {
-		suffixes = append(suffixes, telemetryDescriptionHint+" "+sentence)
 	}
 	return suffixes
 }()
@@ -632,14 +541,14 @@ func extractTelemetryFromArgs(args map[string]any) (Telemetry, map[string]any) {
 
 	switch v := raw.(type) {
 	case map[string]any:
-		// user_turn from cached schemas is intentionally ignored.
+		// user_turn, user_frustration and frustration_level from cached
+		// schemas are intentionally ignored: they are stripped with the rest
+		// of the telemetry argument and never exported.
 		// A V1 string key that is PRESENT shadows its legacy counterpart even
 		// when empty — the Telemetry struct's zero value can't distinguish
 		// "explicitly blank" from "absent", so the conflict must be resolved
 		// here, before the map collapses into the struct. Matches the TS and
-		// Python normalizers' first-string-wins rule. (user_frustration is the
-		// exception: an off-spec V1 value falls through to a valid legacy one,
-		// same as the other SDKs.)
+		// Python normalizers' first-string-wins rule.
 		userIntent, hasUserIntent := v["user_intent"].(string)
 		if hasUserIntent {
 			t.UserIntent = userIntent
@@ -655,12 +564,6 @@ func extractTelemetryFromArgs(args map[string]any) (Telemetry, map[string]any) {
 			t.AgentThinking = agentThinking
 		} else if s, ok := v["context"].(string); ok {
 			t.Context = s
-		}
-		if s, ok := v["user_frustration"].(string); ok {
-			t.UserFrustration = s
-		}
-		if s, ok := v["frustration_level"].(string); ok {
-			t.FrustrationLevel = s
 		}
 	case string:
 		// Some clients flatten the block to a JSON string; tolerate it.

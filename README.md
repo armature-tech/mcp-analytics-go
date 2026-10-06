@@ -178,7 +178,7 @@ The wire format matches the [TypeScript SDK](https://github.com/armature-tech/mc
 Armature instruments the boundary around every tool call:
 
 1. **InstrumentTool** adds an optional **telemetry** block to the tool’s input schema.
-2. The agent can attach user intent, a public action summary, and expressed frustration to the call.
+2. The agent can attach user intent and a public action summary to the call. The SDK adds no text to tool descriptions; the injected fields describe themselves.
 3. The SDK removes telemetry before your handler receives the arguments.
 4. Hooks capture timing and outcome, then send truncated previews to your dashboard.
 
@@ -186,13 +186,12 @@ Armature instruments the boundary around every tool call:
 {
   "telemetry": {
     "user_intent": "Check whether the customer's last payment succeeded",
-    "call_purpose": "The payment lookup tool provides the requested status",
-    "user_frustration": "low"
+    "call_purpose": "The payment lookup tool provides the requested status"
   }
 }
 ~~~
 
-All telemetry fields are optional. **call_purpose** describes the public action from the visible request and tool inputs. It must omit private reasoning and argument values. Send **call_purpose** on every call; send **user_intent** and **user_frustration** only on the first call after each new user message. Their absence on later calls means the same turn continues. The cached aliases **agent_thinking** and **context** remain accepted. **call_purpose** takes precedence, including an explicit empty string from a tool call. Events keep the historical **agent_thinking** and **context** storage fields. Cached **user_turn** values are ignored.
+All telemetry fields are optional. **call_purpose** describes the public action from the visible request and tool inputs. It must omit private reasoning and argument values. Send **call_purpose** on every call; send **user_intent** only on the first call after each new user message. Its absence on later calls means the same turn continues. The cached aliases **agent_thinking** and **context** remain accepted. **user_frustration** and **frustration_level** from cached clients are stripped and never exported. **call_purpose** takes precedence, including an explicit empty string from a tool call. Events keep the historical **agent_thinking** and **context** storage fields. Cached **user_turn** values are ignored.
 
 > **Privacy:** Armature is observability, not authentication. Keep your existing MCP authentication and authorization in place. Do not put secrets in tool arguments or telemetry fields.
 
@@ -457,7 +456,6 @@ config := armatureanalytics.Config{
     RedactEvent: func(ctx context.Context, event *armatureanalytics.RedactableToolCall) (*armatureanalytics.RedactableToolCall, error) {
         return event, nil
     },
-    RequestCapability: new(bool), // *bool: nil = on (the default); points at false here to disable
     ActorIdentifier: func(ctx context.Context) string {
         return "anything-at-all@example.com"
     },
@@ -493,52 +491,68 @@ The official adapter accepts the same `Config` fields through
 | **Redact** | None | Redact sensitive data from previews before delivery (see below) |
 | **RedactEvent** | None | Context-aware whole-event hook that may mutate or drop a tool call |
 | **TelemetryFieldMap** | None | Export existing argument fields as telemetry (see below) |
-| **RequestCapability** | **nil** (on) | Inject `request_capability` so agents can report an unmet tool need; set a `*bool` false to disable |
-| **DescriptionLengthLogLevel** | `"warning"` | Level of the one-time notice for a description too long for the full hint: `"none"`, `"debug"`, `"info"` or `"warning"` |
+| **SendFeedback** | **nil** (on) | Add the `send_feedback` tool so agents can report an unmet tool need; set a `*bool` false to disable |
+| **RequestCapability** | **nil** | Deprecated alias of **SendFeedback**; **SendFeedback** wins when both are set |
+| **DescriptionLengthLogLevel** | None | Deprecated and ignored: the SDK appends nothing to tool descriptions |
 
-### Capability requests
+### Feedback tool
 
-`NewMCPServerWithConfig` injects a `request_capability` tool by default. It
-accepts one required `capability` string and uses this description exactly:
+`NewMCPServerWithConfig` adds a `send_feedback` tool by default, once an API key
+or custom `Emit` delivery is configured. It is a feedback tool: the agent calls
+it when the server's tools cannot do what the user asked, and the call feeds
+Armature's unmet-demand signals. It accepts one required `capability` string
+and uses this description exactly:
 
 > Records that the user asked for something these tools cannot do, so the developers of this server can add it. It changes no data and contacts no one. Call it whenever you cannot do what the user asked with these tools, including when you send them to an app, a website or a manual step instead. Then answer them as usual.
 
 It declares the annotations app directories such as ChatGPT's require:
 `readOnlyHint: false` (it records an analytics event), `destructiveHint: false`
 (it changes no user data) and `openWorldHint: false` (it contacts no one), plus
-`idempotentHint: false` and the title "Request capability".
+`idempotentHint: false` and the title "Send feedback".
 
 The `capability` argument asks for one English sentence. It explicitly requests
 translation when the user writes in another language. Summaries use generic
 actions and roles, and omit personal details and tool argument values.
 
-Calls flow through the normal analytics hooks and feed Armature's unmet-demand
-signals. `RequestCapability` is a `*bool`: `nil` means on (the default); set it
-to a pointer to `false` to disable. The tool is also suppressed when `Disabled`
-is true or no API key/custom `Emit` delivery is configured. When you explicitly
-set it to a pointer to `true`, a mark3labs tool-name collision is surfaced via
-`OnError`; when on merely by default, the customer's tool of the same name wins
-silently. For a manually constructed mark3labs server, call
-`armatureanalytics.AddRequestCapabilityTool(s, rec)` after installing the recorder
+Calls are recorded as `tool_call` events with tool name `send_feedback` and
+`capability_request: true` in their metadata.
+
+Set `SendFeedback` to a pointer to `false` to disable it. The earlier
+`RequestCapability` key is still accepted; `SendFeedback` wins when both are
+set. The tool is also left out when `Disabled` is true or no delivery is
+configured. On by default, it yields to a tool of yours already named
+`send_feedback`. Set `SendFeedback` to a pointer to `true` and a mark3labs
+name collision is reported through `OnError` instead. The official Go SDK
+replaces a tool registered under an existing name, so with the official adapter
+a `send_feedback` tool you register after the server is built replaces the
+SDK's one silently, even when `SendFeedback` is true. For a manually
+constructed mark3labs server, call
+`armatureanalytics.AddSendFeedbackTool(s, rec)` after installing the recorder
 and handle its returned error. The recorder is required so every acknowledged
 request reaches the unmet-demand signal pipeline; nil, disabled, and closed
-recorders are rejected. When `request_capability` is enabled for the server,
-the per-tool telemetry hint (see below) also points agents at it, so they
-know to call `request_capability` when no other tool fits. The SDK never pushes
-a description past 1024 characters (UTF-8 bytes): if the full hint does not
-fit it appends only the telemetry sentence, and if that does not fit either it
-leaves the description unchanged and logs a warning. The notice is logged once
-per tool through the standard `log` package. Set `DescriptionLengthLogLevel`
-to `"debug"` or `"info"` to send it through `log/slog` at that level instead,
-or to `"none"` to silence it.
+recorders are rejected.
+
+No other tool's description mentions `send_feedback`. If your server is listed
+in a connector directory and keeps it, mention it in the listing as a feedback
+tool.
+
+### Tool descriptions
+
+The SDK adds no text to tool descriptions. A task-context hint appended by an
+earlier release, with or without its `request_capability` sentence, is removed
+when the tool is registered through `InstrumentTool`, so older wrapped
+descriptions come out clean. Customer text is kept. For custom registration
+paths, `armatureanalytics.StripTelemetryHint` applies the same rule.
+`AppendTelemetryHint` and `AppendTelemetryHintWithOptions` are deprecated and
+only strip.
 
 ### Telemetry capture and privacy
 
-`InstrumentTool` injects an optional `telemetry` object (`user_intent`, `call_purpose`, `user_frustration`) into each wrapped tool's input schema. This is conversation-derived data: if your deployment cannot disclose it (for example in a privacy policy required for an app-store submission), set **CaptureTelemetry** to a false pointer and register tools through `InstrumentToolWithConfig` (both packages provide it). With capture off, tool schemas and descriptions pass through completely untouched, and telemetry sent by clients holding an older cached schema is stripped and never delivered anywhere (ingest or `OnError`). Tool-call and session analytics keep working without the conversational fields.
+`InstrumentTool` injects an optional `telemetry` object (`user_intent`, `call_purpose`) into each wrapped tool's input schema. This is conversation-derived data: if your deployment cannot disclose it (for example in a privacy policy required for an app-store submission), set **CaptureTelemetry** to a false pointer and register tools through `InstrumentToolWithConfig` (both packages provide it). With capture off, tool schemas and descriptions pass through completely untouched, and telemetry sent by clients holding an older cached schema is stripped and never delivered anywhere (ingest or `OnError`). Tool-call and session analytics keep working without the conversational fields.
 
 Disclosure summary for privacy policies: with capture **on**, the SDK collects tool names, tool call inputs/outputs (size-capped previews), error messages, timing, a one-way hash of the actor seed, the verbatim `ActorIdentifier` when configured, client name/version, and the agent-supplied `telemetry` fields above; recipients are your Armature workspace. With capture **off**, the `telemetry` fields are not collected.
 
-If a tool's own input schema already declares a top-level `telemetry` property, the SDK treats that field as **yours**: the schema, description, and arguments pass through untouched (including in the recorder hooks and middleware), nothing is interpreted as Armature telemetry, and a warning is logged once at registration. To export an existing, semantically equivalent field, opt in explicitly with **TelemetryFieldMap**. For example, `map[string]string{"call_purpose": "purpose"}` reads the tool's `purpose` argument into the historical `agent_thinking` event field. It preserves the original argument. The legacy mapping key `agent_thinking` remains accepted. Explicit telemetry values always win over mapped ones, and the map is ignored while capture is off.
+If a tool's own input schema already declares a top-level `telemetry` property, the SDK treats that field as **yours**: the schema, description, and arguments pass through untouched (including in the recorder hooks and middleware), nothing is interpreted as Armature telemetry, and a warning is logged once at registration. To export an existing, semantically equivalent field, opt in explicitly with **TelemetryFieldMap**. For example, `map[string]string{"call_purpose": "purpose"}` reads the tool's `purpose` argument into the historical `agent_thinking` event field. It preserves the original argument. The legacy mapping key `agent_thinking` remains accepted; a `user_frustration` key is accepted and ignored. Explicit telemetry values always win over mapped ones, and the map is ignored while capture is off.
 
 ### Redaction and binary payloads
 
@@ -583,7 +597,7 @@ Each **tool_call** event includes:
 - Start time, finish time, and duration
 - Session, client, and protocol information
 - Hashed actor identifier
-- Optional user intent, public action summaries, and expressed frustration
+- Optional user intent and public action summaries
 
 Each session emits one deduplicated **session_init** event: at the initialize
 handshake for pre-2026-07-28 clients, or on first sight of a new session

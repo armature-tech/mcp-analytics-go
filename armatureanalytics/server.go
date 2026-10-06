@@ -94,17 +94,11 @@ func NewMCPServerWithConfig(name, version string, cfg Config, opts ...server.Ser
 	}
 	s := server.NewMCPServer(name, version, opts...)
 	serverTelemetryConfigs.Store(s, cfg)
-	if cfg.requestCapabilityEnabled() && !cfg.Disabled && rec != nil {
-		// A tool-name collision is only reported when explicitly opted in; when
-		// on by default the customer's pre-existing tool wins silently.
-		if err := AddRequestCapabilityTool(s, rec); err != nil && cfg.requestCapabilityExplicit() && cfg.OnError != nil {
-			cfg.OnError(err, Batch{})
-		}
-	}
+	injectSendFeedback(s, rec, cfg)
 
 	shutdown := Shutdown(func(ctx context.Context) error {
 		defer serverTelemetryConfigs.Delete(s)
-		defer ForgetRequestCapabilityServer(s)
+		defer ForgetSendFeedbackServer(s)
 		if rec == nil {
 			return nil
 		}

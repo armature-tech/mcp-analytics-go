@@ -63,7 +63,7 @@ func TestCallPurposeJSONIgnoresInvalidAliasTypes(t *testing.T) {
 			t.Fatalf("invalid alias %s rejected valid context: %v", invalid, err)
 		}
 		got := NormalizeTelemetry(telemetry)
-		if got.UserIntent != "valid goal" || got.AgentThinking != "legacy action" || got.Context != "legacy action" || got.UserFrustration != "low" {
+		if got.UserIntent != "valid goal" || got.AgentThinking != "legacy action" || got.Context != "legacy action" || got.UserFrustration != "" {
 			t.Fatalf("invalid alias %s lost valid context: %+v", invalid, got)
 		}
 	}
@@ -157,10 +157,15 @@ func TestCallPurposeInvalidAliasFromMapRedactionKeepsValidContext(t *testing.T) 
 	})
 	for key, want := range map[string]string{
 		"user_intent": "valid goal", "agent_thinking": "redacted legacy action",
-		"context": "redacted legacy action", "user_frustration": "low",
+		"context": "redacted legacy action",
 	} {
 		if event.Metadata[key] != want {
 			t.Fatalf("invalid alias discarded %s: got %v, want %s", key, event.Metadata[key], want)
+		}
+	}
+	for _, key := range []string{"user_frustration", "frustration_level"} {
+		if _, exists := event.Metadata[key]; exists {
+			t.Fatalf("redaction hook value exported %s: %v", key, event.Metadata[key])
 		}
 	}
 }
@@ -168,81 +173,16 @@ func TestCallPurposeInvalidAliasFromMapRedactionKeepsValidContext(t *testing.T) 
 func TestPublicTelemetrySchemaIsOptional(t *testing.T) {
 	schema := TelemetryInputSchema()
 	props := schema["properties"].(map[string]any)
-	if len(props) != 3 || props["agent_thinking"] != nil || props["context"] != nil {
+	if len(props) != 2 || props["agent_thinking"] != nil || props["context"] != nil || props["user_frustration"] != nil {
 		t.Fatalf("unexpected public fields: %v", props)
 	}
 	if _, exists := schema["required"]; exists {
 		t.Fatal("telemetry fields must remain optional")
 	}
-	for _, name := range []string{"user_intent", "call_purpose", "user_frustration"} {
+	for _, name := range []string{"user_intent", "call_purpose"} {
 		field := props[name].(map[string]any)
 		if field["type"] != "string" || field["enum"] != nil {
 			t.Fatalf("field is not a permissive string: %s", name)
-		}
-	}
-}
-
-func TestLegacyHintMigrationPreservesCustomerText(t *testing.T) {
-	for _, hint := range legacyTelemetryHints {
-		for _, opts := range []HintOptions{{}, {RequestCapability: true}} {
-			for _, suffix := range []string{hint, hint + " " + requestCapabilitySentence} {
-				base := "Recherche les documents demandés."
-				want := AppendTelemetryHintWithOptions(base, opts)
-				if got := AppendTelemetryHintWithOptions(base+suffix, opts); got != want {
-					t.Fatalf("suffix migration mismatch: %q", got)
-				}
-				if got := AppendTelemetryHintWithOptions(strings.TrimLeft(suffix, "\n"), opts); got != AppendTelemetryHintWithOptions("", opts) {
-					t.Fatalf("standalone migration mismatch: %q", got)
-				}
-			}
-			// A known sentence in the middle is customer prose, not a suffix.
-			embedded := "Customer example:" + hint + "\nKeep this example."
-			if got := AppendTelemetryHintWithOptions(embedded, opts); !strings.HasPrefix(got, embedded) {
-				t.Fatalf("customer prose changed: %q", got)
-			}
-			longBase := strings.Repeat("é", MaxToolDescriptionLength/2)
-			if got := AppendTelemetryHintWithOptions(longBase+hint, opts); got != longBase {
-				t.Fatalf("old hint survived length fallback or customer text changed")
-			}
-		}
-	}
-}
-
-// A hint ending in an earlier request_capability sentence is upgraded to the
-// current one, whichever telemetry sentence precedes it.
-func TestEarlierRequestCapabilitySentenceIsUpgraded(t *testing.T) {
-	opts := HintOptions{RequestCapability: true}
-	base := "Recherche les documents demandés."
-	want := AppendTelemetryHintWithOptions(base, opts)
-	for _, hint := range append([]string{telemetryDescriptionHint}, legacyTelemetryHints...) {
-		for _, sentence := range legacyRequestCapabilitySentences {
-			if got := AppendTelemetryHintWithOptions(base+hint+" "+sentence, opts); got != want {
-				t.Fatalf("earlier sentence not upgraded: %q", got)
-			}
-		}
-	}
-}
-
-func TestLegacyHintMigrationRemovesStackedSuffixes(t *testing.T) {
-	for _, first := range legacyTelemetryHints {
-		for _, second := range legacyTelemetryHints {
-			for _, opts := range []HintOptions{{}, {RequestCapability: true}} {
-				stacked := first + " " + requestCapabilitySentence + second
-				for _, base := range []string{"", "Recherche les documents demandés.", strings.Repeat("é", MaxToolDescriptionLength/2)} {
-					input := base + stacked
-					if base == "" {
-						input = strings.TrimLeft(input, "\n")
-					}
-					want := AppendTelemetryHintWithOptions(base, opts)
-					got := AppendTelemetryHintWithOptions(input, opts)
-					if got != want || strings.Contains(got, "agent_thinking") {
-						t.Fatalf("stacked SDK suffix survived migration: %q", got)
-					}
-					if again := AppendTelemetryHintWithOptions(got, opts); again != got {
-						t.Fatalf("migrated hint is not idempotent: %q", again)
-					}
-				}
-			}
 		}
 	}
 }

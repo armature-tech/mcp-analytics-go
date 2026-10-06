@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
 )
 
 func TestExtractTelemetryFromArgs_AllFields(t *testing.T) {
@@ -33,11 +32,11 @@ func TestExtractTelemetryFromArgs_AllFields(t *testing.T) {
 	if tel.AgentThinking != "user is on the cpu-spike dashboard" {
 		t.Errorf("AgentThinking = %q", tel.AgentThinking)
 	}
-	if tel.UserFrustration != "medium" {
-		t.Errorf("UserFrustration = %q", tel.UserFrustration)
+	if tel.UserFrustration != "" || tel.FrustrationLevel != "" {
+		t.Errorf("cached user_frustration must be dropped: %+v", tel)
 	}
 	// Legacy mirrors are filled so a not-yet-updated ingest keeps reading.
-	if tel.Intent != tel.UserIntent || tel.Context != tel.AgentThinking || tel.FrustrationLevel != tel.UserFrustration {
+	if tel.Intent != tel.UserIntent || tel.Context != tel.AgentThinking {
 		t.Errorf("legacy mirrors not filled: %+v", tel)
 	}
 	if _, ok := cleaned["telemetry"]; ok {
@@ -65,8 +64,8 @@ func TestExtractTelemetryFromArgs_LegacyKeysNormalize(t *testing.T) {
 	if tel.AgentThinking != "user is on the cpu-spike dashboard" {
 		t.Errorf("AgentThinking = %q", tel.AgentThinking)
 	}
-	if tel.UserFrustration != "high" {
-		t.Errorf("UserFrustration = %q", tel.UserFrustration)
+	if tel.UserFrustration != "" || tel.FrustrationLevel != "" {
+		t.Errorf("cached frustration_level must be dropped: %+v", tel)
 	}
 }
 
@@ -91,7 +90,7 @@ func TestExtractTelemetryFromArgs_IgnoresCachedUserTurn(t *testing.T) {
 			t.Errorf("user_turn %v should be ignored, got %d", cached, tel.UserTurn)
 		}
 		if tel.UserFrustration != "" {
-			t.Errorf("off-spec frustration should be dropped, got %q", tel.UserFrustration)
+			t.Errorf("cached frustration should be dropped, got %q", tel.UserFrustration)
 		}
 	}
 }
@@ -109,110 +108,164 @@ func TestExtractTelemetryFromArgs_PresentV1KeyShadowsLegacy(t *testing.T) {
 	}
 }
 
-func TestAppendTelemetryHint_Idempotent(t *testing.T) {
-	once := AppendTelemetryHint("Echoes.")
-	if once == "Echoes." {
-		t.Fatalf("hint not appended")
+// The suffixes the last hint-appending release produced, spelled out so these
+// tests do not depend on the constants they check.
+const (
+	lastTelemetryHint      = "Include telemetry.call_purpose with a short description of this action. Include telemetry.user_intent and telemetry.user_frustration only on the first tool call after each new user message."
+	lastCapabilitySentence = "Call request_capability before you tell the user something can't be done here or has to be done elsewhere."
+)
+
+func TestStripTelemetryHintRemovesEarlierSDKSuffixes(t *testing.T) {
+	suffixes := []string{
+		"\n\n" + lastTelemetryHint,
+		"\n\n" + lastTelemetryHint + " " + lastCapabilitySentence,
+		"\n\n" + lastTelemetryHint + " If no tool can do what the user asks, call request_capability.",
 	}
-	if AppendTelemetryHint(once) != once {
-		t.Errorf("hint appended twice")
-	}
-	// Known historical SDK suffixes migrate to the public task-context hint.
 	for _, hint := range legacyTelemetryHints {
-		old := "Echoes." + hint
-		if got := AppendTelemetryHint(old); got != once {
-			t.Errorf("historical hint was not migrated: %q", got)
+		suffixes = append(suffixes, hint)
+		for _, sentence := range legacyRequestCapabilitySentences {
+			suffixes = append(suffixes, hint+" "+sentence)
 		}
 	}
-	if AppendTelemetryHint("") == "" {
-		t.Errorf("empty description should become the hint")
-	}
-	// A description already carrying the request_capability-aware hint (e.g.
-	// from an earlier AppendTelemetryHintWithOptions call) is also recognized,
-	// even by the config-agnostic function.
-	withCapability := "Echoes." + telemetryDescriptionHintWithCapability
-	if AppendTelemetryHint(withCapability) != withCapability {
-		t.Errorf("request_capability-hinted description modified")
-	}
-}
-
-// TestAppendTelemetryHintWithOptions_RequestCapabilityEnabled covers (a) from
-// TELEMETRY-CONTRACT.md's hint-decoration matrix: request_capability enabled
-// (the nil-Config default, same as an explicit pointer to true) appends the
-// hint that also points agents at request_capability.
-func TestAppendTelemetryHintWithOptions_RequestCapabilityEnabled(t *testing.T) {
-	want := "Echoes." + telemetryDescriptionHintWithCapability
-	if got := AppendTelemetryHintWithOptions("Echoes.", HintOptions{RequestCapability: true}); got != want {
-		t.Fatalf("nil-RequestCapability hint = %q, want %q", got, want)
-	}
-	if got := AppendTelemetryHintWithOptions("Echoes.", HintOptions{RequestCapability: true}); got != want {
-		t.Fatalf("explicit-on hint = %q, want %q", got, want)
+	for _, base := range []string{"Recherche les documents demandés.", strings.Repeat("é", 2*MaxToolDescriptionLength)} {
+		for _, suffix := range suffixes {
+			got := StripTelemetryHint(base + suffix)
+			if got != base {
+				t.Fatalf("SDK suffix survived: %q", got[len(base):])
+			}
+			if again := StripTelemetryHint(got); again != got {
+				t.Fatalf("stripping is not idempotent: %q", again)
+			}
+			// A description that consisted only of an SDK hint becomes empty.
+			if got := StripTelemetryHint(strings.TrimLeft(suffix, "\n")); got != "" {
+				t.Fatalf("hint-only description = %q, want empty", got)
+			}
+		}
 	}
 }
 
-// The hint only names request_capability on a server that lists it. A config
-// with a delivery path is not enough: a standalone server never registered it.
-func TestInstrumentToolNamesRequestCapabilityOnlyWhereRegistered(t *testing.T) {
+func TestStripTelemetryHintRemovesStackedSuffixes(t *testing.T) {
+	for _, first := range legacyTelemetryHints {
+		for _, second := range legacyTelemetryHints {
+			stacked := first + " " + lastCapabilitySentence + second
+			for _, base := range []string{"", "Recherche les documents demandés."} {
+				input := base + stacked
+				if base == "" {
+					input = strings.TrimLeft(input, "\n")
+				}
+				if got := StripTelemetryHint(input); got != base {
+					t.Fatalf("stacked SDK suffix survived: %q", got)
+				}
+			}
+		}
+	}
+}
+
+func TestStripTelemetryHintKeepsCustomerText(t *testing.T) {
+	for _, description := range []string{
+		"",
+		"Echoes.",
+		strings.Repeat("a", 2*MaxToolDescriptionLength),
+		// A hint quoted inside customer prose is not an SDK suffix.
+		"Customer example:\n\n" + lastTelemetryHint + "\nKeep this example.",
+		"Quoted inline: " + lastTelemetryHint,
+		"Look up a customer. " + lastCapabilitySentence,
+	} {
+		if got := StripTelemetryHint(description); got != description {
+			t.Fatalf("customer text changed: %q -> %q", description, got)
+		}
+	}
+	// Only the SDK's trailing paragraph goes; the customer's own sentence stays.
+	own := "Look up a customer. " + lastCapabilitySentence
+	if got := StripTelemetryHint(own + "\n\n" + lastTelemetryHint); got != own {
+		t.Fatalf("customer sentence lost: %q", got)
+	}
+}
+
+func TestDeprecatedHintHelpersOnlyStrip(t *testing.T) {
+	for _, opts := range []HintOptions{{}, {RequestCapability: true, ToolName: "deprecated_helper_tool", LogLevel: "info"}} {
+		for _, description := range []string{
+			"",
+			"Echoes.",
+			"Echoes.\n\n" + lastTelemetryHint + " " + lastCapabilitySentence,
+			strings.Repeat("a", 2*MaxToolDescriptionLength),
+		} {
+			want := StripTelemetryHint(description)
+			if got := AppendTelemetryHint(description); got != want {
+				t.Fatalf("AppendTelemetryHint(%q) = %q, want %q", description, got, want)
+			}
+			if got := AppendTelemetryHintWithOptions(description, opts); got != want {
+				t.Fatalf("AppendTelemetryHintWithOptions(%q) = %q, want %q", description, got, want)
+			}
+		}
+	}
+}
+
+// TestInstrumentToolLeavesDescriptionsUnchanged: with capture on, no tool
+// description gains text, whether or not send_feedback is enabled, and none
+// mentions send_feedback, request_capability or telemetry. Descriptions are never
+// shortened and no description-length notice is logged.
+func TestInstrumentToolLeavesDescriptionsUnchanged(t *testing.T) {
+	var logBuf, slogBuf bytes.Buffer
+	prevOut, prevFlags, prevDefault := log.Writer(), log.Flags(), slog.Default()
+	log.SetOutput(&logBuf)
+	log.SetFlags(0)
+	slog.SetDefault(slog.New(slog.NewTextHandler(&slogBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+		slog.SetDefault(prevDefault)
+	}()
 	handler := func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		return mcp.NewToolResultText("ok"), nil
 	}
-	standalone := server.NewMCPServer("standalone", "0.0.1")
-	InstrumentToolWithConfig(Config{APIKey: "k"}, standalone, mcp.NewTool("weather", mcp.WithDescription("Weather.")), handler)
-	if got := standalone.GetTool("weather").Tool.Description; got != "Weather."+telemetryDescriptionHint {
-		t.Fatalf("standalone server hint = %q, want the plain hint", got)
+	long := strings.Repeat("z", 2*MaxToolDescriptionLength)
+	for _, tc := range []struct {
+		name         string
+		sendFeedback *bool
+		logLevel     string
+	}{
+		{"default", nil, ""},
+		{"disabled", boolPtr(false), "warning"},
+		{"enabled", boolPtr(true), "info"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, shutdown := NewMCPServerWithConfig("descriptions", "0.0.1", Config{
+				Emit:                      func(context.Context, Batch) error { return nil },
+				SendFeedback:              tc.sendFeedback,
+				DescriptionLengthLogLevel: tc.logLevel,
+			})
+			defer func() { _ = shutdown(context.Background()) }()
+			want := map[string]string{
+				"weather": "Weather.",
+				"bare":    "",
+				"long":    long,
+				"wrapped": "Weather.",
+			}
+			InstrumentTool(s, mcp.NewTool("weather", mcp.WithDescription("Weather.")), handler)
+			InstrumentTool(s, mcp.NewTool("bare"), handler)
+			InstrumentTool(s, mcp.NewTool("long", mcp.WithDescription(long)), handler)
+			InstrumentTool(s, mcp.NewTool("wrapped", mcp.WithDescription("Weather.\n\n"+lastTelemetryHint+" "+lastCapabilitySentence)), handler)
+			for name, description := range want {
+				listed := listTool(t, s, name)
+				if listed.Description != description {
+					t.Fatalf("%s description = %q, want %q", name, listed.Description, description)
+				}
+				if _, ok := listed.InputSchema.Properties["telemetry"]; !ok {
+					t.Fatalf("%s lacks the telemetry property", name)
+				}
+				if strings.Contains(listed.Description, "send_feedback") || strings.Contains(listed.Description, "request_capability") || strings.Contains(listed.Description, "telemetry") {
+					t.Fatalf("%s description mentions the SDK: %q", name, listed.Description)
+				}
+			}
+			wantFeedback := tc.sendFeedback == nil || *tc.sendFeedback
+			if got := s.GetTool(SendFeedbackToolName) != nil; got != wantFeedback {
+				t.Fatalf("send_feedback exposed = %v, want %v", got, wantFeedback)
+			}
+		})
 	}
-
-	constructed, shutdown := NewMCPServerWithConfig("constructed", "0.0.1", Config{Emit: func(context.Context, Batch) error { return nil }})
-	defer func() { _ = shutdown(context.Background()) }()
-	InstrumentTool(constructed, mcp.NewTool("weather", mcp.WithDescription("Weather.")), handler)
-	if got := constructed.GetTool("weather").Tool.Description; got != "Weather."+telemetryDescriptionHintWithCapability {
-		t.Fatalf("constructor server hint = %q, want the request_capability hint", got)
-	}
-
-	disabled, shutdownDisabled := NewMCPServerWithConfig("disabled", "0.0.1", Config{Emit: func(context.Context, Batch) error { return nil }, RequestCapability: boolPtr(false)})
-	defer func() { _ = shutdownDisabled(context.Background()) }()
-	InstrumentTool(disabled, mcp.NewTool("weather", mcp.WithDescription("Weather.")), handler)
-	if got := disabled.GetTool("weather").Tool.Description; got != "Weather."+telemetryDescriptionHint {
-		t.Fatalf("request_capability-off server hint = %q, want the plain hint", got)
-	}
-}
-
-// TestAppendTelemetryHintWithOptions_RequestCapabilityDisabled covers (b):
-// request_capability explicitly disabled keeps today's hint, byte-identical.
-func TestAppendTelemetryHintWithOptions_RequestCapabilityDisabled(t *testing.T) {
-	got := AppendTelemetryHintWithOptions("Echoes.", HintOptions{})
-	want := AppendTelemetryHint("Echoes.")
-	if got != want {
-		t.Fatalf("request_capability-off hint = %q, want byte-identical current hint %q", got, want)
-	}
-	if got != "Echoes."+telemetryDescriptionHint {
-		t.Fatalf("hint text drifted from telemetryDescriptionHint: %q", got)
-	}
-}
-
-// TestAppendTelemetryHintWithOptions_Idempotent covers (c): a description
-// already carrying any recognized hint is returned unchanged, regardless of
-// which Config produced it or is passed on the next call.
-func TestAppendTelemetryHintWithOptions_Idempotent(t *testing.T) {
-	enabled := HintOptions{RequestCapability: true}
-	disabled := HintOptions{}
-
-	once := AppendTelemetryHintWithOptions("Echoes.", enabled)
-	if AppendTelemetryHintWithOptions(once, enabled) != once {
-		t.Errorf("request_capability hint appended twice")
-	}
-	// Flipping cfg after the hint is already present must not re-decorate.
-	if AppendTelemetryHintWithOptions(once, disabled) != once {
-		t.Errorf("hint re-appended after cfg changed from enabled to disabled")
-	}
-	plain := AppendTelemetryHintWithOptions("Echoes.", disabled)
-	if AppendTelemetryHintWithOptions(plain, enabled) != plain {
-		t.Errorf("hint re-appended after cfg changed from disabled to enabled")
-	}
-	// The config-agnostic AppendTelemetryHint's output is recognized too.
-	legacyPath := AppendTelemetryHint("Echoes.")
-	if AppendTelemetryHintWithOptions(legacyPath, enabled) != legacyPath {
-		t.Errorf("config-aware append re-decorated a plain-hinted description")
+	if logBuf.Len() != 0 || slogBuf.Len() != 0 {
+		t.Fatalf("unexpected log output: %q %q", logBuf.String(), slogBuf.String())
 	}
 }
 
@@ -272,14 +325,35 @@ func TestDecorateInputSchemaWithTelemetry_AddsOptionalTelemetry(t *testing.T) {
 	if tel == nil || tel["type"] != "object" {
 		t.Errorf("telemetry property shape wrong: %+v", tel)
 	}
-	props, _ := tel["properties"].(map[string]any)
-	if _, ok := props["user_turn"]; ok {
-		t.Errorf("removed user_turn sub-property still advertised")
+	assertAdvertisedTelemetrySchema(t, tel)
+	if decorated.Description != "Echoes" {
+		t.Errorf("description changed: %q", decorated.Description)
 	}
-	for _, key := range []string{"user_intent", "call_purpose", "user_frustration"} {
-		if _, ok := props[key]; !ok {
-			t.Errorf("missing %s sub-property", key)
+}
+
+// The advertised telemetry object carries exactly user_intent and
+// call_purpose, with the cross-SDK description strings byte for byte.
+func assertAdvertisedTelemetrySchema(t *testing.T, tel map[string]any) {
+	t.Helper()
+	if tel["description"] != "Optional task context for usage analytics, based on the visible user request and the action performed by this tool." {
+		t.Errorf("telemetry description = %q", tel["description"])
+	}
+	props, _ := tel["properties"].(map[string]any)
+	want := map[string]string{
+		"user_intent":  "Generalized one-sentence summary of the task stated in the user's latest message. Describe actions and generic roles only. Replace all tool argument values with generic terms, including names, contacts, IDs, credentials, document titles, team names and filters. For example, 'List employees in the selected team.' Include only on the first tool call after each new user message; omit on later calls in the same turn. Use English.",
+		"call_purpose": "Short public description of the action this tool performs toward the user's stated goal. Base it only on the visible request, the tool's function and its inputs. Use English. Omit names, contact details, identifiers, credentials and argument values. Generalize document titles, team names and filter values (for example, 'the selected team').",
+	}
+	if len(props) != len(want) {
+		t.Errorf("advertised telemetry fields = %v, want exactly user_intent and call_purpose", props)
+	}
+	for key, description := range want {
+		field, _ := props[key].(map[string]any)
+		if field == nil || field["type"] != "string" || field["description"] != description {
+			t.Errorf("%s = %#v", key, props[key])
 		}
+	}
+	if _, exists := tel["required"]; exists {
+		t.Errorf("telemetry fields must stay optional")
 	}
 }
 
@@ -299,9 +373,11 @@ func TestDecorateInputSchemaWithTelemetry_RawSchemaPath(t *testing.T) {
 		t.Fatalf("decode raw: %v", err)
 	}
 	props, _ := parsed["properties"].(map[string]any)
-	if _, ok := props["telemetry"]; !ok {
-		t.Errorf("telemetry not injected into raw schema; got %v", parsed)
+	tel, ok := props["telemetry"].(map[string]any)
+	if !ok {
+		t.Fatalf("telemetry not injected into raw schema; got %v", parsed)
 	}
+	assertAdvertisedTelemetrySchema(t, tel)
 	req, _ := parsed["required"].([]any)
 	for _, r := range req {
 		if r == "telemetry" {
@@ -368,137 +444,5 @@ func TestWrapHandler_StripsTelemetryAndPropagatesViaContext(t *testing.T) {
 	}
 	if sawArgs["text"] != "hi" {
 		t.Errorf("inner handler lost real args: %v", sawArgs)
-	}
-}
-
-func TestAppendTelemetryHintFallsBackToTheTelemetrySentenceThenNothing(t *testing.T) {
-	enabled := HintOptions{RequestCapability: true}
-	disabled := HintOptions{}
-	for _, tc := range []struct {
-		cfg  HintOptions
-		hint string
-	}{{enabled, telemetryDescriptionHintWithCapability}, {disabled, telemetryDescriptionHint}} {
-		fullFits := strings.Repeat("a", MaxToolDescriptionLength-len(tc.hint))
-		if got := AppendTelemetryHintWithOptions(fullFits, tc.cfg); got != fullFits+tc.hint {
-			t.Fatalf("full hint should fit, got %d bytes", len(got))
-		}
-		sentenceOnly := fullFits + "a"
-		want := sentenceOnly
-		if len(tc.hint) > len(telemetrySentenceHint) {
-			want += telemetrySentenceHint
-		}
-		if got := AppendTelemetryHintWithOptions(sentenceOnly, tc.cfg); got != want {
-			t.Fatalf("unexpected fallback: %q", got[len(sentenceOnly):])
-		}
-		sentenceFits := strings.Repeat("a", MaxToolDescriptionLength-len(telemetrySentenceHint))
-		if got := AppendTelemetryHintWithOptions(sentenceFits, tc.cfg); len(got) != MaxToolDescriptionLength {
-			t.Fatalf("telemetry sentence should fit exactly, got %d bytes", len(got))
-		}
-		nothingFits := sentenceFits + "a"
-		if got := AppendTelemetryHintWithOptions(nothingFits, tc.cfg); got != nothingFits {
-			t.Fatalf("description should be unchanged, got %d bytes", len(got))
-		}
-	}
-	// Length is counted in UTF-8 bytes: "é" is one character but two bytes.
-	accented := strings.Repeat("é", (MaxToolDescriptionLength-len(telemetrySentenceHint))/2)
-	if got := AppendTelemetryHintWithOptions(accented, enabled); got != accented+telemetrySentenceHint {
-		t.Fatalf("UTF-8 description should get the telemetry hint only")
-	}
-	// The exported config-less helper applies the same guard.
-	tooLong := strings.Repeat("a", MaxToolDescriptionLength)
-	if got := AppendTelemetryHint(tooLong); got != tooLong {
-		t.Fatalf("AppendTelemetryHint must not exceed the limit")
-	}
-}
-
-func TestAppendTelemetryHintIsIdempotentAfterFallback(t *testing.T) {
-	enabled := HintOptions{RequestCapability: true}
-	for _, n := range []int{10, 900, 950, 1000} {
-		once := AppendTelemetryHintWithOptions(strings.Repeat("a", n), enabled)
-		if AppendTelemetryHintWithOptions(once, enabled) != once {
-			t.Fatalf("second pass changed a %d-byte description", n)
-		}
-		if AppendTelemetryHintWithOptions(once, HintOptions{}) != once {
-			t.Fatalf("second pass under another config changed a %d-byte description", n)
-		}
-	}
-}
-
-func TestAppendTelemetryHintSkipsTheRequestCapabilitySentenceTheCustomerWrote(t *testing.T) {
-	description := "Look up a customer. " + requestCapabilitySentence
-	got := AppendTelemetryHintWithOptions(description, HintOptions{RequestCapability: true})
-	if got != description+telemetrySentenceHint {
-		t.Fatalf("expected only the telemetry sentence, got %q", got)
-	}
-}
-
-func TestAppendTelemetryHintWarnsOncePerToolWhenShortened(t *testing.T) {
-	var buf bytes.Buffer
-	prevOut, prevFlags := log.Writer(), log.Flags()
-	log.SetOutput(&buf)
-	log.SetFlags(0)
-	defer func() {
-		log.SetOutput(prevOut)
-		log.SetFlags(prevFlags)
-	}()
-	tooLong := strings.Repeat("x", MaxToolDescriptionLength-10)
-	shortened := strings.Repeat("y", MaxToolDescriptionLength-len(telemetrySentenceHint))
-	for i := 0; i < 2; i++ {
-		AppendTelemetryHintWithOptions(tooLong, HintOptions{RequestCapability: true, ToolName: "go_long_description_tool"})
-		AppendTelemetryHintWithOptions(shortened, HintOptions{RequestCapability: true, ToolName: "go_shortened_hint_tool"})
-	}
-	want := `[mcp-analytics] Tool "go_long_description_tool" description is too long to append the Armature telemetry hint without exceeding 1024 characters; leaving it unchanged. Telemetry is still collected.` + "\n" +
-		`[mcp-analytics] Tool "go_shortened_hint_tool" description is too long for the full Armature telemetry hint within 1024 characters; appended only the telemetry sentence.` + "\n"
-	if buf.String() != want {
-		t.Fatalf("unexpected warnings:\n%s", buf.String())
-	}
-}
-
-func TestAppendTelemetryHintLogsAtTheConfiguredLevel(t *testing.T) {
-	var logBuf, slogBuf bytes.Buffer
-	prevOut, prevFlags, prevDefault := log.Writer(), log.Flags(), slog.Default()
-	log.SetOutput(&logBuf)
-	log.SetFlags(0)
-	slog.SetDefault(slog.New(slog.NewTextHandler(&slogBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	defer func() {
-		log.SetOutput(prevOut)
-		log.SetFlags(prevFlags)
-		slog.SetDefault(prevDefault)
-	}()
-	tooLong := strings.Repeat("x", MaxToolDescriptionLength-10)
-	for _, level := range []string{"none", "debug", "info"} {
-		AppendTelemetryHintWithOptions(tooLong, HintOptions{ToolName: "go_log_level_" + level, LogLevel: level})
-	}
-	if logBuf.Len() != 0 {
-		t.Fatalf("standard log should stay silent, got %q", logBuf.String())
-	}
-	got := slogBuf.String()
-	if strings.Contains(got, "go_log_level_none") {
-		t.Fatalf("none should not log, got %q", got)
-	}
-	if !strings.Contains(got, "level=DEBUG") || !strings.Contains(got, `\"go_log_level_debug\"`) {
-		t.Fatalf("missing debug notice: %q", got)
-	}
-	if !strings.Contains(got, "level=INFO") || !strings.Contains(got, `\"go_log_level_info\"`) {
-		t.Fatalf("missing info notice: %q", got)
-	}
-}
-
-func TestInstrumentToolKeepsTelemetrySchemaWhenTheHintIsDropped(t *testing.T) {
-	s := server.NewMCPServer("long", "0.0.1")
-	description := strings.Repeat("z", MaxToolDescriptionLength)
-	tool := mcp.NewTool("go_schema_kept_tool", mcp.WithDescription(description))
-	InstrumentToolWithConfig(Config{APIKey: "k"}, s, tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		return mcp.NewToolResultText("ok"), nil
-	})
-	registered := s.GetTool("go_schema_kept_tool")
-	if registered == nil {
-		t.Fatal("tool not registered")
-	}
-	if registered.Tool.Description != description {
-		t.Fatalf("description changed: %d bytes", len(registered.Tool.Description))
-	}
-	if _, ok := registered.Tool.InputSchema.Properties["telemetry"]; !ok {
-		t.Fatal("telemetry property should still be advertised")
 	}
 }

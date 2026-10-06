@@ -52,12 +52,9 @@ func loadContractVectors(t *testing.T) contractVectors {
 	return v
 }
 
-// expectedTelemetry holds only the V1 fields the shared vectors use.
-type expectedTelemetry struct {
-	UserIntent      string `json:"user_intent"`
-	AgentThinking   string `json:"agent_thinking"`
-	UserFrustration string `json:"user_frustration"`
-}
+// exportedTelemetryFields are the only telemetry fields the shared vectors may
+// expect: user_frustration and frustration_level are never exported.
+var exportedTelemetryFields = map[string]bool{"user_intent": true, "agent_thinking": true}
 
 // extractWithMode mirrors how the runtime applies modes: hooks skip extraction
 // entirely for owned tools (recorder.go onBeforeAny), and RecordToolCall's
@@ -87,19 +84,32 @@ func TestContractExtractionVectors(t *testing.T) {
 				}
 				return
 			}
-			var expect expectedTelemetry
+			var expect map[string]string
 			if err := json.Unmarshal(vec.ExpectTelemetry, &expect); err != nil {
 				t.Fatalf("decode expect_telemetry: %v", err)
 			}
-			if tel.UserIntent != expect.UserIntent ||
-				tel.AgentThinking != expect.AgentThinking ||
-				tel.UserFrustration != expect.UserFrustration {
+			for key := range expect {
+				if !exportedTelemetryFields[key] {
+					t.Fatalf("vector expects unsupported telemetry field %q", key)
+				}
+			}
+			if tel.UserIntent != expect["user_intent"] || tel.AgentThinking != expect["agent_thinking"] {
 				t.Fatalf("telemetry: got %+v want %+v", tel, expect)
+			}
+			if tel.UserFrustration != "" || tel.FrustrationLevel != "" {
+				t.Fatalf("frustration extracted: %+v", tel)
 			}
 			// The Go SDK carries legacy mirrors inside Telemetry; they must
 			// always agree with the V1 fields after normalization.
-			if tel.Intent != tel.UserIntent || tel.Context != tel.AgentThinking || tel.FrustrationLevel != tel.UserFrustration {
+			if tel.Intent != tel.UserIntent || tel.Context != tel.AgentThinking {
 				t.Fatalf("legacy mirrors disagree: %+v", tel)
+			}
+			now := time.Now()
+			event := BuildToolCallEvent(ToolCallInput{ToolName: "t", Args: cleaned, Telemetry: tel, StartedAt: now, FinishedAt: now})
+			for _, key := range []string{"user_frustration", "frustration_level"} {
+				if _, exists := event.Metadata[key]; exists {
+					t.Fatalf("event exported %s", key)
+				}
 			}
 		})
 	}
@@ -182,10 +192,81 @@ func TestCaptureOffDropsTelemetryAtChokePoint(t *testing.T) {
 	if _, ok := meta["user_turn"]; ok {
 		t.Fatalf("removed user_turn metadata was emitted")
 	}
-	for _, key := range []string{"user_intent", "agent_thinking", "user_frustration", "intent", "context"} {
+	for _, key := range []string{"user_intent", "agent_thinking", "user_frustration", "intent", "context", "frustration_level"} {
 		if meta[key] != nil {
 			t.Fatalf("metadata[%s] = %v, want nil", key, meta[key])
 		}
+	}
+}
+
+// TestCachedClientFrustrationIsNeverExported: a client holding a schema from
+// a release that advertised user_frustration still sends it (and the legacy
+// frustration_level). The handler never sees it, and no sink receives it:
+// not the delivered batch, not OnError, not the RedactEvent candidate.
+func TestCachedClientFrustrationIsNeverExported(t *testing.T) {
+	var (
+		delivered []Batch
+		failed    []Batch
+		redacted  []RedactableToolCall
+		handled   map[string]any
+	)
+	s, shutdown := NewMCPServerWithConfig("cached-client", "0", Config{
+		Delivery: DeliveryAwait,
+		Emit: func(_ context.Context, batch Batch) error {
+			delivered = append(delivered, batch)
+			return errRedact{msg: "ingest unavailable"}
+		},
+		OnError: func(_ error, batch Batch) { failed = append(failed, batch) },
+		RedactEvent: func(_ context.Context, candidate *RedactableToolCall) (*RedactableToolCall, error) {
+			redacted = append(redacted, *candidate)
+			return candidate, nil
+		},
+		TelemetryFieldMap: map[string]string{"user_frustration": "mood"},
+	})
+	t.Cleanup(func() { _ = shutdown(context.Background()) })
+	InstrumentTool(s, mcp.NewTool("search", mcp.WithString("q"), mcp.WithString("mood")), func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		handled = req.GetArguments()
+		return mcp.NewToolResultText("ok"), nil
+	})
+
+	call := `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"search","arguments":{"q":"x","mood":"medium","telemetry":{"user_intent":"find x","call_purpose":"search the index","user_frustration":"high","frustration_level":"low"}}}}`
+	ctx := s.WithContext(context.Background(), newFakeSession("cached-client-session"))
+	if resp := s.HandleMessage(ctx, []byte(call)); resp == nil {
+		t.Fatal("no response")
+	}
+	if err := shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	if _, exists := handled["telemetry"]; exists || handled["q"] != "x" {
+		t.Fatalf("handler args = %v", handled)
+	}
+	if len(redacted) != 1 || redacted[0].Telemetry == nil {
+		t.Fatalf("redact candidates = %#v", redacted)
+	}
+	if got := redacted[0].Telemetry; got.UserFrustration != "" || got.FrustrationLevel != "" || got.UserIntent != "find x" {
+		t.Fatalf("redact candidate telemetry = %+v", got)
+	}
+	if len(delivered) == 0 || len(failed) == 0 {
+		t.Fatalf("delivered %d, failed %d batches", len(delivered), len(failed))
+	}
+	var sawIntent bool
+	for _, batch := range append(append([]Batch{}, delivered...), failed...) {
+		for _, event := range batch.Events {
+			if event.Kind == KindToolCall && event.Metadata["user_intent"] == "find x" {
+				sawIntent = true
+			}
+		}
+		raw, err := json.Marshal(batch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), "frustration") || strings.Contains(string(raw), `"high"`) {
+			t.Fatalf("frustration exported: %s", raw)
+		}
+	}
+	if !sawIntent {
+		t.Fatal("user_intent was not exported alongside")
 	}
 }
 

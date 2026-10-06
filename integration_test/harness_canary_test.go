@@ -72,10 +72,10 @@ func harnessCanaryHandler(t *testing.T, collector *statelessEventCollector) http
 			"sdk-canary-go",
 			"harness-canary-test",
 			armatureanalytics.Config{
-				Delivery:          armatureanalytics.DeliveryAwait,
-				Emit:              collector.emit,
-				ActorSeed:         func(context.Context) string { return "sdk-canary-browser-worker" },
-				RequestCapability: new(bool),
+				Delivery:     armatureanalytics.DeliveryAwait,
+				Emit:         collector.emit,
+				ActorSeed:    func(context.Context) string { return "sdk-canary-browser-worker" },
+				SendFeedback: new(bool),
 			},
 			markserver.WithToolCapabilities(true),
 		)

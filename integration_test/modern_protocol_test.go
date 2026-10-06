@@ -40,9 +40,9 @@ func newModernStatelessServer(t *testing.T) (*httptest.Server, *statelessEventCo
 		&officialmcp.Implementation{Name: "modern-stateless", Version: "1.0.0"},
 		nil,
 		armatureanalytics.Config{
-			Delivery:          armatureanalytics.DeliveryAwait,
-			Emit:              collector.emit,
-			RequestCapability: boolPtr(false),
+			Delivery:     armatureanalytics.DeliveryAwait,
+			Emit:         collector.emit,
+			SendFeedback: boolPtr(false),
 		},
 	)
 	// Typed tool via InstrumentTool: v1.7.0 validates tool schemas (SEP-2106)

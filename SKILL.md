@@ -16,12 +16,12 @@ behavior. The SDK adds an optional `telemetry` object to tool input schemas,
 removes it before handlers run, and asynchronously sends authenticated events
 to Armature.
 
-The optional public fields are `user_intent`, `call_purpose`, and
-`user_frustration`. Use a short action summary for `call_purpose`. Base it on
-the visible request and tool function. Do not collect private reasoning.
-Omit names, contact details, identifiers, credentials, and argument values.
-Send intent and frustration only on the first call after a new user message.
-Historical `agent_thinking` and `context` inputs remain accepted.
+The optional public fields are `user_intent` and `call_purpose`. Use a short
+action summary for `call_purpose`. Base it on the visible request and tool
+function. Do not collect private reasoning. Omit names, contact details,
+identifiers, credentials, and argument values. Send intent only on the first
+call after a new user message. Historical `agent_thinking` and `context`
+inputs remain accepted. The SDK adds no text to tool descriptions.
 
 ## 1. Detect the MCP framework
 
@@ -83,8 +83,8 @@ or `Config.Emit` replaces network delivery:
 ```go
 cfg := adapter.EnvConfig()
 cfg.Disabled = cfg.APIKey == ""
-// request_capability is on by default; to disable, set a pointer to false
-// (e.g. cfg.RequestCapability = new(bool)). See "Report the integration".
+// send_feedback is on by default; to disable, set a pointer to false
+// (e.g. cfg.SendFeedback = new(bool)). See "Report the integration".
 rec, err := adapter.NewRecorder(cfg)
 ```
 
@@ -150,8 +150,8 @@ Do all of these:
 
 1. Run formatting, `go mod tidy`, `go vet ./...`, and the repo's tests.
 2. List tools through a real in-process MCP client and confirm an instrumented
-   tool schema contains optional `telemetry.user_intent`, `call_purpose`, and
-   `user_frustration`, with no `agent_thinking` property.
+   tool schema contains exactly the optional `telemetry.user_intent` and
+   `call_purpose` properties, and that its description is unchanged.
 3. Call that tool with `telemetry.user_intent` and confirm the handler receives
    its original arguments without the top-level `telemetry` property.
 4. Point `EndpointURL` at an `httptest.Server`, drain the recorder, and assert a
@@ -184,12 +184,13 @@ Tell the user:
 - How shutdown/flush is bounded.
 - Whether missing-key startup is gated and whether delivery errors are logged.
 - Which schema, handler-cleanup, and event-emission checks passed.
-- That servers built with `NewMCPServerWithConfig` add a `request_capability`
-  tool (on by default) so the agent can report a capability the current tools
-  can't satisfy — this is what surfaces "unmet demand" use cases in Armature.
-  It's recommended, so leave it on. Tell the user it's enabled and offer to turn
-  it off: set `Config.RequestCapability` to a pointer to `false` if they'd rather
-  not expose it.
+- That servers built with `NewMCPServerWithConfig` add a `send_feedback`
+  tool (on by default), a feedback tool the agent calls to report a capability
+  the current tools can't satisfy; this surfaces "unmet demand" use cases in
+  Armature. Tell the user it's enabled and offer to turn it off: set
+  `Config.SendFeedback` to a pointer to `false`. If the server is listed in a
+  connector directory and keeps it, its listing should mention it as a
+  feedback tool. No other tool's description refers to it.
 
 ## Guardrails
 

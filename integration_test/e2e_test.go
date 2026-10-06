@@ -207,16 +207,15 @@ func TestRecorder_DisabledIsNoop(t *testing.T) {
 	}
 }
 
-func TestRequestCapability_OptInEmitsNormalToolCall(t *testing.T) {
+func TestSendFeedback_DefaultOnEmitsNormalToolCall(t *testing.T) {
 	sink := newIngestSink(t)
 	mcpServer, shutdown := armatureanalytics.NewMCPServerWithConfig(
 		"test-server",
 		"1.0.0",
 		armatureanalytics.Config{
-			APIKey:            "test-key",
-			EndpointURL:       sink.server.URL,
-			Timeout:           2 * time.Second,
-			RequestCapability: boolPtr(true),
+			APIKey:      "test-key",
+			EndpointURL: sink.server.URL,
+			Timeout:     2 * time.Second,
 		},
 		server.WithToolCapabilities(true),
 	)
@@ -240,12 +239,20 @@ func TestRequestCapability_OptInEmitsNormalToolCall(t *testing.T) {
 		t.Fatalf("Initialize: %v", err)
 	}
 
+	listed, err := client.ListTools(ctx, mcp.ListToolsRequest{})
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	if len(listed.Tools) != 1 || listed.Tools[0].Name != "send_feedback" {
+		t.Fatalf("tools = %#v, want send_feedback only (no request_capability alias)", listed.Tools)
+	}
+
 	callReq := mcp.CallToolRequest{}
-	callReq.Params.Name = "request_capability"
+	callReq.Params.Name = "send_feedback"
 	callReq.Params.Arguments = map[string]any{"capability": "send an SMS"}
 	result, err := client.CallTool(ctx, callReq)
 	if err != nil {
-		t.Fatalf("CallTool request_capability: %v", err)
+		t.Fatalf("CallTool send_feedback: %v", err)
 	}
 	if len(result.Content) != 1 {
 		t.Fatalf("response content = %#v, want one acknowledgment", result.Content)
@@ -264,14 +271,14 @@ func TestRequestCapability_OptInEmitsNormalToolCall(t *testing.T) {
 			continue
 		}
 		meta, _ := ev["metadata"].(map[string]any)
-		if meta["tool_name"] == "request_capability" {
+		if meta["tool_name"] == "send_feedback" {
 			if meta["capability_request"] != true {
-				t.Fatalf("request_capability event is missing provenance marker: %v", meta)
+				t.Fatalf("send_feedback event is missing provenance marker: %v", meta)
 			}
 			return
 		}
 	}
-	t.Fatalf("request_capability was not recorded as a normal tool_call: events=%v", sink.Events())
+	t.Fatalf("send_feedback was not recorded as a normal tool_call: events=%v", sink.Events())
 }
 
 func TestAddTool_PropagatesIntentToEvent(t *testing.T) {

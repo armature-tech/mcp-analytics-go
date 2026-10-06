@@ -81,28 +81,35 @@ type Config struct {
 	// the call site.
 	Disabled bool
 
-	// RequestCapability controls the SDK-owned request_capability tool that
-	// servers constructed by NewMCPServerWithConfig inject so agents can report
-	// a capability the current tools can't satisfy. nil means on (the default,
-	// once a delivery path is configured); set to a pointer to false to
-	// disable. A pointer to true is an explicit opt-in — the only case where a
-	// tool-name collision is treated as an error rather than yielding to the
-	// customer's tool.
+	// SendFeedback controls the SDK-owned send_feedback tool that servers
+	// constructed by NewMCPServerWithConfig add so agents can report a
+	// capability the current tools can't satisfy. nil means on (the default,
+	// once a delivery path is configured); set a pointer to false to disable.
+	// On by default, the tool yields silently to a customer tool of the same
+	// name. A pointer to true is an explicit opt-in: with mcp-go, that
+	// collision is then reported through OnError. No other tool's description
+	// mentions send_feedback. A server listed in a connector directory that
+	// keeps it should mention it in its listing as a feedback tool.
+	SendFeedback *bool
+
+	// RequestCapability is the earlier name of SendFeedback, still accepted.
+	// When both are set, SendFeedback wins.
+	//
+	// Deprecated: use SendFeedback.
 	RequestCapability *bool
 
-	// DescriptionLengthLogLevel sets how the one-time notice for a tool
-	// description too long for the full telemetry hint is logged: "none",
-	// "debug" or "info" (through log/slog), or "warning" (the default, through
-	// the standard log package). Other values log as "warning".
+	// DescriptionLengthLogLevel is accepted for compatibility and ignored.
+	//
+	// Deprecated: the SDK no longer appends text to tool descriptions, so no
+	// description-length notice is ever logged.
 	DescriptionLengthLogLevel string
 
 	// CaptureTelemetry is the master switch for conversation-derived telemetry
-	// (user_intent, call_purpose, user_frustration). nil or true
-	// means on. When false the SDK injects no telemetry schema, appends no
-	// description nudges (see InstrumentToolWithConfig), and never exports
-	// telemetry values — including values sent by clients holding a cached
-	// schema, which are stripped and dropped. Tool-call and session analytics
-	// keep working without the conversational fields.
+	// (user_intent, call_purpose). nil or true means on. When false the SDK
+	// injects no telemetry schema and never exports telemetry values —
+	// including values sent by clients holding a cached schema, which are
+	// stripped and dropped. Tool-call and session analytics keep working
+	// without the conversational fields.
 	CaptureTelemetry *bool
 
 	// Redact, if set, runs over sanitized tool inputs/outputs (and the
@@ -122,9 +129,9 @@ type Config struct {
 
 	// TelemetryFieldMap opts specific customer-owned argument fields into
 	// export as Armature telemetry (TELEMETRY-CONTRACT.md). Keys are the V1
-	// telemetry field names (user_intent, call_purpose, user_frustration);
-	// agent_thinking remains accepted as a legacy mapping key.
-	// values are top-level argument property names to READ
+	// telemetry field names (user_intent, call_purpose); agent_thinking
+	// remains accepted as a legacy mapping key, and a user_frustration key is
+	// accepted and ignored. Values are top-level argument property names to READ
 	// (never strip) from the tool's arguments. Ignored while CaptureTelemetry
 	// is false.
 	TelemetryFieldMap map[string]string
@@ -134,19 +141,29 @@ func (c Config) captureEnabled() bool {
 	return c.CaptureTelemetry == nil || *c.CaptureTelemetry
 }
 
-// requestCapabilityEnabled reports whether the SDK-owned request_capability
-// tool should be injected: on unless explicitly disabled with a pointer to
-// false. Callers still apply the Disabled and delivery-sink (rec != nil) gates.
-func (c Config) requestCapabilityEnabled() bool {
-	return c.RequestCapability == nil || *c.RequestCapability
+// sendFeedbackSetting resolves SendFeedback, falling back to the deprecated
+// RequestCapability alias.
+func (c Config) sendFeedbackSetting() *bool {
+	if c.SendFeedback != nil {
+		return c.SendFeedback
+	}
+	return c.RequestCapability
 }
 
-// requestCapabilityExplicit reports whether the caller explicitly opted in
-// (a pointer to true). A request_capability tool-name collision is only
-// surfaced as an error under an explicit opt-in; when the tool is on merely by
-// default the customer's tool of the same name wins silently.
-func (c Config) requestCapabilityExplicit() bool {
-	return c.RequestCapability != nil && *c.RequestCapability
+// sendFeedbackEnabled reports whether the SDK-owned send_feedback tool should
+// be injected: on unless disabled with a pointer to false. Callers still apply
+// the Disabled and delivery-sink (rec != nil) gates.
+func (c Config) sendFeedbackEnabled() bool {
+	v := c.sendFeedbackSetting()
+	return v == nil || *v
+}
+
+// sendFeedbackExplicit reports whether the caller explicitly opted in (a
+// pointer to true). A send_feedback tool-name collision is only reported as an
+// error under an explicit opt-in; on by default, the customer's tool wins.
+func (c Config) sendFeedbackExplicit() bool {
+	v := c.sendFeedbackSetting()
+	return v != nil && *v
 }
 
 // Recorder owns the ingest client and the hook closures. Once registered on
@@ -316,7 +333,7 @@ func (r *Recorder) RecordToolCall(ctx context.Context, in ToolCallInput) {
 }
 
 // ReserveCapabilityRequest reserves delivery capacity before an SDK-owned
-// request_capability handler acknowledges a request. It returns nil after
+// send_feedback handler acknowledges a request. It returns nil after
 // shutdown has started.
 func (r *Recorder) ReserveCapabilityRequest() *CapabilityReservation {
 	if r == nil || r.cfg.Disabled || r.send == nil {
@@ -669,11 +686,11 @@ func (r *Recorder) consumeCapabilityResult(result any) *CapabilityReservation {
 	if toolResult.Meta == nil {
 		return nil
 	}
-	reservation, ok := toolResult.Meta.AdditionalFields[requestCapabilityResultMarker].(*CapabilityReservation)
+	reservation, ok := toolResult.Meta.AdditionalFields[sendFeedbackResultMarker].(*CapabilityReservation)
 	if !ok || reservation == nil {
 		return nil
 	}
-	delete(toolResult.Meta.AdditionalFields, requestCapabilityResultMarker)
+	delete(toolResult.Meta.AdditionalFields, sendFeedbackResultMarker)
 	if len(toolResult.Meta.AdditionalFields) == 0 && toolResult.Meta.ProgressToken == nil {
 		toolResult.Meta = nil
 	}

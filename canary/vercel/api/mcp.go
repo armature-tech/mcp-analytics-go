@@ -66,8 +66,8 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			ActorSeed:   func(context.Context) string { return "sdk-canary-browser-worker" },
 			Timeout:     10 * time.Second,
 			// The HTTP smoke test asserts an exact tool list; keep the
-			// on-by-default request_capability tool out of this fixture.
-			RequestCapability: new(bool),
+			// on-by-default send_feedback tool out of this fixture.
+			SendFeedback: new(bool),
 		},
 		server.WithToolCapabilities(true),
 	)

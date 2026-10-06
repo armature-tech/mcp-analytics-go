@@ -121,7 +121,7 @@ func NewMCPServerWithConfig(impl *mcp.Implementation, opts *mcp.ServerOptions, c
 	shutdown := func(close func(context.Context) error) Shutdown {
 		return func(ctx context.Context) error {
 			defer serverTelemetryConfigs.Delete(s)
-			defer armatureanalytics.ForgetRequestCapabilityServer(s)
+			defer armatureanalytics.ForgetSendFeedbackServer(s)
 			return close(ctx)
 		}
 	}
@@ -136,11 +136,11 @@ func NewMCPServerWithConfig(impl *mcp.Implementation, opts *mcp.ServerOptions, c
 		}
 		return s, shutdown(func(context.Context) error { return nil })
 	}
-	// On by default (nil) unless explicitly disabled with a pointer to false.
-	// The official SDK's registration is last-write-wins, so a customer tool of
-	// the same name simply replaces this one — no collision guard needed.
-	if (cfg.RequestCapability == nil || *cfg.RequestCapability) && !cfg.Disabled && rec != nil {
-		addRequestCapabilityTool(s, rec)
+	// On by default (nil) unless disabled with a pointer to false. The
+	// official SDK's registration is last-write-wins, so a customer tool of the
+	// same name simply replaces this one — no collision guard needed.
+	if sendFeedbackEnabled(cfg) && !cfg.Disabled && rec != nil {
+		addSendFeedbackTool(s, rec)
 	}
 	rec.Install(s)
 	return s, shutdown(rec.Close)
@@ -551,12 +551,7 @@ func InstrumentTool[In, Out any](s *mcp.Server, tool *mcp.Tool, handler mcp.Tool
 // telemetry argument stripped — and the Recorder's capture gate guarantees it
 // is never exported.
 func InstrumentToolWithConfig[In, Out any](cfg Config, s *mcp.Server, tool *mcp.Tool, handler mcp.ToolHandlerFor[In, Out]) {
-	// Name request_capability only if this server actually lists it.
-	decorated, ok, err := decorateInputSchemaWithTelemetry[In](tool, &armatureanalytics.HintOptions{
-		RequestCapability: armatureanalytics.RequestCapabilityRegistered(s),
-		ToolName:          toolName(tool),
-		LogLevel:          cfg.DescriptionLengthLogLevel,
-	})
+	decorated, ok, err := decorateInputSchemaWithTelemetry[In](tool)
 	if err != nil {
 		panic(fmt.Sprintf("armatureanalytics/official: instrument tool %q: %v", toolName(tool), err))
 	}
@@ -581,28 +576,21 @@ func CaptureEnabled(cfg Config) bool {
 // explicit input schema includes the optional telemetry object. ok is false
 // when the tool already declares a top-level telemetry property.
 //
-// The appended description hint is always the CURRENT
-// (request_capability-agnostic) one: this function cannot tell whether the
-// server lists request_capability.
-// DecorateInputSchemaWithTelemetryWithOptions can select the hint that also
-// points agents at request_capability; InstrumentTool does so automatically
-// when the server lists that tool.
+// It adds no text to the description. An exact SDK hint suffix from an
+// earlier release is removed (armatureanalytics.StripTelemetryHint).
 func DecorateInputSchemaWithTelemetry[In any](tool *mcp.Tool) (*mcp.Tool, bool, error) {
-	return decorateInputSchemaWithTelemetry[In](tool, nil)
+	return decorateInputSchemaWithTelemetry[In](tool)
 }
 
-// DecorateInputSchemaWithTelemetryWithOptions is DecorateInputSchemaWithTelemetry
-// with explicit hint options (armatureanalytics.HintOptions): set
-// RequestCapability only when the server lists request_capability.
-// InstrumentTool / InstrumentToolWithConfig choose this automatically.
-func DecorateInputSchemaWithTelemetryWithOptions[In any](tool *mcp.Tool, opts armatureanalytics.HintOptions) (*mcp.Tool, bool, error) {
-	return decorateInputSchemaWithTelemetry[In](tool, &opts)
+// DecorateInputSchemaWithTelemetryWithOptions is DecorateInputSchemaWithTelemetry.
+//
+// Deprecated: no hint is appended, so opts are ignored. Use
+// DecorateInputSchemaWithTelemetry.
+func DecorateInputSchemaWithTelemetryWithOptions[In any](tool *mcp.Tool, _ armatureanalytics.HintOptions) (*mcp.Tool, bool, error) {
+	return decorateInputSchemaWithTelemetry[In](tool)
 }
 
-// decorateInputSchemaWithTelemetry is the shared implementation. opts == nil
-// preserves the historical DecorateInputSchemaWithTelemetry behavior (current
-// hint); non-nil opts route through AppendTelemetryHintWithOptions.
-func decorateInputSchemaWithTelemetry[In any](tool *mcp.Tool, opts *armatureanalytics.HintOptions) (*mcp.Tool, bool, error) {
+func decorateInputSchemaWithTelemetry[In any](tool *mcp.Tool) (*mcp.Tool, bool, error) {
 	if tool == nil {
 		return nil, false, fmt.Errorf("tool is nil")
 	}
@@ -631,11 +619,7 @@ func decorateInputSchemaWithTelemetry[In any](tool *mcp.Tool, opts *armatureanal
 
 	decorated := *tool
 	decorated.InputSchema = schema
-	if opts != nil {
-		decorated.Description = armatureanalytics.AppendTelemetryHintWithOptions(decorated.Description, *opts)
-	} else {
-		decorated.Description = armatureanalytics.AppendTelemetryHint(decorated.Description)
-	}
+	decorated.Description = armatureanalytics.StripTelemetryHint(decorated.Description)
 	// Last registration wins: a name previously marked owned that now
 	// decorates cleanly (field renamed, recorder replaced) captures again.
 	armatureanalytics.UnmarkTelemetryOwnedTool(tool.Name)
