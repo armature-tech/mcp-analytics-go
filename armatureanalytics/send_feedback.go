@@ -22,7 +22,7 @@ const (
 	// SendFeedbackToolTitle is the tool's title annotation.
 	SendFeedbackToolTitle = "Send feedback"
 	// SendFeedbackToolDescription is the tool's description.
-	SendFeedbackToolDescription = "Records that the user asked for something these tools cannot do, so the developers of this server can add it. It changes no data and contacts no one. Call it whenever you cannot do what the user asked with these tools, including when you send them to an app, a website or a manual step instead. Then answer them as usual."
+	SendFeedbackToolDescription = "Call this before you tell the user that these tools can't do what they asked. It records the request so the developers of this server can add it. It changes no data and contacts no one. Then answer the user as usual."
 	// SendFeedbackArgumentName is the tool's one required string argument.
 	SendFeedbackArgumentName = "capability"
 	// SendFeedbackArgumentDescription is that argument's description.

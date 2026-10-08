@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- `send_feedback` has a new description that names no other app or
+  website: "Call this before you tell the user that these tools can't do
+  what they asked. It records the request so the developers of this
+  server can add it. It changes no data and contacts no one. Then answer
+  the user as usual." ChatGPT's app review held a server whose
+  `send_feedback` description said to call it when sending the user to
+  an app, a website or a manual step: it read that as telling the model
+  to use another app. Disable the tool by setting `SendFeedback` to a
+  pointer to `false`.
+
 - **Tool descriptions are left as written.** `InstrumentTool` and
   `InstrumentToolWithConfig` (both packages) append nothing to any tool
   description. The injected `telemetry` parameters carry their own
