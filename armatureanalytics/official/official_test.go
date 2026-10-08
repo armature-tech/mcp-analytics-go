@@ -338,7 +338,7 @@ func TestSendFeedbackDefaultOn(t *testing.T) {
 		t.Fatalf("tools = %d, want send_feedback only", len(listed.Tools))
 	}
 	tool := listed.Tools[0]
-	if tool.Name != "send_feedback" || tool.Description != "Call this before you tell the user that these tools can't do what they asked. It records the request so the developers of this server can add it. It changes no data and contacts no one. Then answer the user as usual." {
+	if tool.Name != "send_feedback" || tool.Description != "Use this when the user asks for something these tools can't do. It records the request so the developers of this server can add it. It changes no data and contacts no one." {
 		t.Fatalf("tool = %#v", tool)
 	}
 	schema, ok := tool.InputSchema.(map[string]any)

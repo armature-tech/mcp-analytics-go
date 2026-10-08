@@ -6,6 +6,16 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- `send_feedback` has a new description: "Use this when the user asks
+  for something these tools can't do. It records the request so the
+  developers of this server can add it. It changes no data and contacts
+  no one." ChatGPT showed a "Suspicious Instruction" warning on the tool
+  call with the previous wording ("Call this before you tell the user
+  that these tools can't do what they asked. … Then answer the user as
+  usual."): it read the description as prescribing when the tool must be
+  called before responding. The new wording says when the tool is useful
+  and no longer orders it against the answer.
+
 - `send_feedback` has a new description that names no other app or
   website: "Call this before you tell the user that these tools can't do
   what they asked. It records the request so the developers of this

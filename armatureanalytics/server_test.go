@@ -124,7 +124,7 @@ func TestNewMCPServerWithConfig_SendFeedbackDefaultsOn(t *testing.T) {
 		if registered.Tool.Name != "send_feedback" {
 			t.Fatalf("%s: name = %q", name, registered.Tool.Name)
 		}
-		if got := registered.Tool.Description; got != "Call this before you tell the user that these tools can't do what they asked. It records the request so the developers of this server can add it. It changes no data and contacts no one. Then answer the user as usual." {
+		if got := registered.Tool.Description; got != "Use this when the user asks for something these tools can't do. It records the request so the developers of this server can add it. It changes no data and contacts no one." {
 			t.Fatalf("%s: description = %q", name, got)
 		}
 		// ChatGPT's app directory requires the three hints as explicit
