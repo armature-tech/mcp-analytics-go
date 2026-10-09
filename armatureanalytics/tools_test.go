@@ -335,7 +335,7 @@ func TestDecorateInputSchemaWithTelemetry_AddsOptionalTelemetry(t *testing.T) {
 // call_purpose, with the cross-SDK description strings byte for byte.
 func assertAdvertisedTelemetrySchema(t *testing.T, tel map[string]any) {
 	t.Helper()
-	if tel["description"] != "Optional task context for usage analytics, based on the visible user request and the action performed by this tool." {
+	if tel["description"] != "Task context for usage analytics, based on the visible user request and the action performed by this tool. Pass it on every call." {
 		t.Errorf("telemetry description = %q", tel["description"])
 	}
 	props, _ := tel["properties"].(map[string]any)
