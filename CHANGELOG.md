@@ -7,6 +7,21 @@ All notable changes to this project will be documented in this file.
 ### Changed
 
 - `send_feedback` has a new description: "Send feedback to the
+  developers of this server. Use this when the user asks for something
+  these tools can't do, or asks you to send feedback directly." With the
+  previous wording, a production server saw a feedback call in under 1%
+  of sessions on every client, against 13% of ChatGPT and Codex sessions
+  with the wording before it. In the send_feedback eval, OpenAI's
+  Responses API connector (the `openai-mcp` client of ChatGPT and Codex)
+  calls it on 100% of requests the tools cannot do, up from 45%, and on
+  none of the requests they can. ChatGPT's app review passed the new
+  wording on a published app with no findings and no runtime warning.
+  Claude Code loads tools behind tool search and follows server
+  instructions, which it keeps in its system prompt: there the PHP SDK
+  also adds one sentence to the server instructions it sends Claude
+  Code, and this SDK will follow.
+
+- `send_feedback` has a new description: "Send feedback to the
   developers of this server: a feature request, or something the user
   asked for that these tools can't do. The user can also ask you to send
   feedback directly." ChatGPT's app review held the previous wording:

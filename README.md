@@ -503,7 +503,7 @@ it when the server's tools cannot do what the user asked, and the call feeds
 Armature's unmet-demand signals. It accepts one required `capability` string
 and uses this description exactly:
 
-> Send feedback to the developers of this server: a feature request, or something the user asked for that these tools can't do. The user can also ask you to send feedback directly.
+> Send feedback to the developers of this server. Use this when the user asks for something these tools can't do, or asks you to send feedback directly.
 
 It declares the annotations app directories such as ChatGPT's require:
 `readOnlyHint: false` (it records an analytics event), `destructiveHint: false`
